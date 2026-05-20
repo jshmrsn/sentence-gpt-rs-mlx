@@ -757,13 +757,14 @@ suspend fun trainMicrogptStepParallel(
     val documentResults = coroutineScope {
         batchDocuments.map { document ->
             async(Dispatchers.Default) {
-                println("Training document start")
+                //println("Training document start")
                 trainOnDocumentWithGradients(
                     model = session.trainedMicrogpt.model,
                     config = session.trainedMicrogpt.config,
                     tokenizer = session.trainedMicrogpt.tokenizer,
                     document = document
-                ).also { println("Training document end") }
+                )
+                    //.also { println("Training document end") }
             }
         }.awaitAll()
     }
