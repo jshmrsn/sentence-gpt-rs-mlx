@@ -41,6 +41,15 @@ private val VocabLabelWidth = 72.dp
 private val NetworkHorizontalPadding = 18.dp
 private val NetworkVerticalPadding = 14.dp
 
+
+private fun networkDiagramHeight(trainedMicrogpt: TrainedMicrogpt): Dp {
+    val largestExpandedColumn = max(
+        trainedMicrogpt.config.contextWindowSize * trainedMicrogpt.config.embeddingSize * 4,
+        trainedMicrogpt.config.contextWindowSize * trainedMicrogpt.tokenizer.vocabularySize
+    )
+    return max(100, largestExpandedColumn * 10).dp
+}
+
 @Composable
 fun MicrogptModelVisualization(
     trainedMicrogpt: TrainedMicrogpt?,

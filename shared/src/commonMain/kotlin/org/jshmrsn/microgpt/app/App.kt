@@ -25,15 +25,18 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonIgnoreUnknownKeys
 import microgpt_kotlin_visualized.shared.generated.resources.Res
+import org.jshmrsn.microgpt.lib.AdamOptimizerConfig
 import org.jshmrsn.microgpt.lib.MicrogptTrainingProgress
 import org.jshmrsn.microgpt.lib.MicrogptTrainingSession
 import org.jshmrsn.microgpt.lib.MicrogptTrainingStepResult
 import org.jshmrsn.microgpt.lib.TrainedMicrogpt
+import org.jshmrsn.microgpt.lib.TransformerConfig
 import org.jshmrsn.microgpt.lib.calculateDocumentLoss
 import org.jshmrsn.microgpt.lib.createMicrogptTrainingSession
 import kotlin.math.ln
 import kotlin.math.roundToLong
 import kotlin.random.Random
+import kotlin.text.contains
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.TimeSource
 
@@ -130,13 +133,6 @@ private fun MicrogptTrainingStepResult.withValidationLoss(
 }
 
 @Serializable
-data class Instruction(
-    val prompt: String,
-    val features: List<String>,
-    val words: List<String>
-)
-
-@Serializable
 @JsonIgnoreUnknownKeys
 data class Story(
     val story: String,
@@ -183,12 +179,66 @@ fun App() {
             val trainingText = if (false) {
                 generateMathTrainingText()
             } else {
+                val excludeCharacters = listOf(
+                    "$",
+                    "&",
+                    "\"",
+                    "“",
+                    "”",
+                    "(",
+                    ")",
+                    "*",
+                    "'",
+                    "_",
+                    "-",
+                    "–",
+                    "…",
+                    "%",
+                    "~",
+                    "`",
+                    "[",
+                    "]",
+                    "{",
+                    "}",
+                    "\\",
+                    ";",
+                    "|",
+                    "—",
+                    "-",
+                    "é",
+                    "/",
+                    "’",
+                    "‘",
+                    ":",
+                    "0",
+                    "1",
+                    "2",
+                    "3",
+                    "4",
+                    "5",
+                    "6",
+                    "7",
+                    "8",
+                    "9"
+                )
                 val storiesJsonString = Res.readBytes("files/input-stories-00.json").decodeToString()
                 val stories: List<Story> = Json.decodeFromString<List<Story>>(storiesJsonString)
                 val sentences = stories
                     .filter { it.source == "GPT-4" }
-                    .flatMap {
-                        it.story.replace("\n", "").split(".").map { it.trim() + "." }
+                    .flatMap { story ->
+                        story.story
+                            .replace("!", ".")
+                            .replace("?", ".")
+                            .split(".")
+                            .filter { sentence -> excludeCharacters.none { it in sentence } }
+                            .map { sentence ->
+                                sentence
+                                    .replace("\n", "")
+                                    .replace(",", "")
+                                    .trim()
+                                .lowercase()
+                            }
+                            .filter { sentence -> sentence.length > 10 && sentence.contains(" ") }
                     }
 
                 sentences
@@ -200,7 +250,19 @@ fun App() {
                 randomNumberGenerator = Random(1),
                 trainingStepCount = 100000,
                 validationSetDivisor = 20,
-                validationEvaluationDocumentCount = 10
+                validationEvaluationDocumentCount = 10,
+                transformerConfig = TransformerConfig(
+                    layerCount = 4,
+                    embeddingSize = 32,
+                    contextWindowSize = 64,
+                    attentionHeadCount = 8
+                ),
+                optimizerConfig = AdamOptimizerConfig(
+                    learningRate = 0.01,
+                    firstMomentDecay = 0.85,
+                    secondMomentDecay = 0.99,
+                    epsilon = 1e-8
+                )
             )
 
             trainingStepCount = trainingSession.trainingStepCount
@@ -367,8 +429,8 @@ fun App() {
                         trainedMicrogpt = model,
                         prefix = prefix,
                         randomNumberGenerator = sampleRandomNumberGenerator,
-                        sampleCount = 3,
-                        temperature = 0.25
+                        sampleCount = 10,
+                        temperature = 0.5
                     )
                 }
             ) {

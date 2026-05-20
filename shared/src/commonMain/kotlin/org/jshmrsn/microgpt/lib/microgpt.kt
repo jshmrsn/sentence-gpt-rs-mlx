@@ -194,7 +194,6 @@ data class AdamOptimizerState(
     val firstMomentEstimates: List<Double>,
     val secondMomentEstimates: List<Double>
 )
-
 data class AdamOptimizerConfig(
     val learningRate: Double = 0.01,
     val firstMomentDecay: Double = 0.85,
@@ -848,7 +847,9 @@ fun createMicrogptTrainingSession(
     randomNumberGenerator: Random,
     trainingStepCount: Int,
     validationSetDivisor: Int,
-    validationEvaluationDocumentCount: Int
+    validationEvaluationDocumentCount: Int,
+    transformerConfig: TransformerConfig,
+    optimizerConfig: AdamOptimizerConfig
 ): MicrogptTrainingSession {
     /**
      * DATASET
@@ -941,16 +942,7 @@ fun createMicrogptTrainingSession(
     //
     // Hyperparameters define the architecture and training behavior but are
     // not themselves learned from data.
-    val layerCount = 2
-    val embeddingSize = 64
-    val contextWindowSize = 32
-    val attentionHeadCount = 8
-    val config = TransformerConfig(
-        layerCount = layerCount,
-        embeddingSize = embeddingSize,
-        contextWindowSize = contextWindowSize,
-        attentionHeadCount = attentionHeadCount
-    )
+
 
     /**
      * PARAMETER STORAGE
@@ -973,9 +965,9 @@ fun createMicrogptTrainingSession(
     // Dense vectors allow the network to represent similarity and structure.
     val model = TransformerModelParameters.initialize(
         vocabularySize = vocabularySize,
-        contextWindowSize = config.contextWindowSize,
-        embeddingSize = config.embeddingSize,
-        layerCount = config.layerCount,
+        contextWindowSize = transformerConfig.contextWindowSize,
+        embeddingSize = transformerConfig.embeddingSize,
+        layerCount = transformerConfig.layerCount,
         randomNumberGenerator = randomNumberGenerator
     )
 
@@ -1029,12 +1021,13 @@ fun createMicrogptTrainingSession(
     return MicrogptTrainingSession(
         trainedMicrogpt = TrainedMicrogpt(
             model = model,
-            config = config,
+            config = transformerConfig,
             tokenizer = tokenizer
         ),
         documents = documents,
         validationDocuments = validationDocuments,
         trainingStepCount = trainingStepCount,
-        validationEvaluationDocumentCount = validationEvaluationDocumentCount
+        validationEvaluationDocumentCount = validationEvaluationDocumentCount,
+        optimizerConfig = optimizerConfig
     )
 }
