@@ -32,7 +32,7 @@ import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.TimeSource
 
 private val TrainingFrameBudget = 100.milliseconds
-private const val ValidationStepInterval = 300
+private const val ValidationStepInterval = 50
 
 private fun formatLoss(loss: Double): String {
     val scaled = (loss * 10_000.0).roundToLong()
@@ -139,19 +139,37 @@ fun App() {
         var prefix by remember { mutableStateOf("1+3=") }
         var samples by remember { mutableStateOf(emptyList<String>()) }
         var visibleMicrogpt by remember { mutableStateOf<TrainedMicrogpt?>(null) }
-        val randomNumberGenerator = remember { Random(1) }
+        var trainingSessionState by remember { mutableStateOf<MicrogptTrainingSession?>(null) }
+        var nextValidationStep by remember { mutableStateOf(ValidationStepInterval) }
+        var isTrainingActive by remember { mutableStateOf(false) }
+        var resetGeneration by remember { mutableStateOf(0) }
+        val sampleRandomNumberGenerator = remember { Random(1) }
 
-        LaunchedEffect(Unit) {
-            val trainingText = if (true) {
+        LaunchedEffect(resetGeneration) {
+            isTrainingActive = false
+            trainedMicrogpt = null
+            completedStepCount = 0
+            trainingStepCount = 1
+            latestLoss = null
+            latestValidationLoss = null
+            progressHistory = emptyList()
+            trainingExampleCount = 0
+            validationExampleCount = 0
+            validationEvaluationExampleCount = 0
+            visibleMicrogpt = null
+            trainingSessionState = null
+            samples = emptyList()
+
+            val trainingText = if (false) {
                 generateMathTrainingText()
             } else {
-                Res.readBytes("files/input.txt").decodeToString()
+                Res.readBytes("files/input-shakespear.txt").decodeToString()
             }
 
             var trainingSession = createMicrogptTrainingSession(
                 inputText = trainingText,
-                randomNumberGenerator = randomNumberGenerator,
-                trainingStepCount = 10000,
+                randomNumberGenerator = Random(1),
+                trainingStepCount = 100000,
                 validationDivisor = 20
             )
 
@@ -173,7 +191,16 @@ fun App() {
             latestValidationLoss = trainingSession.latestValidationLoss
             progressHistory = trainingSession.progressHistory
             visibleMicrogpt = trainingSession.trainedMicrogpt
-            var nextValidationStep = ValidationStepInterval
+            trainedMicrogpt = trainingSession.trainedMicrogpt
+            trainingSessionState = trainingSession
+            nextValidationStep = ValidationStepInterval
+        }
+
+        LaunchedEffect(isTrainingActive, resetGeneration) {
+            if (!isTrainingActive) return@LaunchedEffect
+
+            var trainingSession = trainingSessionState ?: return@LaunchedEffect
+            var localNextValidationStep = nextValidationStep
 
             while (!trainingSession.isComplete) {
                 val frameStart = TimeSource.Monotonic.markNow()
@@ -185,12 +212,12 @@ fun App() {
                     latestResult = result
                 } while (
                     !trainingSession.isComplete &&
-                    trainingSession.completedStepCount < nextValidationStep &&
+                    trainingSession.completedStepCount < localNextValidationStep &&
                     frameStart.elapsedNow() < TrainingFrameBudget
                 )
 
                 var result = latestResult ?: break
-                if (trainingSession.completedStepCount >= nextValidationStep) {
+                if (trainingSession.completedStepCount >= localNextValidationStep) {
                     result = result.withValidationLoss(
                         calculateValidationLoss(
                             session = trainingSession,
@@ -198,18 +225,24 @@ fun App() {
                         )
                     )
                     trainingSession = result.session
-                    nextValidationStep += ValidationStepInterval
+                    localNextValidationStep += ValidationStepInterval
                 }
                 val progress = result.progress
+                trainingSessionState = trainingSession
+                nextValidationStep = localNextValidationStep
                 completedStepCount = progress.completedStepCount
                 trainingStepCount = progress.trainingStepCount
                 latestLoss = progress.loss
                 latestValidationLoss = progress.validationLoss ?: trainingSession.latestValidationLoss
                 progressHistory = result.progressHistory
                 visibleMicrogpt = trainingSession.trainedMicrogpt
+
+                trainedMicrogpt = trainingSession.trainedMicrogpt
+
                 withFrameNanos { }
             }
 
+            isTrainingActive = false
             trainedMicrogpt = trainingSession.trainedMicrogpt
         }
 
@@ -222,9 +255,34 @@ fun App() {
                 .padding(16.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            val isTraining = trainedMicrogpt == null
+            val currentTrainingSession = trainingSessionState
+            val isTrainingComplete = currentTrainingSession?.isComplete == true
             val progress = completedStepCount.toFloat() / trainingStepCount.toFloat()
-            Text(if (isTraining) "Training" else "Ready")
+            Text(
+                when {
+                    currentTrainingSession == null -> "Initializing"
+                    isTrainingComplete -> "Ready"
+                    isTrainingActive -> "Training"
+                    else -> "Paused"
+                }
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(
+                    enabled = currentTrainingSession != null && !isTrainingComplete,
+                    onClick = { isTrainingActive = !isTrainingActive }
+                ) {
+                    Text(if (isTrainingActive) "Pause" else "Start")
+                }
+                Button(
+                    enabled = currentTrainingSession != null,
+                    onClick = {
+                        isTrainingActive = false
+                        resetGeneration += 1
+                    }
+                ) {
+                    Text("Reset")
+                }
+            }
             LinearProgressIndicator(
                 progress = { progress },
                 modifier = Modifier.fillMaxWidth(),
@@ -278,7 +336,7 @@ fun App() {
                     samples = generateMicrogptSamples(
                         trainedMicrogpt = model,
                         prefix = prefix,
-                        randomNumberGenerator = randomNumberGenerator,
+                        randomNumberGenerator = sampleRandomNumberGenerator,
                         sampleCount = 10,
                         temperature = 0.5
                     )

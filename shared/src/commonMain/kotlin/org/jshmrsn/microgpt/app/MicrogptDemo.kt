@@ -3,7 +3,6 @@ package org.jshmrsn.microgpt.app
 import org.jshmrsn.microgpt.lib.MicrogptTrainingSession
 import org.jshmrsn.microgpt.lib.MicrogptTrainingStepResult
 import org.jshmrsn.microgpt.lib.TrainedMicrogpt
-import org.jshmrsn.microgpt.lib.createMicrogptTrainingSession
 import org.jshmrsn.microgpt.lib.generateSamples
 import org.jshmrsn.microgpt.lib.trainMicrogptStep
 import kotlin.random.Random

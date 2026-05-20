@@ -846,8 +846,8 @@ fun generateSamples(
 fun createMicrogptTrainingSession(
     inputText: String,
     randomNumberGenerator: Random,
-    trainingStepCount: Int = 1000,
-    validationDivisor: Int = 20
+    trainingStepCount: Int,
+    validationDivisor: Int
 ): MicrogptTrainingSession {
     /**
      * DATASET
@@ -940,8 +940,8 @@ fun createMicrogptTrainingSession(
     //
     // Hyperparameters define the architecture and training behavior but are
     // not themselves learned from data.
-    val layerCount = 3
-    val embeddingSize = 32
+    val layerCount = 2
+    val embeddingSize = 16
     val contextWindowSize = 16
     val attentionHeadCount = 4
     val config = TransformerConfig(
