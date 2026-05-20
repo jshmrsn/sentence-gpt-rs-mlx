@@ -222,7 +222,7 @@ data class MicrogptTrainingSession(
     val documents: List<String>,
     val validationDocuments: List<String>,
     val trainingStepCount: Int,
-    val validationEvaluationDocumentCount: Int = 32,
+    val validationEvaluationDocumentCount: Int,
     val optimizerConfig: AdamOptimizerConfig = AdamOptimizerConfig(),
     val optimizerState: AdamOptimizerState = AdamOptimizerState(
         firstMomentEstimates = List(trainedMicrogpt.model.values().size) { 0.0 },
@@ -844,10 +844,11 @@ fun generateSamples(
     )
 
 fun createMicrogptTrainingSession(
-    inputText: String,
+    inputText: List<String>,
     randomNumberGenerator: Random,
     trainingStepCount: Int,
-    validationDivisor: Int
+    validationSetDivisor: Int,
+    validationEvaluationDocumentCount: Int
 ): MicrogptTrainingSession {
     /**
      * DATASET
@@ -869,11 +870,11 @@ fun createMicrogptTrainingSession(
     //
     // In machine learning, the dataset is the source of examples from which
     // the model learns statistical patterns.
-    val shuffledDocuments = inputText.lines()
+    val shuffledDocuments = inputText
         .map { it.trim() }
         .filter { it.isNotEmpty() }
         .shuffledBy(randomNumberGenerator)
-    val validationDocumentCount = shuffledDocuments.size / validationDivisor
+    val validationDocumentCount = shuffledDocuments.size / validationSetDivisor
     val validationDocuments = shuffledDocuments.take(validationDocumentCount)
     val documents = shuffledDocuments.drop(validationDocumentCount)
 
@@ -941,9 +942,9 @@ fun createMicrogptTrainingSession(
     // Hyperparameters define the architecture and training behavior but are
     // not themselves learned from data.
     val layerCount = 2
-    val embeddingSize = 16
-    val contextWindowSize = 16
-    val attentionHeadCount = 4
+    val embeddingSize = 64
+    val contextWindowSize = 32
+    val attentionHeadCount = 8
     val config = TransformerConfig(
         layerCount = layerCount,
         embeddingSize = embeddingSize,
@@ -1033,6 +1034,7 @@ fun createMicrogptTrainingSession(
         ),
         documents = documents,
         validationDocuments = validationDocuments,
-        trainingStepCount = trainingStepCount
+        trainingStepCount = trainingStepCount,
+        validationEvaluationDocumentCount = validationEvaluationDocumentCount
     )
 }

@@ -9,16 +9,17 @@ import kotlin.random.Random
 
 private const val MaximumOperand = 999
 
-fun generateMathTrainingText(): String =
-    buildString {
+fun generateMathTrainingText(): List<String> =
+    mutableListOf<String>().also {
         for (a in 0..MaximumOperand) {
             for (b in 0..MaximumOperand) {
-                append(a)
-                append('+')
-                append(b)
-                append('=')
-                append(a + b)
-                append('\n')
+                it.add(buildString {
+                    append(a)
+                    append('+')
+                    append(b)
+                    append('=')
+                    append(a + b)
+                })
             }
         }
     }

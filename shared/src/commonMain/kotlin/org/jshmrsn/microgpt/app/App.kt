@@ -1,3 +1,5 @@
+@file:OptIn(ExperimentalSerializationApi::class)
+
 package org.jshmrsn.microgpt.app
 
 import androidx.compose.foundation.Canvas
@@ -18,6 +20,10 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
+import kotlinx.serialization.ExperimentalSerializationApi
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonIgnoreUnknownKeys
 import microgpt_kotlin_visualized.shared.generated.resources.Res
 import org.jshmrsn.microgpt.lib.MicrogptTrainingProgress
 import org.jshmrsn.microgpt.lib.MicrogptTrainingSession
@@ -123,6 +129,20 @@ private fun MicrogptTrainingStepResult.withValidationLoss(
     )
 }
 
+@Serializable
+data class Instruction(
+    val prompt: String,
+    val features: List<String>,
+    val words: List<String>
+)
+
+@Serializable
+@JsonIgnoreUnknownKeys
+data class Story(
+    val story: String,
+    val source: String
+)
+
 @Composable
 @Preview
 fun App() {
@@ -136,7 +156,7 @@ fun App() {
         var trainingExampleCount by remember { mutableStateOf(0) }
         var validationExampleCount by remember { mutableStateOf(0) }
         var validationEvaluationExampleCount by remember { mutableStateOf(0) }
-        var prefix by remember { mutableStateOf("1+3=") }
+        var prefix by remember { mutableStateOf("") }
         var samples by remember { mutableStateOf(emptyList<String>()) }
         var visibleMicrogpt by remember { mutableStateOf<TrainedMicrogpt?>(null) }
         var trainingSessionState by remember { mutableStateOf<MicrogptTrainingSession?>(null) }
@@ -163,14 +183,24 @@ fun App() {
             val trainingText = if (false) {
                 generateMathTrainingText()
             } else {
-                Res.readBytes("files/input-shakespear.txt").decodeToString()
+                val storiesJsonString = Res.readBytes("files/input-stories-00.json").decodeToString()
+                val stories: List<Story> = Json.decodeFromString<List<Story>>(storiesJsonString)
+                val sentences = stories
+                    .filter { it.source == "GPT-4" }
+                    .flatMap {
+                        it.story.replace("\n", "").split(".").map { it.trim() + "." }
+                    }
+
+                sentences
+                //Res.readBytes("files/input-names.txt").decodeToString()
             }
 
             var trainingSession = createMicrogptTrainingSession(
                 inputText = trainingText,
                 randomNumberGenerator = Random(1),
                 trainingStepCount = 100000,
-                validationDivisor = 20
+                validationSetDivisor = 20,
+                validationEvaluationDocumentCount = 10
             )
 
             trainingStepCount = trainingSession.trainingStepCount
@@ -337,8 +367,8 @@ fun App() {
                         trainedMicrogpt = model,
                         prefix = prefix,
                         randomNumberGenerator = sampleRandomNumberGenerator,
-                        sampleCount = 10,
-                        temperature = 0.5
+                        sampleCount = 3,
+                        temperature = 0.25
                     )
                 }
             ) {
@@ -367,7 +397,11 @@ private fun LossMetricText(
         val estimatedAccuracy = estimatedAccuracyFromLoss(loss, vocabularySize)
         val randomAccuracy = 1.0 / vocabularySize.toDouble()
         Text(
-            text = "$label estimated accuracy ${formatPercent(estimatedAccuracy)} | random ${formatPercent(randomAccuracy)} | vocab $vocabularySize",
+            text = "$label estimated accuracy ${formatPercent(estimatedAccuracy)} | random ${
+                formatPercent(
+                    randomAccuracy
+                )
+            } | vocab $vocabularySize",
             style = MaterialTheme.typography.labelMedium
         )
     }
