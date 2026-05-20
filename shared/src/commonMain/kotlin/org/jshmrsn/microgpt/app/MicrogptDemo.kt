@@ -1,10 +1,11 @@
 package org.jshmrsn.microgpt.app
 
-import microgpt_kotlin_visualized.shared.generated.resources.Res
-import org.jetbrains.compose.resources.ExperimentalResourceApi
+import org.jshmrsn.microgpt.lib.MicrogptTrainingProgress
+import org.jshmrsn.microgpt.lib.MicrogptTrainingSession
 import org.jshmrsn.microgpt.lib.TrainedMicrogpt
+import org.jshmrsn.microgpt.lib.createMicrogptTrainingSession
 import org.jshmrsn.microgpt.lib.generateSamples
-import org.jshmrsn.microgpt.lib.microgpt
+import org.jshmrsn.microgpt.lib.trainMicrogptStep
 import kotlin.random.Random
 
 private const val GeneratedExpressionCount = 50_000
@@ -25,17 +26,14 @@ fun generateMicrogptInputText(expressionCount: Int = GeneratedExpressionCount): 
         }
     }
 
-@OptIn(ExperimentalResourceApi::class)
-suspend fun loadMicrogptInputText(): String =
-    Res.readBytes("files/input.txt").decodeToString()
+fun createMicrogptDemoTrainingSession(randomNumberGenerator: Random = Random(0)): MicrogptTrainingSession =
+    createMicrogptTrainingSession(
+        inputText = generateMicrogptInputText(),
+        randomNumberGenerator = randomNumberGenerator
+    )
 
-
-suspend fun trainMicrogptDemo(randomNumberGenerator: Random = Random(0)): TrainedMicrogpt {
-    //val inputText = generateMicrogptInputText()
-    val inputText = loadMicrogptInputText()
-
-    return microgpt(inputText, randomNumberGenerator)
-}
+fun trainMicrogptDemoStep(session: MicrogptTrainingSession): MicrogptTrainingProgress? =
+    trainMicrogptStep(session)
 
 fun generateMicrogptSamples(
     trainedMicrogpt: TrainedMicrogpt,

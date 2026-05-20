@@ -164,6 +164,31 @@ data class TrainedMicrogpt(
     val tokenizer: CharacterTokenizer
 )
 
+data class MicrogptTrainingProgress(
+    val completedStepCount: Int,
+    val trainingStepCount: Int,
+    val loss: Double
+) {
+    val isComplete: Boolean = completedStepCount >= trainingStepCount
+}
+
+data class MicrogptTrainingSession(
+    val trainedMicrogpt: TrainedMicrogpt,
+    val documents: List<String>,
+    val trainingStepCount: Int,
+    val optimizerConfig: AdamOptimizerConfig = AdamOptimizerConfig(),
+    val parameters: List<Value> = trainedMicrogpt.model.values(),
+    val optimizerState: AdamOptimizerState = AdamOptimizerState(
+        firstMomentEstimates = MutableList(parameters.size) { 0.0 },
+        secondMomentEstimates = MutableList(parameters.size) { 0.0 }
+    ),
+    var completedStepCount: Int = 0,
+    var latestLoss: Double? = null
+) {
+    val isComplete: Boolean
+        get() = completedStepCount >= trainingStepCount
+}
+
 private fun Int.leftPad(width: Int): String =
     toString().padStart(width, ' ')
 
@@ -555,41 +580,36 @@ fun weightedHeadValueSum(
     return weightedValueSum
 }
 
-fun trainModel(
-    model: TransformerModelParameters,
-    config: TransformerConfig,
-    tokenizer: CharacterTokenizer,
-    documents: List<String>,
-    trainingStepCount: Int,
-    optimizerConfig: AdamOptimizerConfig = AdamOptimizerConfig()
-) {
-    val parameters = model.values()
-    val optimizerState = AdamOptimizerState(
-        firstMomentEstimates = MutableList(parameters.size) { 0.0 },
-        secondMomentEstimates = MutableList(parameters.size) { 0.0 }
+fun trainMicrogptStep(session: MicrogptTrainingSession): MicrogptTrainingProgress? {
+    if (session.isComplete) return null
+
+    val step = session.completedStepCount
+    val document = session.documents[step % session.documents.size]
+    val loss = trainOnDocument(
+        model = session.trainedMicrogpt.model,
+        config = session.trainedMicrogpt.config,
+        tokenizer = session.trainedMicrogpt.tokenizer,
+        document = document
     )
 
-    for (step in 0 until trainingStepCount) {
-        val document = documents[step % documents.size]
-        val loss = trainOnDocument(
-            model = model,
-            config = config,
-            tokenizer = tokenizer,
-            document = document
-        )
+    loss.backward()
 
-        loss.backward()
+    applyAdamUpdate(
+        parameters = session.parameters,
+        optimizerState = session.optimizerState,
+        optimizerConfig = session.optimizerConfig,
+        step = step,
+        trainingStepCount = session.trainingStepCount
+    )
 
-        applyAdamUpdate(
-            parameters = parameters,
-            optimizerState = optimizerState,
-            optimizerConfig = optimizerConfig,
-            step = step,
-            trainingStepCount = trainingStepCount
-        )
+    session.completedStepCount += 1
+    session.latestLoss = loss.data
 
-        print("step ${(step + 1).leftPad(4)} / ${trainingStepCount.leftPad(4)} | loss ${loss.data.toFixed(4)}\r")
-    }
+    return MicrogptTrainingProgress(
+        completedStepCount = session.completedStepCount,
+        trainingStepCount = session.trainingStepCount,
+        loss = loss.data
+    )
 }
 
 fun trainOnDocument(
@@ -724,7 +744,11 @@ fun generateSamples(
         randomNumberGenerator = randomNumberGenerator
     )
 
-fun microgpt(inputText: String, randomNumberGenerator: Random): TrainedMicrogpt {
+fun createMicrogptTrainingSession(
+    inputText: String,
+    randomNumberGenerator: Random,
+    trainingStepCount: Int = 1000
+): MicrogptTrainingSession {
     /**
      * DATASET
      *
@@ -898,18 +922,21 @@ fun microgpt(inputText: String, randomNumberGenerator: Random): TrainedMicrogpt 
     val parameters = model.values()
     println("num parameters: ${parameters.size}")
 
-    val trainingStepCount = 1000
-    trainModel(
-        model = model,
-        config = config,
-        tokenizer = tokenizer,
+    return MicrogptTrainingSession(
+        trainedMicrogpt = TrainedMicrogpt(
+            model = model,
+            config = config,
+            tokenizer = tokenizer
+        ),
         documents = documents,
         trainingStepCount = trainingStepCount
     )
+}
 
-    return TrainedMicrogpt(
-        model = model,
-        config = config,
-        tokenizer = tokenizer
-    )
+fun microgpt(inputText: String, randomNumberGenerator: Random): TrainedMicrogpt {
+    val session = createMicrogptTrainingSession(inputText, randomNumberGenerator)
+    while (!session.isComplete) {
+        trainMicrogptStep(session)
+    }
+    return session.trainedMicrogpt
 }

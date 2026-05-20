@@ -3,6 +3,7 @@ package org.jshmrsn.microgpt.app
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.Button
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
@@ -12,21 +13,41 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import org.jshmrsn.microgpt.lib.TrainedMicrogpt
+import kotlin.math.roundToLong
 import kotlin.random.Random
+
+private fun formatLoss(loss: Double): String {
+    val scaled = (loss * 10_000.0).roundToLong()
+    val whole = scaled / 10_000
+    val fraction = (scaled % 10_000).toString().padStart(4, '0')
+    return "$whole.$fraction"
+}
 
 @Composable
 @Preview
 fun App() {
     MaterialTheme {
         var trainedMicrogpt by remember { mutableStateOf<TrainedMicrogpt?>(null) }
-        var microgptStatus by remember { mutableStateOf("Training...") }
+        var completedStepCount by remember { mutableStateOf(0) }
+        var trainingStepCount by remember { mutableStateOf(1) }
+        var latestLoss by remember { mutableStateOf<Double?>(null) }
         var prefix by remember { mutableStateOf("1+3=") }
         var samples by remember { mutableStateOf(emptyList<String>()) }
         val sampleRandomNumberGenerator = remember { Random(1) }
 
         LaunchedEffect(Unit) {
-            trainedMicrogpt = trainMicrogptDemo()
-            microgptStatus = "Ready"
+            val trainingSession = createMicrogptDemoTrainingSession()
+            trainingStepCount = trainingSession.trainingStepCount
+
+            while (!trainingSession.isComplete) {
+                val progress = trainMicrogptDemoStep(trainingSession) ?: break
+                completedStepCount = progress.completedStepCount
+                trainingStepCount = progress.trainingStepCount
+                latestLoss = progress.loss
+                withFrameNanos { }
+            }
+
+            trainedMicrogpt = trainingSession.trainedMicrogpt
         }
 
         Column(
@@ -37,7 +58,17 @@ fun App() {
                 .padding(16.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            Text(microgptStatus)
+            val isTraining = trainedMicrogpt == null
+            val progress = completedStepCount.toFloat() / trainingStepCount.toFloat()
+            Text(if (isTraining) "Training" else "Ready")
+            LinearProgressIndicator(
+                progress = { progress },
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Text("Step $completedStepCount / $trainingStepCount")
+            latestLoss?.let { loss ->
+                Text("Loss ${formatLoss(loss)}")
+            }
             OutlinedTextField(
                 value = prefix,
                 onValueChange = { prefix = it },
