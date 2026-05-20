@@ -1,20 +1,24 @@
 package org.jshmrsn.microgpt.app
 
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeContentPadding
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.tooling.preview.Preview
+import androidx.compose.ui.unit.dp
 import org.jetbrains.compose.resources.painterResource
+import org.jshmrsn.microgpt.lib.TrainedMicrogpt
+import kotlin.random.Random
 
 import microgpt_kotlin_visualized.shared.generated.resources.Res
 import microgpt_kotlin_visualized.shared.generated.resources.compose_multiplatform
@@ -23,38 +27,55 @@ import microgpt_kotlin_visualized.shared.generated.resources.compose_multiplatfo
 @Preview
 fun App() {
     MaterialTheme {
-        var showContent by remember { mutableStateOf(false) }
-        var microgptStatus by remember { mutableStateOf("MicroGPT has not run yet.") }
-        var hasRunMicrogpt by remember { mutableStateOf(false) }
+        var trainedMicrogpt by remember { mutableStateOf<TrainedMicrogpt?>(null) }
+        var microgptStatus by remember { mutableStateOf("Training...") }
+        var prefix by remember { mutableStateOf("") }
+        var samples by remember { mutableStateOf(emptyList<String>()) }
+        val sampleRandomNumberGenerator = remember { Random(1) }
 
-        LaunchedEffect(showContent) {
-            if (showContent && !hasRunMicrogpt) {
-                hasRunMicrogpt = true
-                microgptStatus = "Running MicroGPT with bundled input.txt..."
-                runMicrogptDemo()
-                microgptStatus = "MicroGPT finished. See the run console for samples."
-            }
+        LaunchedEffect(Unit) {
+            trainedMicrogpt = trainMicrogptDemo()
+            microgptStatus = "Ready"
         }
 
         Column(
             modifier = Modifier
                 .background(MaterialTheme.colorScheme.primaryContainer)
                 .safeContentPadding()
-                .fillMaxSize(),
+                .fillMaxSize()
+                .padding(16.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            Button(onClick = { showContent = !showContent }) {
-                Text("Click me!")
+            val greeting = remember { Greeting().greet() }
+            Image(painterResource(Res.drawable.compose_multiplatform), null)
+            Text("Compose: $greeting")
+            Text(microgptStatus)
+            OutlinedTextField(
+                value = prefix,
+                onValueChange = { prefix = it },
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("Prefix") },
+                singleLine = true,
+            )
+            Button(
+                enabled = trainedMicrogpt != null,
+                onClick = {
+                    val model = trainedMicrogpt ?: return@Button
+                    samples = generateMicrogptSamples(
+                        trainedMicrogpt = model,
+                        prefix = prefix,
+                        randomNumberGenerator = sampleRandomNumberGenerator
+                    )
+                }
+            ) {
+                Text("Generate")
             }
-            AnimatedVisibility(showContent) {
-                val greeting = remember { Greeting().greet() }
-                Column(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                ) {
-                    Image(painterResource(Res.drawable.compose_multiplatform), null)
-                    Text("Compose: $greeting")
-                    Text(microgptStatus)
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                samples.forEachIndexed { index, sample ->
+                    Text("Sample ${index + 1}: $sample")
                 }
             }
         }

@@ -2,6 +2,8 @@ package org.jshmrsn.microgpt.app
 
 import microgpt_kotlin_visualized.shared.generated.resources.Res
 import org.jetbrains.compose.resources.ExperimentalResourceApi
+import org.jshmrsn.microgpt.lib.TrainedMicrogpt
+import org.jshmrsn.microgpt.lib.generateSamples
 import org.jshmrsn.microgpt.lib.microgpt
 import kotlin.random.Random
 
@@ -9,7 +11,22 @@ import kotlin.random.Random
 suspend fun loadMicrogptInputText(): String =
     Res.readBytes("files/input.txt").decodeToString()
 
-suspend fun runMicrogptDemo(randomNumberGenerator: Random = Random(0)) {
+suspend fun trainMicrogptDemo(randomNumberGenerator: Random = Random(0)): TrainedMicrogpt {
     val inputText = loadMicrogptInputText()
-    microgpt(inputText, randomNumberGenerator)
+    return microgpt(inputText, randomNumberGenerator)
 }
+
+fun generateMicrogptSamples(
+    trainedMicrogpt: TrainedMicrogpt,
+    prefix: String,
+    sampleCount: Int = 10,
+    temperature: Double = 0.5,
+    randomNumberGenerator: Random
+): List<String> =
+    generateSamples(
+        trainedMicrogpt = trainedMicrogpt,
+        prefix = prefix,
+        sampleCount = sampleCount,
+        temperature = temperature,
+        randomNumberGenerator = randomNumberGenerator
+    )

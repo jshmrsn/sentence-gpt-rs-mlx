@@ -156,6 +156,12 @@ data class AdamOptimizerConfig(
     val epsilon: Double = 1e-8
 )
 
+data class TrainedMicrogpt(
+    val model: TransformerModelParameters,
+    val config: TransformerConfig,
+    val tokenizer: CharacterTokenizer
+)
+
 /**
  * Gaussian parameter initialization via Box-Muller.
  *
@@ -631,31 +637,46 @@ fun generateSamples(
     model: TransformerModelParameters,
     config: TransformerConfig,
     tokenizer: CharacterTokenizer,
+    prefix: String,
     sampleCount: Int,
     temperature: Double,
     randomNumberGenerator: Random
-) {
+): List<String> {
     println("\n--- inference (new, hallucinated names) ---")
+    val samples = mutableListOf<String>()
     for (sampleIndex in 0 until sampleCount) {
-        val sample = generateSample(model, config, tokenizer, temperature, randomNumberGenerator)
+        val sample = generateSample(model, config, tokenizer, prefix, temperature, randomNumberGenerator)
+        samples.add(sample)
         println("sample ${"%2d".format(sampleIndex + 1)}: $sample")
     }
+    return samples
 }
 
 fun generateSample(
     model: TransformerModelParameters,
     config: TransformerConfig,
     tokenizer: CharacterTokenizer,
+    prefix: String,
     temperature: Double,
     randomNumberGenerator: Random
 ): String {
     val keys = createKeyValueCache(config.layerCount)
     val values = createKeyValueCache(config.layerCount)
     var tokenId = tokenizer.sequenceBoundaryTokenId
-    val sample = StringBuilder()
+    val normalizedPrefix = prefix
+        .trim()
+        .lowercase()
+        .filter { character -> character in tokenizer.characterToTokenId }
+        .take(config.contextWindowSize - 1)
+    val sample = StringBuilder(normalizedPrefix)
 
     for (positionId in 0 until config.contextWindowSize) {
         val logits = runTransformerModel(model, config, tokenId, positionId, keys, values)
+        if (positionId < normalizedPrefix.length) {
+            tokenId = tokenizer.characterToTokenId.getValue(normalizedPrefix[positionId])
+            continue
+        }
+
         val scaledLogits = logits.map { it / temperature }
         val probabilities = softmax(scaledLogits)
 
@@ -668,7 +689,24 @@ fun generateSample(
     return sample.toString()
 }
 
-fun microgpt(inputText: String, randomNumberGenerator: Random) {
+fun generateSamples(
+    trainedMicrogpt: TrainedMicrogpt,
+    prefix: String,
+    sampleCount: Int,
+    temperature: Double,
+    randomNumberGenerator: Random
+): List<String> =
+    generateSamples(
+        model = trainedMicrogpt.model,
+        config = trainedMicrogpt.config,
+        tokenizer = trainedMicrogpt.tokenizer,
+        prefix = prefix,
+        sampleCount = sampleCount,
+        temperature = temperature,
+        randomNumberGenerator = randomNumberGenerator
+    )
+
+fun microgpt(inputText: String, randomNumberGenerator: Random): TrainedMicrogpt {
     /**
      * DATASET
      *
@@ -851,13 +889,9 @@ fun microgpt(inputText: String, randomNumberGenerator: Random) {
         trainingStepCount = trainingStepCount
     )
 
-    val temperature = 0.5
-    generateSamples(
+    return TrainedMicrogpt(
         model = model,
         config = config,
-        tokenizer = tokenizer,
-        sampleCount = 20,
-        temperature = temperature,
-        randomNumberGenerator = randomNumberGenerator
+        tokenizer = tokenizer
     )
 }
