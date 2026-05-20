@@ -47,7 +47,7 @@ import kotlin.time.TimeSource
 
 private val TrainingFrameBudget = 100.milliseconds
 private const val ValidationStepInterval = 50
-private const val TrainingBatchDocumentCount = 4
+private const val TrainingBatchDocumentCount = 12
 private const val DemoDocumentLimit = 250
 
 private data class TrainingChunkResult(
