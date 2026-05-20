@@ -47,9 +47,11 @@ package org.jshmrsn.microgpt.lib
  * If you understand this file, you understand the core algorithmic essence
  * of GPT training and inference.
  */
+import kotlin.math.PI
 import kotlin.math.cos
 import kotlin.math.ln
 import kotlin.math.pow
+import kotlin.math.roundToLong
 import kotlin.math.sqrt
 import kotlin.random.Random
 
@@ -162,6 +164,22 @@ data class TrainedMicrogpt(
     val tokenizer: CharacterTokenizer
 )
 
+private fun Int.leftPad(width: Int): String =
+    toString().padStart(width, ' ')
+
+private fun Double.toFixed(decimalPlaces: Int): String {
+    var scale = 1L
+    repeat(decimalPlaces) { scale *= 10L }
+
+    val scaled = (this * scale).roundToLong()
+    val sign = if (scaled < 0) "-" else ""
+    val absoluteScaled = if (scaled < 0) -scaled else scaled
+    val whole = absoluteScaled / scale
+    val fraction = (absoluteScaled % scale).toString().padStart(decimalPlaces, '0')
+
+    return "$sign$whole.$fraction"
+}
+
 /**
  * Gaussian parameter initialization via Box-Muller.
  *
@@ -204,7 +222,7 @@ fun randomGaussian(
     }
     val secondUniformSample = randomNumberGenerator.nextDouble()
     val standardNormalSample =
-        sqrt(-2.0 * ln(firstUniformSample)) * cos(2.0 * Math.PI * secondUniformSample)
+        sqrt(-2.0 * ln(firstUniformSample)) * cos(2.0 * PI * secondUniformSample)
     return mean + standardDeviation * standardNormalSample
 }
 
@@ -570,7 +588,7 @@ fun trainModel(
             trainingStepCount = trainingStepCount
         )
 
-        print("step ${"%4d".format(step + 1)} / ${"%4d".format(trainingStepCount)} | loss ${"%.4f".format(loss.data)}\r")
+        print("step ${(step + 1).leftPad(4)} / ${trainingStepCount.leftPad(4)} | loss ${loss.data.toFixed(4)}\r")
     }
 }
 
@@ -647,7 +665,7 @@ fun generateSamples(
     for (sampleIndex in 0 until sampleCount) {
         val sample = generateSample(model, config, tokenizer, prefix, temperature, randomNumberGenerator)
         samples.add(sample)
-        println("sample ${"%2d".format(sampleIndex + 1)}: $sample")
+        println("sample ${(sampleIndex + 1).leftPad(2)}: $sample")
     }
     return samples
 }

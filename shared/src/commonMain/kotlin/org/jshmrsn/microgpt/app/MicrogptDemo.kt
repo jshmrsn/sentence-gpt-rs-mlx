@@ -19,8 +19,8 @@ suspend fun trainMicrogptDemo(randomNumberGenerator: Random = Random(0)): Traine
 fun generateMicrogptSamples(
     trainedMicrogpt: TrainedMicrogpt,
     prefix: String,
-    sampleCount: Int = 10,
-    temperature: Double = 0.5,
+    sampleCount: Int,
+    temperature: Double,
     randomNumberGenerator: Random
 ): List<String> =
     generateSamples(

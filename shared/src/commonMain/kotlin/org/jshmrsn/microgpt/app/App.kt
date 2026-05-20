@@ -1,12 +1,7 @@
 package org.jshmrsn.microgpt.app
 
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.safeContentPadding
+import androidx.compose.foundation.layout.*
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
@@ -16,12 +11,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
-import org.jetbrains.compose.resources.painterResource
 import org.jshmrsn.microgpt.lib.TrainedMicrogpt
 import kotlin.random.Random
-
-import microgpt_kotlin_visualized.shared.generated.resources.Res
-import microgpt_kotlin_visualized.shared.generated.resources.compose_multiplatform
 
 @Composable
 @Preview
@@ -46,9 +37,6 @@ fun App() {
                 .padding(16.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            val greeting = remember { Greeting().greet() }
-            Image(painterResource(Res.drawable.compose_multiplatform), null)
-            Text("Compose: $greeting")
             Text(microgptStatus)
             OutlinedTextField(
                 value = prefix,
@@ -64,7 +52,9 @@ fun App() {
                     samples = generateMicrogptSamples(
                         trainedMicrogpt = model,
                         prefix = prefix,
-                        randomNumberGenerator = sampleRandomNumberGenerator
+                        randomNumberGenerator = sampleRandomNumberGenerator,
+                        sampleCount = 10,
+                        temperature = 0.5
                     )
                 }
             ) {
