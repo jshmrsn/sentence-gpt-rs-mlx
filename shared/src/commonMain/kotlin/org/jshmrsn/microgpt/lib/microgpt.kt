@@ -53,6 +53,10 @@ import kotlin.math.ln
 import kotlin.math.pow
 import kotlin.math.sqrt
 import kotlin.random.Random
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 
 typealias Matrix = List<List<Value>>
 typealias KeyValueCache = List<List<List<Value>>>
@@ -255,6 +259,11 @@ data class MicrogptTrainingStepResult(
 data class AdamUpdateResult(
     val model: TransformerModelParameters,
     val optimizerState: AdamOptimizerState
+)
+
+private data class DocumentTrainingResult(
+    val loss: Double,
+    val gradients: Map<Value, Double>
 )
 
 private data class ParameterUpdate(
@@ -651,6 +660,45 @@ fun weightedHeadValueSum(
     return weightedValueSum
 }
 
+private fun trainingBatchDocuments(
+    documents: List<String>,
+    step: Int,
+    batchDocumentCount: Int
+): List<String> {
+    val batchStartIndex = (step * batchDocumentCount) % documents.size
+    return List(batchDocumentCount) { batchOffset ->
+        documents[(batchStartIndex + batchOffset) % documents.size]
+    }
+}
+
+private fun trainOnDocumentWithGradients(
+    model: TransformerModelParameters,
+    config: TransformerConfig,
+    tokenizer: CharacterTokenizer,
+    document: String
+): DocumentTrainingResult {
+    val loss = trainOnDocument(
+        model = model,
+        config = config,
+        tokenizer = tokenizer,
+        document = document
+    )
+    return DocumentTrainingResult(
+        loss = loss.data,
+        gradients = loss.backward()
+    )
+}
+
+private fun averageGradients(
+    parameters: List<Value>,
+    gradientsPerDocument: List<Map<Value, Double>>
+): Map<Value, Double> {
+    val inverseDocumentCount = 1.0 / gradientsPerDocument.size.toDouble()
+    return parameters.associateWith { parameter ->
+        gradientsPerDocument.sumOf { gradients -> gradients[parameter] ?: 0.0 } * inverseDocumentCount
+    }
+}
+
 fun trainMicrogptStep(session: MicrogptTrainingSession): MicrogptTrainingStepResult? {
     if (session.isComplete) return null
 
@@ -679,6 +727,63 @@ fun trainMicrogptStep(session: MicrogptTrainingSession): MicrogptTrainingStepRes
         completedStepCount = session.completedStepCount + 1,
         trainingStepCount = session.trainingStepCount,
         loss = loss.data,
+        validationLoss = null
+    )
+    val progressHistory = session.progressHistory + progress
+
+    return MicrogptTrainingStepResult(
+        session = session.copy(
+            trainedMicrogpt = updatedMicrogpt,
+            optimizerState = update.optimizerState,
+            completedStepCount = progress.completedStepCount,
+            latestLoss = progress.loss,
+            progressHistory = progressHistory
+        ),
+        progress = progress,
+        progressHistory = progressHistory
+    )
+}
+
+suspend fun trainMicrogptStepParallel(
+    session: MicrogptTrainingSession,
+    batchDocumentCount: Int
+): MicrogptTrainingStepResult? {
+    if (session.isComplete) return null
+
+    require(batchDocumentCount > 0) { "batchDocumentCount must be positive" }
+
+    val step = session.completedStepCount
+    val batchDocuments = trainingBatchDocuments(session.documents, step, batchDocumentCount)
+    val documentResults = coroutineScope {
+        batchDocuments.map { document ->
+            async(Dispatchers.Default) {
+                trainOnDocumentWithGradients(
+                    model = session.trainedMicrogpt.model,
+                    config = session.trainedMicrogpt.config,
+                    tokenizer = session.trainedMicrogpt.tokenizer,
+                    document = document
+                )
+            }
+        }.awaitAll()
+    }
+    val parameters = session.trainedMicrogpt.model.values()
+    val averageLoss = documentResults.sumOf { it.loss } / documentResults.size.toDouble()
+    val averagedGradients = averageGradients(parameters, documentResults.map { it.gradients })
+
+    val update = applyAdamUpdate(
+        model = session.trainedMicrogpt.model,
+        gradients = averagedGradients,
+        optimizerState = session.optimizerState,
+        optimizerConfig = session.optimizerConfig,
+        step = step,
+        trainingStepCount = session.trainingStepCount
+    )
+    val updatedMicrogpt = session.trainedMicrogpt.copy(model = update.model)
+
+    val progress = MicrogptTrainingProgress(
+        completedStepCount = session.completedStepCount + 1,
+        trainingStepCount = session.trainingStepCount,
+        loss = averageLoss,
         validationLoss = null
     )
     val progressHistory = session.progressHistory + progress

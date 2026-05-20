@@ -20,6 +20,9 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
@@ -34,6 +37,7 @@ import org.jshmrsn.microgpt.lib.TransformerConfig
 import org.jshmrsn.microgpt.lib.calculateDocumentLoss
 import org.jshmrsn.microgpt.lib.createMicrogptTrainingSession
 import org.jshmrsn.microgpt.lib.shuffledBy
+import org.jshmrsn.microgpt.lib.trainMicrogptStepParallel
 import kotlin.math.ln
 import kotlin.math.roundToLong
 import kotlin.random.Random
@@ -43,7 +47,14 @@ import kotlin.time.TimeSource
 
 private val TrainingFrameBudget = 100.milliseconds
 private const val ValidationStepInterval = 50
+private const val TrainingBatchDocumentCount = 4
 private const val DemoDocumentLimit = 250
+
+private data class TrainingChunkResult(
+    val session: MicrogptTrainingSession,
+    val latestResult: MicrogptTrainingStepResult,
+    val nextValidationStep: Int
+)
 
 private fun formatLoss(loss: Double): String {
     val scaled = (loss * 10_000.0).roundToLong()
@@ -160,11 +171,14 @@ fun App() {
         var trainingSessionState by remember { mutableStateOf<MicrogptTrainingSession?>(null) }
         var nextValidationStep by remember { mutableStateOf(ValidationStepInterval) }
         var isTrainingActive by remember { mutableStateOf(false) }
+        var isGeneratingSamples by remember { mutableStateOf(false) }
         var resetGeneration by remember { mutableStateOf(0) }
+        val coroutineScope = rememberCoroutineScope()
         val sampleRandomNumberGenerator = remember { Random(1) }
 
         LaunchedEffect(resetGeneration) {
             isTrainingActive = false
+            isGeneratingSamples = false
             trainedMicrogpt = null
             completedStepCount = 0
             trainingStepCount = 1
@@ -178,94 +192,95 @@ fun App() {
             trainingSessionState = null
             samples = emptyList()
 
-            val inputDocuments = run {
-                val excludeCharacters = listOf(
-                    "$",
-                    "&",
-                    "\"",
-                    "“",
-                    "”",
-                    "(",
-                    ")",
-                    "*",
-                    "'",
-                    "_",
-                    "-",
-                    "–",
-                    "…",
-                    "%",
-                    "~",
-                    "`",
-                    "[",
-                    "]",
-                    "{",
-                    "}",
-                    "\\",
-                    ";",
-                    "|",
-                    "—",
-                    "-",
-                    "é",
-                    "/",
-                    "’",
-                    "‘",
-                    ":",
-                    "0",
-                    "1",
-                    "2",
-                    "3",
-                    "4",
-                    "5",
-                    "6",
-                    "7",
-                    "8",
-                    "9"
-                )
-                val storiesJsonString = Res.readBytes("files/input-stories-00.json").decodeToString()
-                val stories: List<Story> = Json.decodeFromString<List<Story>>(storiesJsonString)
-                val sentences = stories
-                    .filter { it.source == "GPT-4" }
-                    .flatMap { story ->
-                        story.story
-                            .replace("!", ".")
-                            .replace("?", ".")
-                            .split(".")
-                            .filter { sentence -> excludeCharacters.none { it in sentence } }
-                            .map { sentence ->
-                                sentence
-                                    .replace("\n", "")
-                                    .replace(",", "")
-                                    .trim()
-                                .lowercase()
-                            }
-                            .filter { sentence -> sentence.length > 10 && sentence.contains(" ") }
-                    }
+            var trainingSession = withContext(Dispatchers.Default) {
+                val inputDocuments = run {
+                    val excludeCharacters = listOf(
+                        "$",
+                        "&",
+                        "\"",
+                        "“",
+                        "”",
+                        "(",
+                        ")",
+                        "*",
+                        "'",
+                        "_",
+                        "-",
+                        "–",
+                        "…",
+                        "%",
+                        "~",
+                        "`",
+                        "[",
+                        "]",
+                        "{",
+                        "}",
+                        "\\",
+                        ";",
+                        "|",
+                        "—",
+                        "-",
+                        "é",
+                        "/",
+                        "’",
+                        "‘",
+                        ":",
+                        "0",
+                        "1",
+                        "2",
+                        "3",
+                        "4",
+                        "5",
+                        "6",
+                        "7",
+                        "8",
+                        "9"
+                    )
+                    val storiesJsonString = Res.readBytes("files/input-stories-00.json").decodeToString()
+                    val stories: List<Story> = Json.decodeFromString<List<Story>>(storiesJsonString)
+                    val sentences = stories
+                        .filter { it.source == "GPT-4" }
+                        .flatMap { story ->
+                            story.story
+                                .replace("!", ".")
+                                .replace("?", ".")
+                                .split(".")
+                                .filter { sentence -> excludeCharacters.none { it in sentence } }
+                                .map { sentence ->
+                                    sentence
+                                        .replace("\n", "")
+                                        .replace(",", "")
+                                        .trim()
+                                        .lowercase()
+                                }
+                                .filter { sentence -> sentence.length > 10 && sentence.contains(" ") }
+                        }
 
-                // Keep the interactive demo in a toy-data regime so the scalar
-                // training loop can complete multiple passes over the corpus.
-                sentences.take(DemoDocumentLimit).shuffledBy(Random(1))
-                //Res.readBytes("files/input-names.txt").decodeToString()
+                    // Keep the interactive demo in a toy-data regime so the scalar
+                    // training loop can complete multiple passes over the corpus.
+                    sentences.take(DemoDocumentLimit).shuffledBy(Random(1))
+                }
+
+                createMicrogptTrainingSession(
+                    inputDocuments = inputDocuments,
+                    randomNumberGenerator = Random(1),
+                    trainingStepCount = 8000,
+                    validationSetDivisor = 20,
+                    validationEvaluationDocumentCount = 8,
+                    transformerConfig = TransformerConfig(
+                        layerCount = 2,
+                        embeddingSize = 24,
+                        contextWindowSize = 48,
+                        attentionHeadCount = 4
+                    ),
+                    optimizerConfig = AdamOptimizerConfig(
+                        learningRate = 0.003,
+                        firstMomentDecay = 0.9,
+                        secondMomentDecay = 0.999,
+                        epsilon = 1e-8
+                    )
+                )
             }
-
-            var trainingSession = createMicrogptTrainingSession(
-                inputDocuments = inputDocuments,
-                randomNumberGenerator = Random(1),
-                trainingStepCount = 8000,
-                validationSetDivisor = 20,
-                validationEvaluationDocumentCount = 8,
-                transformerConfig = TransformerConfig(
-                    layerCount = 2,
-                    embeddingSize = 24,
-                    contextWindowSize = 48,
-                    attentionHeadCount = 4
-                ),
-                optimizerConfig = AdamOptimizerConfig(
-                    learningRate = 0.003,
-                    firstMomentDecay = 0.9,
-                    secondMomentDecay = 0.999,
-                    epsilon = 1e-8
-                )
-            )
 
             trainingStepCount = trainingSession.trainingStepCount
             trainingExampleCount = trainingSession.documents.size
@@ -274,13 +289,15 @@ fun App() {
                 trainingSession.validationEvaluationDocumentCount,
                 trainingSession.validationDocuments.size
             )
-            trainingSession = trainingSession.withInitialProgress(
-                trainLoss = calculateTrainingLossBaseline(trainingSession),
-                validationLoss = calculateValidationLoss(
-                    session = trainingSession,
-                    completedStepCount = 0
+            trainingSession = withContext(Dispatchers.Default) {
+                trainingSession.withInitialProgress(
+                    trainLoss = calculateTrainingLossBaseline(trainingSession),
+                    validationLoss = calculateValidationLoss(
+                        session = trainingSession,
+                        completedStepCount = 0
+                    )
                 )
-            )
+            }
             latestLoss = trainingSession.latestLoss
             latestValidationLoss = trainingSession.latestValidationLoss
             progressHistory = trainingSession.progressHistory
@@ -297,38 +314,54 @@ fun App() {
             var localNextValidationStep = nextValidationStep
 
             while (!trainingSession.isComplete) {
-                val frameStart = TimeSource.Monotonic.markNow()
-                var latestResult: MicrogptTrainingStepResult? = null
+                val chunkResult = withContext(Dispatchers.Default) {
+                    val frameStart = TimeSource.Monotonic.markNow()
+                    var backgroundSession = trainingSession
+                    var backgroundNextValidationStep = localNextValidationStep
+                    var latestResult: MicrogptTrainingStepResult? = null
 
-                do {
-                    val result = trainMicrogptDemoStep(trainingSession) ?: break
-                    trainingSession = result.session
-                    latestResult = result
-                } while (
-                    !trainingSession.isComplete &&
-                    trainingSession.completedStepCount < localNextValidationStep &&
-                    frameStart.elapsedNow() < TrainingFrameBudget
-                )
-
-                var result = latestResult ?: break
-                if (trainingSession.completedStepCount >= localNextValidationStep) {
-                    result = result.withValidationLoss(
-                        calculateValidationLoss(
-                            session = trainingSession,
-                            completedStepCount = trainingSession.completedStepCount
-                        )
+                    do {
+                        val result = trainMicrogptStepParallel(
+                            session = backgroundSession,
+                            batchDocumentCount = TrainingBatchDocumentCount
+                        ) ?: break
+                        backgroundSession = result.session
+                        latestResult = result
+                    } while (
+                        !backgroundSession.isComplete &&
+                        backgroundSession.completedStepCount < backgroundNextValidationStep &&
+                        frameStart.elapsedNow() < TrainingFrameBudget
                     )
-                    trainingSession = result.session
-                    localNextValidationStep += ValidationStepInterval
-                }
-                val progress = result.progress
+
+                    var result = latestResult ?: return@withContext null
+                    if (backgroundSession.completedStepCount >= backgroundNextValidationStep) {
+                        result = result.withValidationLoss(
+                            calculateValidationLoss(
+                                session = backgroundSession,
+                                completedStepCount = backgroundSession.completedStepCount
+                            )
+                        )
+                        backgroundSession = result.session
+                        backgroundNextValidationStep += ValidationStepInterval
+                    }
+
+                    TrainingChunkResult(
+                        session = backgroundSession,
+                        latestResult = result,
+                        nextValidationStep = backgroundNextValidationStep
+                    )
+                } ?: break
+
+                trainingSession = chunkResult.session
+                localNextValidationStep = chunkResult.nextValidationStep
+                val progress = chunkResult.latestResult.progress
                 trainingSessionState = trainingSession
                 nextValidationStep = localNextValidationStep
                 completedStepCount = progress.completedStepCount
                 trainingStepCount = progress.trainingStepCount
                 latestLoss = progress.loss
                 latestValidationLoss = progress.validationLoss ?: trainingSession.latestValidationLoss
-                progressHistory = result.progressHistory
+                progressHistory = chunkResult.latestResult.progressHistory
                 visibleMicrogpt = trainingSession.trainedMicrogpt
 
                 trainedMicrogpt = trainingSession.trainedMicrogpt
@@ -384,7 +417,7 @@ fun App() {
             Text("Step $completedStepCount / $trainingStepCount")
             if (trainingExampleCount > 0 || validationExampleCount > 0) {
                 Text(
-                    text = "Train examples $trainingExampleCount | validation examples $validationExampleCount | validation batch $validationEvaluationExampleCount",
+                    text = "Train examples $trainingExampleCount | validation examples $validationExampleCount | validation batch $validationEvaluationExampleCount | train batch $TrainingBatchDocumentCount",
                     style = MaterialTheme.typography.labelMedium
                 )
             }
@@ -424,19 +457,29 @@ fun App() {
                 singleLine = true,
             )
             Button(
-                enabled = trainedMicrogpt != null,
+                enabled = trainedMicrogpt != null && !isGeneratingSamples,
                 onClick = {
                     val model = trainedMicrogpt ?: return@Button
-                    samples = generateMicrogptSamples(
-                        trainedMicrogpt = model,
-                        prefix = prefix,
-                        randomNumberGenerator = sampleRandomNumberGenerator,
-                        sampleCount = 10,
-                        temperature = 0.5
-                    )
+                    isGeneratingSamples = true
+                    coroutineScope.launch {
+                        try {
+                            val generatedSamples = withContext(Dispatchers.Default) {
+                                generateMicrogptSamples(
+                                    trainedMicrogpt = model,
+                                    prefix = prefix,
+                                    randomNumberGenerator = sampleRandomNumberGenerator,
+                                    sampleCount = 10,
+                                    temperature = 0.5
+                                )
+                            }
+                            samples = generatedSamples
+                        } finally {
+                            isGeneratingSamples = false
+                        }
+                    }
                 }
             ) {
-                Text("Generate")
+                Text(if (isGeneratingSamples) "Generating" else "Generate")
             }
             Column(
                 modifier = Modifier.fillMaxWidth(),

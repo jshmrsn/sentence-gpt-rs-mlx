@@ -4,6 +4,7 @@ import kotlin.math.ln
 import kotlin.math.max
 import kotlin.math.pow
 
+
 /**
  * A scalar node in a computation graph.
  *
@@ -30,17 +31,11 @@ import kotlin.math.pow
  *   much faster but conceptually the same.
  */
 
-data class Value(
+class Value(
     val data: Double,
     val children: List<Value> = emptyList(),
-    val localGradients: List<Double> = emptyList(),
-    private val nodeId: Long = nextValueNodeId()
+    val localGradients: List<Double> = emptyList()
 ) {
-    override fun equals(other: Any?): Boolean =
-        this === other || (other is Value && nodeId == other.nodeId)
-
-    override fun hashCode(): Int = nodeId.hashCode()
-
     /**
      * Addition node.
      *
@@ -240,14 +235,6 @@ data class Value(
         }
         return gradients
     }
-}
-
-private var nextValueNodeId = 0L
-
-private fun nextValueNodeId(): Long {
-    val nodeId = nextValueNodeId
-    nextValueNodeId += 1L
-    return nodeId
 }
 
 operator fun Double.plus(other: Value): Value = Value(this) + other
