@@ -668,7 +668,7 @@ fun generateSample(
     return sample.toString()
 }
 
-fun microgpt(randomNumberGenerator: Random) {
+fun microgpt(inputText: String, randomNumberGenerator: Random) {
     /**
      * DATASET
      *
@@ -689,17 +689,7 @@ fun microgpt(randomNumberGenerator: Random) {
     //
     // In machine learning, the dataset is the source of examples from which
     // the model learns statistical patterns.
-    val inputFile = File("input.txt")
-    if (!inputFile.exists()) {
-        val namesUrl = "https://raw.githubusercontent.com/karpathy/makemore/988aa59/names.txt"
-        URL(namesUrl).openStream().use { input ->
-            inputFile.outputStream().use { output ->
-                input.copyTo(output)
-            }
-        }
-    }
-
-    val documents = inputFile.readLines()
+    val documents = inputText.lines()
         .map { it.trim() }
         .filter { it.isNotEmpty() }
         .toMutableList()

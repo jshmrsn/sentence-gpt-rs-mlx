@@ -24,6 +24,18 @@ import microgpt_kotlin_visualized.shared.generated.resources.compose_multiplatfo
 fun App() {
     MaterialTheme {
         var showContent by remember { mutableStateOf(false) }
+        var microgptStatus by remember { mutableStateOf("MicroGPT has not run yet.") }
+        var hasRunMicrogpt by remember { mutableStateOf(false) }
+
+        LaunchedEffect(showContent) {
+            if (showContent && !hasRunMicrogpt) {
+                hasRunMicrogpt = true
+                microgptStatus = "Running MicroGPT with bundled input.txt..."
+                runMicrogptDemo()
+                microgptStatus = "MicroGPT finished. See the run console for samples."
+            }
+        }
+
         Column(
             modifier = Modifier
                 .background(MaterialTheme.colorScheme.primaryContainer)
@@ -42,6 +54,7 @@ fun App() {
                 ) {
                     Image(painterResource(Res.drawable.compose_multiplatform), null)
                     Text("Compose: $greeting")
+                    Text(microgptStatus)
                 }
             }
         }
