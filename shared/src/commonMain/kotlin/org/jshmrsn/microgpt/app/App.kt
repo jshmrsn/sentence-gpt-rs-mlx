@@ -176,9 +176,7 @@ fun App() {
             trainingSessionState = null
             samples = emptyList()
 
-            val trainingText = if (false) {
-                generateMathTrainingText()
-            } else {
+            val inputDocuments = run {
                 val excludeCharacters = listOf(
                     "$",
                     "&",
@@ -246,7 +244,7 @@ fun App() {
             }
 
             var trainingSession = createMicrogptTrainingSession(
-                inputText = trainingText,
+                inputDocuments = inputDocuments,
                 randomNumberGenerator = Random(1),
                 trainingStepCount = 100000,
                 validationSetDivisor = 20,

@@ -843,7 +843,7 @@ fun generateSamples(
     )
 
 fun createMicrogptTrainingSession(
-    inputText: List<String>,
+    inputDocuments: List<String>,
     randomNumberGenerator: Random,
     trainingStepCount: Int,
     validationSetDivisor: Int,
@@ -871,7 +871,7 @@ fun createMicrogptTrainingSession(
     //
     // In machine learning, the dataset is the source of examples from which
     // the model learns statistical patterns.
-    val shuffledDocuments = inputText
+    val shuffledDocuments = inputDocuments
         .map { it.trim() }
         .filter { it.isNotEmpty() }
         .shuffledBy(randomNumberGenerator)
