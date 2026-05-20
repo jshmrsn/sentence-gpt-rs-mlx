@@ -1,7 +1,7 @@
 package org.jshmrsn.microgpt.app
 
-import org.jshmrsn.microgpt.lib.MicrogptTrainingProgress
 import org.jshmrsn.microgpt.lib.MicrogptTrainingSession
+import org.jshmrsn.microgpt.lib.MicrogptTrainingStepResult
 import org.jshmrsn.microgpt.lib.TrainedMicrogpt
 import org.jshmrsn.microgpt.lib.createMicrogptTrainingSession
 import org.jshmrsn.microgpt.lib.generateSamples
@@ -32,7 +32,7 @@ fun createMicrogptDemoTrainingSession(randomNumberGenerator: Random = Random(0))
         randomNumberGenerator = randomNumberGenerator
     )
 
-fun trainMicrogptDemoStep(session: MicrogptTrainingSession): MicrogptTrainingProgress? =
+fun trainMicrogptDemoStep(session: MicrogptTrainingSession): MicrogptTrainingStepResult? =
     trainMicrogptStep(session)
 
 fun generateMicrogptSamples(

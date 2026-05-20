@@ -36,11 +36,13 @@ fun App() {
         val sampleRandomNumberGenerator = remember { Random(1) }
 
         LaunchedEffect(Unit) {
-            val trainingSession = createMicrogptDemoTrainingSession()
+            var trainingSession = createMicrogptDemoTrainingSession()
             trainingStepCount = trainingSession.trainingStepCount
 
             while (!trainingSession.isComplete) {
-                val progress = trainMicrogptDemoStep(trainingSession) ?: break
+                val result = trainMicrogptDemoStep(trainingSession) ?: break
+                trainingSession = result.session
+                val progress = result.progress
                 completedStepCount = progress.completedStepCount
                 trainingStepCount = progress.trainingStepCount
                 latestLoss = progress.loss

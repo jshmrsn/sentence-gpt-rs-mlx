@@ -51,11 +51,11 @@ import kotlin.math.PI
 import kotlin.math.cos
 import kotlin.math.ln
 import kotlin.math.pow
-import kotlin.math.roundToLong
 import kotlin.math.sqrt
 import kotlin.random.Random
 
-typealias Matrix = MutableList<MutableList<Value>>
+typealias Matrix = List<List<Value>>
+typealias KeyValueCache = List<List<List<Value>>>
 
 data class AttentionParameters(
     val queryWeights: Matrix,
@@ -122,6 +122,52 @@ data class TransformerModelParameters(
     }
 }
 
+private fun TransformerModelParameters.withValues(values: List<Value>): TransformerModelParameters {
+    var valueIndex = 0
+
+    fun nextMatrix(matrix: Matrix): Matrix =
+        matrix.map { row ->
+            row.map {
+                values[valueIndex].also { valueIndex += 1 }
+            }
+        }
+
+    return copy(
+        tokenEmbedding = nextMatrix(tokenEmbedding),
+        positionEmbedding = nextMatrix(positionEmbedding),
+        languageModelHead = nextMatrix(languageModelHead),
+        layers = layers.map { layer ->
+            layer.copy(
+                attention = layer.attention.copy(
+                    queryWeights = nextMatrix(layer.attention.queryWeights),
+                    keyWeights = nextMatrix(layer.attention.keyWeights),
+                    valueWeights = nextMatrix(layer.attention.valueWeights),
+                    outputProjectionWeights = nextMatrix(layer.attention.outputProjectionWeights)
+                ),
+                feedForward = layer.feedForward.copy(
+                    expansionWeights = nextMatrix(layer.feedForward.expansionWeights),
+                    projectionWeights = nextMatrix(layer.feedForward.projectionWeights)
+                )
+            )
+        }
+    )
+}
+
+private fun <T> List<T>.replacedAt(index: Int, value: T): List<T> =
+    mapIndexed { currentIndex, currentValue -> if (currentIndex == index) value else currentValue }
+
+data class TransformerRun(
+    val logits: List<Value>,
+    val keys: KeyValueCache,
+    val values: KeyValueCache
+)
+
+data class TransformerLayerRun(
+    val hiddenState: List<Value>,
+    val keys: KeyValueCache,
+    val values: KeyValueCache
+)
+
 data class TransformerConfig(
     val layerCount: Int,
     val embeddingSize: Int,
@@ -138,17 +184,15 @@ data class CharacterTokenizer(
     val vocabularySize: Int = uniqueCharacters.size + 1
     val characterToTokenId: Map<Char, Int> = uniqueCharacters.withIndex().associate { it.value to it.index }
 
-    fun encodeDocument(document: String): List<Int> {
-        val tokens = mutableListOf(sequenceBoundaryTokenId)
-        tokens.addAll(document.map { character -> characterToTokenId[character]!! })
-        tokens.add(sequenceBoundaryTokenId)
-        return tokens
-    }
+    fun encodeDocument(document: String): List<Int> =
+        listOf(sequenceBoundaryTokenId) +
+            document.map { character -> characterToTokenId[character]!! } +
+            listOf(sequenceBoundaryTokenId)
 }
 
 data class AdamOptimizerState(
-    val firstMomentEstimates: MutableList<Double>,
-    val secondMomentEstimates: MutableList<Double>
+    val firstMomentEstimates: List<Double>,
+    val secondMomentEstimates: List<Double>
 )
 
 data class AdamOptimizerConfig(
@@ -177,33 +221,35 @@ data class MicrogptTrainingSession(
     val documents: List<String>,
     val trainingStepCount: Int,
     val optimizerConfig: AdamOptimizerConfig = AdamOptimizerConfig(),
-    val parameters: List<Value> = trainedMicrogpt.model.values(),
     val optimizerState: AdamOptimizerState = AdamOptimizerState(
-        firstMomentEstimates = MutableList(parameters.size) { 0.0 },
-        secondMomentEstimates = MutableList(parameters.size) { 0.0 }
+        firstMomentEstimates = List(trainedMicrogpt.model.values().size) { 0.0 },
+        secondMomentEstimates = List(trainedMicrogpt.model.values().size) { 0.0 }
     ),
-    var completedStepCount: Int = 0,
-    var latestLoss: Double? = null
+    val completedStepCount: Int = 0,
+    val latestLoss: Double? = null
 ) {
     val isComplete: Boolean
         get() = completedStepCount >= trainingStepCount
 }
 
+data class MicrogptTrainingStepResult(
+    val session: MicrogptTrainingSession,
+    val progress: MicrogptTrainingProgress
+)
+
+data class AdamUpdateResult(
+    val model: TransformerModelParameters,
+    val optimizerState: AdamOptimizerState
+)
+
+private data class ParameterUpdate(
+    val value: Value,
+    val firstMomentEstimate: Double,
+    val secondMomentEstimate: Double
+)
+
 private fun Int.leftPad(width: Int): String =
     toString().padStart(width, ' ')
-
-private fun Double.toFixed(decimalPlaces: Int): String {
-    var scale = 1L
-    repeat(decimalPlaces) { scale *= 10L }
-
-    val scaled = (this * scale).roundToLong()
-    val sign = if (scaled < 0) "-" else ""
-    val absoluteScaled = if (scaled < 0) -scaled else scaled
-    val whole = absoluteScaled / scale
-    val fraction = (absoluteScaled % scale).toString().padStart(decimalPlaces, '0')
-
-    return "$sign$whole.$fraction"
-}
 
 /**
  * Gaussian parameter initialization via Box-Muller.
@@ -257,13 +303,15 @@ fun randomGaussian(
  * The dataset order is randomized so the optimizer sees examples in mixed order.
  * This reduces harmful ordering effects during training.
  */
-fun <T> MutableList<T>.shuffleInPlace(randomNumberGenerator: Random) {
-    for (currentIndex in this.lastIndex downTo 1) {
+fun <T> List<T>.shuffledBy(randomNumberGenerator: Random): List<T> {
+    val shuffled = toMutableList()
+    for (currentIndex in shuffled.lastIndex downTo 1) {
         val swapIndex = randomNumberGenerator.nextInt(currentIndex + 1)
-        val temporaryValue = this[currentIndex]
-        this[currentIndex] = this[swapIndex]
-        this[swapIndex] = temporaryValue
+        val temporaryValue = shuffled[currentIndex]
+        shuffled[currentIndex] = shuffled[swapIndex]
+        shuffled[swapIndex] = temporaryValue
     }
+    return shuffled
 }
 
 /**
@@ -284,8 +332,8 @@ fun matrix(
     randomNumberGenerator: Random,
     standardDeviation: Double = 0.08
 ): Matrix =
-    MutableList(outputSize) {
-        MutableList(inputSize) { Value(randomGaussian(randomNumberGenerator, 0.0, standardDeviation)) }
+    List(outputSize) {
+        List(inputSize) { Value(randomGaussian(randomNumberGenerator, 0.0, standardDeviation)) }
     }
 
 /**
@@ -457,17 +505,17 @@ fun weightedChoice(weights: List<Double>, randomNumberGenerator: Random): Int {
     return weights.lastIndex
 }
 
-fun createKeyValueCache(layerCount: Int): MutableList<MutableList<List<Value>>> =
-    MutableList(layerCount) { mutableListOf<List<Value>>() }
+fun createKeyValueCache(layerCount: Int): KeyValueCache =
+    List(layerCount) { emptyList() }
 
 fun runTransformerModel(
     model: TransformerModelParameters,
     config: TransformerConfig,
     tokenId: Int,
     positionId: Int,
-    keys: MutableList<MutableList<List<Value>>>,
-    values: MutableList<MutableList<List<Value>>>
-): List<Value> {
+    keys: KeyValueCache,
+    values: KeyValueCache
+): TransformerRun {
     val tokenEmbedding = model.tokenEmbedding[tokenId]
     val positionEmbedding = model.positionEmbedding[positionId]
     var hiddenState = tokenEmbedding.zip(positionEmbedding).map { (tokenValue, positionValue) ->
@@ -475,19 +523,28 @@ fun runTransformerModel(
     }
 
     hiddenState = rmsnorm(hiddenState)
+    var currentKeys = keys
+    var currentValues = values
 
     for (layerIndex in 0 until config.layerCount) {
-        hiddenState = runTransformerLayer(
+        val layerRun = runTransformerLayer(
             hiddenState = hiddenState,
             layer = model.layers[layerIndex],
             layerIndex = layerIndex,
             config = config,
-            keys = keys,
-            values = values
+            keys = currentKeys,
+            values = currentValues
         )
+        hiddenState = layerRun.hiddenState
+        currentKeys = layerRun.keys
+        currentValues = layerRun.values
     }
 
-    return linear(hiddenState, model.languageModelHead)
+    return TransformerRun(
+        logits = linear(hiddenState, model.languageModelHead),
+        keys = currentKeys,
+        values = currentValues
+    )
 }
 
 fun runTransformerLayer(
@@ -495,9 +552,9 @@ fun runTransformerLayer(
     layer: TransformerLayerParameters,
     layerIndex: Int,
     config: TransformerConfig,
-    keys: MutableList<MutableList<List<Value>>>,
-    values: MutableList<MutableList<List<Value>>>
-): List<Value> {
+    keys: KeyValueCache,
+    values: KeyValueCache
+): TransformerLayerRun {
     var residualState = hiddenState
     var normalizedState = rmsnorm(hiddenState)
 
@@ -505,13 +562,13 @@ fun runTransformerLayer(
     val key = linear(normalizedState, layer.attention.keyWeights)
     val value = linear(normalizedState, layer.attention.valueWeights)
 
-    keys[layerIndex].add(key)
-    values[layerIndex].add(value)
+    val updatedKeys = keys.replacedAt(layerIndex, keys[layerIndex] + listOf(key))
+    val updatedValues = values.replacedAt(layerIndex, values[layerIndex] + listOf(value))
 
     val attentionOutput = runMultiHeadAttention(
         query = query,
-        keys = keys[layerIndex],
-        values = values[layerIndex],
+        keys = updatedKeys[layerIndex],
+        values = updatedValues[layerIndex],
         config = config
     )
     var blockOutput = linear(attentionOutput, layer.attention.outputProjectionWeights)
@@ -528,7 +585,11 @@ fun runTransformerLayer(
     updatedHiddenState = blockOutput.zip(residualState).map { (feedForwardValue, residualValue) ->
         feedForwardValue + residualValue
     }
-    return updatedHiddenState
+    return TransformerLayerRun(
+        hiddenState = updatedHiddenState,
+        keys = updatedKeys,
+        values = updatedValues
+    )
 }
 
 fun runMultiHeadAttention(
@@ -536,23 +597,18 @@ fun runMultiHeadAttention(
     keys: List<List<Value>>,
     values: List<List<Value>>,
     config: TransformerConfig
-): List<Value> {
-    val attentionOutput = mutableListOf<Value>()
-
-    for (headIndex in 0 until config.attentionHeadCount) {
+): List<Value> =
+    (0 until config.attentionHeadCount).flatMap { headIndex ->
         val headStartIndex = headIndex * config.attentionHeadSize
         val headQuery = query.subList(headStartIndex, headStartIndex + config.attentionHeadSize)
         val headKeys = keys.map { it.subList(headStartIndex, headStartIndex + config.attentionHeadSize) }
         val headValues = values.map { it.subList(headStartIndex, headStartIndex + config.attentionHeadSize) }
         val attentionWeights = softmax(attentionLogits(headQuery, headKeys, config.attentionHeadSize))
 
-        for (headValueIndex in 0 until config.attentionHeadSize) {
-            attentionOutput.add(weightedHeadValueSum(attentionWeights, headValues, headValueIndex))
+        (0 until config.attentionHeadSize).map { headValueIndex ->
+            weightedHeadValueSum(attentionWeights, headValues, headValueIndex)
         }
     }
-
-    return attentionOutput
-}
 
 fun attentionLogits(
     headQuery: List<Value>,
@@ -580,7 +636,7 @@ fun weightedHeadValueSum(
     return weightedValueSum
 }
 
-fun trainMicrogptStep(session: MicrogptTrainingSession): MicrogptTrainingProgress? {
+fun trainMicrogptStep(session: MicrogptTrainingSession): MicrogptTrainingStepResult? {
     if (session.isComplete) return null
 
     val step = session.completedStepCount
@@ -592,23 +648,31 @@ fun trainMicrogptStep(session: MicrogptTrainingSession): MicrogptTrainingProgres
         document = document
     )
 
-    loss.backward()
+    val gradients = loss.backward()
 
-    applyAdamUpdate(
-        parameters = session.parameters,
+    val update = applyAdamUpdate(
+        model = session.trainedMicrogpt.model,
+        gradients = gradients,
         optimizerState = session.optimizerState,
         optimizerConfig = session.optimizerConfig,
         step = step,
         trainingStepCount = session.trainingStepCount
     )
 
-    session.completedStepCount += 1
-    session.latestLoss = loss.data
-
-    return MicrogptTrainingProgress(
-        completedStepCount = session.completedStepCount,
+    val progress = MicrogptTrainingProgress(
+        completedStepCount = session.completedStepCount + 1,
         trainingStepCount = session.trainingStepCount,
         loss = loss.data
+    )
+
+    return MicrogptTrainingStepResult(
+        session = session.copy(
+            trainedMicrogpt = session.trainedMicrogpt.copy(model = update.model),
+            optimizerState = update.optimizerState,
+            completedStepCount = progress.completedStepCount,
+            latestLoss = progress.loss
+        ),
+        progress = progress
     )
 }
 
@@ -620,55 +684,68 @@ fun trainOnDocument(
 ): Value {
     val tokens = tokenizer.encodeDocument(document)
     val predictionStepCount = minOf(config.contextWindowSize, tokens.size - 1)
-    val keys = createKeyValueCache(config.layerCount)
-    val values = createKeyValueCache(config.layerCount)
-    val losses = mutableListOf<Value>()
+    var keys = createKeyValueCache(config.layerCount)
+    var values = createKeyValueCache(config.layerCount)
+    var loss = Value(0.0)
 
     for (positionId in 0 until predictionStepCount) {
         val tokenId = tokens[positionId]
         val targetTokenId = tokens[positionId + 1]
-        val logits = runTransformerModel(model, config, tokenId, positionId, keys, values)
-        val probabilities = softmax(logits)
+        val modelRun = runTransformerModel(model, config, tokenId, positionId, keys, values)
+        keys = modelRun.keys
+        values = modelRun.values
+        val probabilities = softmax(modelRun.logits)
         val positionLoss = -probabilities[targetTokenId].log()
-        losses.add(positionLoss)
+        loss = loss + positionLoss
     }
 
-    var loss = Value(0.0)
-    for (positionLoss in losses) loss = loss + positionLoss
     return (1.0 / predictionStepCount.toDouble()) * loss
 }
 
 fun applyAdamUpdate(
-    parameters: List<Value>,
+    model: TransformerModelParameters,
+    gradients: Map<Value, Double>,
     optimizerState: AdamOptimizerState,
     optimizerConfig: AdamOptimizerConfig,
     step: Int,
     trainingStepCount: Int
-) {
+): AdamUpdateResult {
+    val parameters = model.values()
     val stepLearningRate = optimizerConfig.learningRate * (1.0 - step.toDouble() / trainingStepCount.toDouble())
 
-    for (parameterIndex in parameters.indices) {
-        val parameter = parameters[parameterIndex]
-        optimizerState.firstMomentEstimates[parameterIndex] =
+    val parameterUpdates = parameters.mapIndexed { parameterIndex, parameter ->
+        val gradient = gradients[parameter] ?: 0.0
+        val firstMomentEstimate =
             optimizerConfig.firstMomentDecay * optimizerState.firstMomentEstimates[parameterIndex] +
-                (1.0 - optimizerConfig.firstMomentDecay) * parameter.gradient
-        optimizerState.secondMomentEstimates[parameterIndex] =
+                (1.0 - optimizerConfig.firstMomentDecay) * gradient
+        val secondMomentEstimate =
             optimizerConfig.secondMomentDecay * optimizerState.secondMomentEstimates[parameterIndex] +
-                (1.0 - optimizerConfig.secondMomentDecay) * parameter.gradient.pow(2.0)
+                (1.0 - optimizerConfig.secondMomentDecay) * gradient.pow(2.0)
 
         val biasCorrectedFirstMoment =
-            optimizerState.firstMomentEstimates[parameterIndex] /
+            firstMomentEstimate /
                 (1.0 - optimizerConfig.firstMomentDecay.pow(step + 1.0))
         val biasCorrectedSecondMoment =
-            optimizerState.secondMomentEstimates[parameterIndex] /
+            secondMomentEstimate /
                 (1.0 - optimizerConfig.secondMomentDecay.pow(step + 1.0))
         val parameterUpdate =
             stepLearningRate * biasCorrectedFirstMoment /
                 (sqrt(biasCorrectedSecondMoment) + optimizerConfig.epsilon)
 
-        parameter.data -= parameterUpdate
-        parameter.gradient = 0.0
+        ParameterUpdate(
+            value = Value(parameter.data - parameterUpdate),
+            firstMomentEstimate = firstMomentEstimate,
+            secondMomentEstimate = secondMomentEstimate
+        )
     }
+
+    return AdamUpdateResult(
+        model = model.withValues(parameterUpdates.map { it.value }),
+        optimizerState = AdamOptimizerState(
+            firstMomentEstimates = parameterUpdates.map { it.firstMomentEstimate },
+            secondMomentEstimates = parameterUpdates.map { it.secondMomentEstimate }
+        )
+    )
 }
 
 fun generateSamples(
@@ -680,14 +757,10 @@ fun generateSamples(
     temperature: Double,
     randomNumberGenerator: Random
 ): List<String> {
-    println("\n--- inference (new, hallucinated names) ---")
-    val samples = mutableListOf<String>()
-    for (sampleIndex in 0 until sampleCount) {
+    return List(sampleCount) {
         val sample = generateSample(model, config, tokenizer, prefix, temperature, randomNumberGenerator)
-        samples.add(sample)
-        println("sample ${(sampleIndex + 1).leftPad(2)}: $sample")
+        sample
     }
-    return samples
 }
 
 fun generateSample(
@@ -698,8 +771,8 @@ fun generateSample(
     temperature: Double,
     randomNumberGenerator: Random
 ): String {
-    val keys = createKeyValueCache(config.layerCount)
-    val values = createKeyValueCache(config.layerCount)
+    var keys = createKeyValueCache(config.layerCount)
+    var values = createKeyValueCache(config.layerCount)
     var tokenId = tokenizer.sequenceBoundaryTokenId
     val normalizedPrefix = prefix
         .trim()
@@ -709,13 +782,15 @@ fun generateSample(
     val sample = StringBuilder(normalizedPrefix)
 
     for (positionId in 0 until config.contextWindowSize) {
-        val logits = runTransformerModel(model, config, tokenId, positionId, keys, values)
+        val modelRun = runTransformerModel(model, config, tokenId, positionId, keys, values)
+        keys = modelRun.keys
+        values = modelRun.values
         if (positionId < normalizedPrefix.length) {
             tokenId = tokenizer.characterToTokenId.getValue(normalizedPrefix[positionId])
             continue
         }
 
-        val scaledLogits = logits.map { it / temperature }
+        val scaledLogits = modelRun.logits.map { it / temperature }
         val probabilities = softmax(scaledLogits)
 
         tokenId = weightedChoice(probabilities.map { it.data }, randomNumberGenerator)
@@ -772,9 +847,8 @@ fun createMicrogptTrainingSession(
     val documents = inputText.lines()
         .map { it.trim() }
         .filter { it.isNotEmpty() }
-        .toMutableList()
+        .shuffledBy(randomNumberGenerator)
 
-    documents.shuffleInPlace(randomNumberGenerator)
     println("num docs: ${documents.size}")
 
     /**
@@ -933,10 +1007,3 @@ fun createMicrogptTrainingSession(
     )
 }
 
-fun microgpt(inputText: String, randomNumberGenerator: Random): TrainedMicrogpt {
-    val session = createMicrogptTrainingSession(inputText, randomNumberGenerator)
-    while (!session.isComplete) {
-        trainMicrogptStep(session)
-    }
-    return session.trainedMicrogpt
-}

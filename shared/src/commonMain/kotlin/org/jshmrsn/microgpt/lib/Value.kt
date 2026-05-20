@@ -30,28 +30,16 @@ import kotlin.math.pow
  *   much faster but conceptually the same.
  */
 
-class Value(
-    var data: Double,
-    children: List<Value> = emptyList(),
-    localGradients: List<Double> = emptyList()
+data class Value(
+    val data: Double,
+    val children: List<Value> = emptyList(),
+    val localGradients: List<Double> = emptyList(),
+    private val nodeId: Long = nextValueNodeId()
 ) {
-    // Forward-pass numeric value at this node.
+    override fun equals(other: Any?): Boolean =
+        this === other || (other is Value && nodeId == other.nodeId)
 
-    // Gradient: derivative of the loss with respect to this node's value.
-    // After backpropagation, this tells us how much the loss would change
-    // if we nudged this value slightly: dL/d(this value).
-    // This is the key information needed for learning: it shows which direction
-    // to adjust parameters to reduce the loss.
-    var gradient: Double = 0.0
-
-    // Parents/inputs of this node in the computation graph.
-    private val children: List<Value> = children
-
-    // Local derivatives of this node with respect to each child.
-    // These are edge-level terms in the chain rule:
-    // dL/d(child) += dL/d(this) * d(this)/d(child)
-    // Example: if z = x * y, then dz/dx = y and dz/dy = x.
-    private val localGradients: List<Double> = localGradients
+    override fun hashCode(): Int = nodeId.hashCode()
 
     /**
      * Addition node.
@@ -84,7 +72,7 @@ class Value(
      * During backpropagation, we never need to "remember" what operation created
      * a node. We only need the local derivatives (localGradients) and the children.
      * The chain rule backward() method uses:
-     *   child.gradient += parent.gradient * localGradient
+     *   childGradient = childGradient + parentGradient * localGradient
      *
      * So the "memory" of the operation lives in the numerical values of localGradients,
      * not in any symbolic operation identifier. This is a key insight of automatic
@@ -205,17 +193,17 @@ class Value(
      *
      * Mechanically:
      * 1) Build a topological ordering of the graph
-     * 2) Seed loss.gradient = 1 because dL/dL = 1
+     * 2) Seed the loss node's gradient as 1 because dL/dL = 1
      * 3) Traverse nodes in reverse topological order
      * 4) Propagate gradients to children using the chain rule
-     *    child.gradient += parent.gradient * d(parent)/d(child)
+     *    childGradient = childGradient + parentGradient * d(parent)/d(child)
      *
      * The blog stresses a subtle but important point:
      * gradients are accumulated with +=, not assigned.
      * If a value influences the loss through multiple paths, the total derivative
      * is the sum of the contributions from all those paths.
      */
-    fun backward() {
+    fun backward(): Map<Value, Double> {
         val topologicalOrder: List<Value> = run {
             val topologicalOrder = mutableListOf<Value>()
             val visited = mutableSetOf<Value>()
@@ -235,7 +223,7 @@ class Value(
 
         // dL/dL = 1
         // d(loss)/d(loss) = 1
-        this.gradient = 1.0
+        val gradients = mutableMapOf(this to 1.0)
 
         // Reverse-mode automatic differentiation:
         // walk backward through the graph and distribute gradients
@@ -244,11 +232,22 @@ class Value(
         // This is the multivariable chain rule, and += accumulates
         // contributions from multiple downstream paths.
         for (node in topologicalOrder.asReversed()) {
+            val nodeGradient = gradients[node] ?: 0.0
             for (childIndex in node.children.indices) {
-                node.children[childIndex].gradient += node.localGradients[childIndex] * node.gradient
+                val child = node.children[childIndex]
+                gradients[child] = (gradients[child] ?: 0.0) + node.localGradients[childIndex] * nodeGradient
             }
         }
+        return gradients
     }
+}
+
+private var nextValueNodeId = 0L
+
+private fun nextValueNodeId(): Long {
+    val nodeId = nextValueNodeId
+    nextValueNodeId += 1L
+    return nodeId
 }
 
 operator fun Double.plus(other: Value): Value = Value(this) + other
