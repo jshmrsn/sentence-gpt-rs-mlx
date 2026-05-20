@@ -41,6 +41,14 @@ private val VocabLabelWidth = 72.dp
 private val NetworkHorizontalPadding = 18.dp
 private val NetworkVerticalPadding = 14.dp
 
+private fun networkDiagramHeight(trainedMicrogpt: TrainedMicrogpt): Dp {
+    val largestExpandedColumn = max(
+        trainedMicrogpt.config.contextWindowSize * trainedMicrogpt.config.embeddingSize * 4,
+        trainedMicrogpt.config.contextWindowSize * trainedMicrogpt.tokenizer.vocabularySize
+    )
+    return max(1400, largestExpandedColumn * 10).dp
+}
+
 @Composable
 fun MicrogptModelVisualization(
     trainedMicrogpt: TrainedMicrogpt?,
@@ -69,7 +77,7 @@ fun MicrogptModelVisualization(
             trainedMicrogpt = trainedMicrogpt,
             modifier = Modifier
                 .fillMaxWidth()
-                .height(1400.dp)
+                .height(networkDiagramHeight(trainedMicrogpt))
         )
         EmbeddingAndHeadHeatmaps(trainedMicrogpt)
         TransformerLayerVisualizations(trainedMicrogpt)
@@ -122,43 +130,60 @@ private fun NetworkDiagram(
 
                 for (stageIndex in 0 until stageCount - 1) {
                     val matrix = stages[stageIndex + 1].incomingWeights ?: continue
-                    val fromNodeIndices = sampledNodeIndices(stages[stageIndex].nodeCount)
-                    val toNodeIndices = sampledNodeIndices(stages[stageIndex + 1].nodeCount)
-                    for (fromIndex in fromNodeIndices) {
-                        for (toIndex in toNodeIndices) {
-                            val value = connectionValue(
-                                matrix = matrix,
-                                fromStage = stages[stageIndex],
-                                toStage = stages[stageIndex + 1],
-                                fromNodeIndex = fromIndex,
-                                toNodeIndex = toIndex
-                            )
+                    val fromStage = stages[stageIndex]
+                    val toStage = stages[stageIndex + 1]
+                    for (fromFeatureIndex in 0 until fromStage.featureCount) {
+                        for (toFeatureIndex in 0 until toStage.featureCount) {
+                            val value = featureConnectionValue(matrix, fromStage, toStage, fromFeatureIndex, toFeatureIndex)
                             val strength = min(1f, (abs(value) / maxMagnitude).toFloat())
-                            val color = weightColor(value).copy(alpha = 0.15f + strength * 0.65f)
-                            val start = Offset(
-                                x = horizontalPadding + xStep * stageIndex,
-                                y = nodeY(fromIndex, stages[stageIndex], size.height, verticalPadding)
-                            )
-                            val end = Offset(
-                                x = horizontalPadding + xStep * (stageIndex + 1),
-                                y = nodeY(toIndex, stages[stageIndex + 1], size.height, verticalPadding)
-                            )
-                            drawLine(
-                                color = color,
-                                start = start,
-                                end = end,
-                                strokeWidth = 0.5.dp.toPx() + strength * 2.5.dp.toPx(),
-                                cap = StrokeCap.Round
-                            )
+                            val color = weightColor(value).copy(alpha = 0.025f + strength * 0.22f)
+                            forEachPositionConnection(fromStage, toStage) { fromPositionIndex, toPositionIndex ->
+                                val start = Offset(
+                                    x = horizontalPadding + xStep * stageIndex,
+                                    y = nodeY(
+                                        featureIndex = fromFeatureIndex,
+                                        positionIndex = fromPositionIndex,
+                                        stage = fromStage,
+                                        height = size.height,
+                                        verticalPadding = verticalPadding
+                                    )
+                                )
+                                val end = Offset(
+                                    x = horizontalPadding + xStep * (stageIndex + 1),
+                                    y = nodeY(
+                                        featureIndex = toFeatureIndex,
+                                        positionIndex = toPositionIndex,
+                                        stage = toStage,
+                                        height = size.height,
+                                        verticalPadding = verticalPadding
+                                    )
+                                )
+                                drawLine(
+                                    color = color,
+                                    start = start,
+                                    end = end,
+                                    strokeWidth = 0.25.dp.toPx() + strength * 1.2.dp.toPx(),
+                                    cap = StrokeCap.Round
+                                )
+                            }
                         }
                     }
                 }
 
                 for (stageIndex in 0 until stageCount) {
                     for (nodeIndex in 0 until stages[stageIndex].nodeCount) {
+                        val stage = stages[stageIndex]
+                        val featureIndex = nodeIndex % stage.featureCount
+                        val positionIndex = nodeIndex / stage.featureCount
                         val center = Offset(
                             x = horizontalPadding + xStep * stageIndex,
-                            y = nodeY(nodeIndex, stages[stageIndex], size.height, verticalPadding)
+                            y = nodeY(
+                                featureIndex = featureIndex,
+                                positionIndex = positionIndex,
+                                stage = stage,
+                                height = size.height,
+                                verticalPadding = verticalPadding
+                            )
                         )
                         drawCircle(Color(0xFFF7F9FB), radius = radius, center = center)
                         drawCircle(
@@ -533,42 +558,73 @@ private fun buildArchitectureStages(trainedMicrogpt: TrainedMicrogpt): List<Arch
         )
 }
 
-private fun connectionValue(
+private fun featureConnectionValue(
     matrix: Matrix,
     fromStage: ArchitectureStage,
     toStage: ArchitectureStage,
-    fromNodeIndex: Int,
-    toNodeIndex: Int
+    fromFeatureIndex: Int,
+    toFeatureIndex: Int
 ): Double {
-    val fromFeatureIndex = fromNodeIndex % fromStage.featureCount
-    val toFeatureIndex = toNodeIndex % toStage.featureCount
     return when (toStage.incomingWeightKind) {
         IncomingWeightKind.Linear -> matrixValueOrZero(matrix, toFeatureIndex, fromFeatureIndex)
         IncomingWeightKind.TokenEmbedding -> matrixValueOrZero(matrix, fromFeatureIndex, toFeatureIndex)
     }
 }
 
+private inline fun forEachPositionConnection(
+    fromStage: ArchitectureStage,
+    toStage: ArchitectureStage,
+    block: (fromPositionIndex: Int, toPositionIndex: Int) -> Unit
+) {
+    when {
+        fromStage.sequenceLength == toStage.sequenceLength -> {
+            for (positionIndex in 0 until fromStage.sequenceLength) {
+                block(positionIndex, positionIndex)
+            }
+        }
+        toStage.sequenceLength == 1 -> {
+            block(fromStage.sequenceLength - 1, 0)
+        }
+        fromStage.sequenceLength == 1 -> {
+            for (toPositionIndex in 0 until toStage.sequenceLength) {
+                block(0, toPositionIndex)
+            }
+        }
+        else -> {
+            for (positionIndex in 0 until min(fromStage.sequenceLength, toStage.sequenceLength)) {
+                block(positionIndex, positionIndex)
+            }
+        }
+    }
+}
+
 private fun nodeY(
-    nodeIndex: Int,
+    featureIndex: Int,
+    positionIndex: Int,
     stage: ArchitectureStage,
     height: Float,
     verticalPadding: Float
 ): Float {
-    val featureIndex = nodeIndex % stage.featureCount
-    val positionIndex = nodeIndex / stage.featureCount
     val baseY = featureY(featureIndex, stage.featureCount, height, verticalPadding)
     if (stage.sequenceLength <= 1) return baseY
 
-    val featureSpacing = if (stage.featureCount <= 1) {
-        height - verticalPadding * 2f
-    } else {
-        (height - verticalPadding * 2f) / (stage.featureCount - 1).toFloat()
-    }
-    val spread = min(featureSpacing * 0.72f, 22f)
+    val rowHeight = featureRowHeight(stage.featureCount, height, verticalPadding)
+    val spread = rowHeight * 0.72f
     val positionOffset = -spread / 2f +
         spread * positionIndex.toFloat() / (stage.sequenceLength - 1).toFloat()
     return baseY + positionOffset
 }
+
+private fun featureRowHeight(
+    featureCount: Int,
+    height: Float,
+    verticalPadding: Float
+): Float =
+    if (featureCount <= 0) {
+        height - verticalPadding * 2f
+    } else {
+        (height - verticalPadding * 2f) / featureCount.toFloat()
+    }
 
 private fun featureY(
     featureIndex: Int,
@@ -577,19 +633,8 @@ private fun featureY(
     verticalPadding: Float
 ): Float {
     if (featureCount <= 1) return height / 2f
-    val yStep = (height - verticalPadding * 2f) / (featureCount - 1).toFloat()
-    return verticalPadding + yStep * featureIndex
-}
-
-private fun sampledNodeIndices(nodeCount: Int, maxSampledNodeCount: Int = 8): List<Int> {
-    if (nodeCount <= maxSampledNodeCount) return (0 until nodeCount).toList()
-    val lastIndex = nodeCount - 1
-    return (0 until maxSampledNodeCount)
-        .map { sampleIndex ->
-            (sampleIndex.toDouble() * lastIndex.toDouble() / (maxSampledNodeCount - 1).toDouble())
-                .roundToInt()
-        }
-        .distinct()
+    val rowHeight = featureRowHeight(featureCount, height, verticalPadding)
+    return verticalPadding + rowHeight * (featureIndex.toFloat() + 0.5f)
 }
 
 private fun tokenLabels(trainedMicrogpt: TrainedMicrogpt): List<String> =
