@@ -913,7 +913,7 @@ fun createMicrogptTrainingSession(
     // not themselves learned from data.
     val layerCount = 1
     val embeddingSize = 16
-    val contextWindowSize = 16
+    val contextWindowSize = 10
     val attentionHeadCount = 4
     val config = TransformerConfig(
         layerCount = layerCount,

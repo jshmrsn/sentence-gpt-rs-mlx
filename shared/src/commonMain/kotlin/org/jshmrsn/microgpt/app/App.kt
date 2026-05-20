@@ -2,6 +2,8 @@ package org.jshmrsn.microgpt.app
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -33,11 +35,13 @@ fun App() {
         var latestLoss by remember { mutableStateOf<Double?>(null) }
         var prefix by remember { mutableStateOf("1+3=") }
         var samples by remember { mutableStateOf(emptyList<String>()) }
+        var visibleMicrogpt by remember { mutableStateOf<TrainedMicrogpt?>(null) }
         val sampleRandomNumberGenerator = remember { Random(1) }
 
         LaunchedEffect(Unit) {
             var trainingSession = createMicrogptDemoTrainingSession()
             trainingStepCount = trainingSession.trainingStepCount
+            visibleMicrogpt = trainingSession.trainedMicrogpt
 
             while (!trainingSession.isComplete) {
                 val result = trainMicrogptDemoStep(trainingSession) ?: break
@@ -46,6 +50,7 @@ fun App() {
                 completedStepCount = progress.completedStepCount
                 trainingStepCount = progress.trainingStepCount
                 latestLoss = progress.loss
+                visibleMicrogpt = trainingSession.trainedMicrogpt
                 withFrameNanos { }
             }
 
@@ -57,6 +62,7 @@ fun App() {
                 .background(MaterialTheme.colorScheme.primaryContainer)
                 .safeContentPadding()
                 .fillMaxSize()
+                .verticalScroll(rememberScrollState())
                 .padding(16.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
@@ -71,6 +77,13 @@ fun App() {
             latestLoss?.let { loss ->
                 Text("Loss ${formatLoss(loss)}")
             }
+            MicrogptModelVisualization(
+                trainedMicrogpt = visibleMicrogpt,
+                completedStepCount = completedStepCount,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 8.dp)
+            )
             OutlinedTextField(
                 value = prefix,
                 onValueChange = { prefix = it },
