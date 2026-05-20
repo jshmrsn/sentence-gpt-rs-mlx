@@ -174,6 +174,16 @@ data class TransformerConfig(
     val contextWindowSize: Int,
     val attentionHeadCount: Int
 ) {
+    init {
+        require(layerCount > 0) { "layerCount must be positive" }
+        require(embeddingSize > 0) { "embeddingSize must be positive" }
+        require(contextWindowSize > 0) { "contextWindowSize must be positive" }
+        require(attentionHeadCount > 0) { "attentionHeadCount must be positive" }
+        require(embeddingSize % attentionHeadCount == 0) {
+            "embeddingSize must be divisible by attentionHeadCount"
+        }
+    }
+
     val attentionHeadSize: Int = embeddingSize / attentionHeadCount
 }
 
@@ -195,9 +205,9 @@ data class AdamOptimizerState(
     val secondMomentEstimates: List<Double>
 )
 data class AdamOptimizerConfig(
-    val learningRate: Double = 0.01,
-    val firstMomentDecay: Double = 0.85,
-    val secondMomentDecay: Double = 0.99,
+    val learningRate: Double,
+    val firstMomentDecay: Double,
+    val secondMomentDecay: Double,
     val epsilon: Double = 1e-8
 )
 
@@ -222,7 +232,7 @@ data class MicrogptTrainingSession(
     val validationDocuments: List<String>,
     val trainingStepCount: Int,
     val validationEvaluationDocumentCount: Int,
-    val optimizerConfig: AdamOptimizerConfig = AdamOptimizerConfig(),
+    val optimizerConfig: AdamOptimizerConfig,
     val optimizerState: AdamOptimizerState = AdamOptimizerState(
         firstMomentEstimates = List(trainedMicrogpt.model.values().size) { 0.0 },
         secondMomentEstimates = List(trainedMicrogpt.model.values().size) { 0.0 }

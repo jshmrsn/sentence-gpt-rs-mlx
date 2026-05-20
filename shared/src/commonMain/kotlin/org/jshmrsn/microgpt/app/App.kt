@@ -33,6 +33,7 @@ import org.jshmrsn.microgpt.lib.TrainedMicrogpt
 import org.jshmrsn.microgpt.lib.TransformerConfig
 import org.jshmrsn.microgpt.lib.calculateDocumentLoss
 import org.jshmrsn.microgpt.lib.createMicrogptTrainingSession
+import org.jshmrsn.microgpt.lib.shuffledBy
 import kotlin.math.ln
 import kotlin.math.roundToLong
 import kotlin.random.Random
@@ -42,6 +43,7 @@ import kotlin.time.TimeSource
 
 private val TrainingFrameBudget = 100.milliseconds
 private const val ValidationStepInterval = 50
+private const val DemoDocumentLimit = 250
 
 private fun formatLoss(loss: Double): String {
     val scaled = (loss * 10_000.0).roundToLong()
@@ -239,26 +241,28 @@ fun App() {
                             .filter { sentence -> sentence.length > 10 && sentence.contains(" ") }
                     }
 
-                sentences
+                // Keep the interactive demo in a toy-data regime so the scalar
+                // training loop can complete multiple passes over the corpus.
+                sentences.take(DemoDocumentLimit).shuffledBy(Random(1))
                 //Res.readBytes("files/input-names.txt").decodeToString()
             }
 
             var trainingSession = createMicrogptTrainingSession(
                 inputDocuments = inputDocuments,
                 randomNumberGenerator = Random(1),
-                trainingStepCount = 100000,
+                trainingStepCount = 8000,
                 validationSetDivisor = 20,
-                validationEvaluationDocumentCount = 10,
+                validationEvaluationDocumentCount = 8,
                 transformerConfig = TransformerConfig(
-                    layerCount = 4,
-                    embeddingSize = 32,
-                    contextWindowSize = 64,
-                    attentionHeadCount = 8
+                    layerCount = 2,
+                    embeddingSize = 24,
+                    contextWindowSize = 48,
+                    attentionHeadCount = 4
                 ),
                 optimizerConfig = AdamOptimizerConfig(
-                    learningRate = 0.01,
-                    firstMomentDecay = 0.85,
-                    secondMomentDecay = 0.99,
+                    learningRate = 0.003,
+                    firstMomentDecay = 0.9,
+                    secondMomentDecay = 0.999,
                     epsilon = 1e-8
                 )
             )
