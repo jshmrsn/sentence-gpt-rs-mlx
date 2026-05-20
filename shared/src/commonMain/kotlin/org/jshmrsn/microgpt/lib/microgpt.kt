@@ -211,7 +211,8 @@ data class TrainedMicrogpt(
 data class MicrogptTrainingProgress(
     val completedStepCount: Int,
     val trainingStepCount: Int,
-    val loss: Double
+    val loss: Double,
+    val validationLoss: Double?
 ) {
     val isComplete: Boolean = completedStepCount >= trainingStepCount
 }
@@ -219,14 +220,18 @@ data class MicrogptTrainingProgress(
 data class MicrogptTrainingSession(
     val trainedMicrogpt: TrainedMicrogpt,
     val documents: List<String>,
+    val validationDocuments: List<String>,
     val trainingStepCount: Int,
+    val validationEvaluationDocumentCount: Int = 32,
     val optimizerConfig: AdamOptimizerConfig = AdamOptimizerConfig(),
     val optimizerState: AdamOptimizerState = AdamOptimizerState(
         firstMomentEstimates = List(trainedMicrogpt.model.values().size) { 0.0 },
         secondMomentEstimates = List(trainedMicrogpt.model.values().size) { 0.0 }
     ),
     val completedStepCount: Int = 0,
-    val latestLoss: Double? = null
+    val latestLoss: Double? = null,
+    val latestValidationLoss: Double? = null,
+    val progressHistory: List<MicrogptTrainingProgress> = emptyList()
 ) {
     val isComplete: Boolean
         get() = completedStepCount >= trainingStepCount
@@ -234,7 +239,8 @@ data class MicrogptTrainingSession(
 
 data class MicrogptTrainingStepResult(
     val session: MicrogptTrainingSession,
-    val progress: MicrogptTrainingProgress
+    val progress: MicrogptTrainingProgress,
+    val progressHistory: List<MicrogptTrainingProgress>
 )
 
 data class AdamUpdateResult(
@@ -658,21 +664,26 @@ fun trainMicrogptStep(session: MicrogptTrainingSession): MicrogptTrainingStepRes
         step = step,
         trainingStepCount = session.trainingStepCount
     )
+    val updatedMicrogpt = session.trainedMicrogpt.copy(model = update.model)
 
     val progress = MicrogptTrainingProgress(
         completedStepCount = session.completedStepCount + 1,
         trainingStepCount = session.trainingStepCount,
-        loss = loss.data
+        loss = loss.data,
+        validationLoss = null
     )
+    val progressHistory = session.progressHistory + progress
 
     return MicrogptTrainingStepResult(
         session = session.copy(
-            trainedMicrogpt = session.trainedMicrogpt.copy(model = update.model),
+            trainedMicrogpt = updatedMicrogpt,
             optimizerState = update.optimizerState,
             completedStepCount = progress.completedStepCount,
-            latestLoss = progress.loss
+            latestLoss = progress.loss,
+            progressHistory = progressHistory
         ),
-        progress = progress
+        progress = progress,
+        progressHistory = progressHistory
     )
 }
 
@@ -701,6 +712,19 @@ fun trainOnDocument(
 
     return (1.0 / predictionStepCount.toDouble()) * loss
 }
+
+fun calculateDocumentLoss(
+    model: TransformerModelParameters,
+    config: TransformerConfig,
+    tokenizer: CharacterTokenizer,
+    document: String
+): Double =
+    trainOnDocument(
+        model = model,
+        config = config,
+        tokenizer = tokenizer,
+        document = document
+    ).data
 
 fun applyAdamUpdate(
     model: TransformerModelParameters,
@@ -822,7 +846,8 @@ fun generateSamples(
 fun createMicrogptTrainingSession(
     inputText: String,
     randomNumberGenerator: Random,
-    trainingStepCount: Int = 1000
+    trainingStepCount: Int = 1000,
+    validationDivisor: Int = 20
 ): MicrogptTrainingSession {
     /**
      * DATASET
@@ -844,12 +869,16 @@ fun createMicrogptTrainingSession(
     //
     // In machine learning, the dataset is the source of examples from which
     // the model learns statistical patterns.
-    val documents = inputText.lines()
+    val shuffledDocuments = inputText.lines()
         .map { it.trim() }
         .filter { it.isNotEmpty() }
         .shuffledBy(randomNumberGenerator)
+    val validationDocumentCount = shuffledDocuments.size / validationDivisor
+    val validationDocuments = shuffledDocuments.take(validationDocumentCount)
+    val documents = shuffledDocuments.drop(validationDocumentCount)
 
-    println("num docs: ${documents.size}")
+    println("num training docs: ${documents.size}")
+    println("num validation docs: ${validationDocuments.size}")
 
     /**
      * TOKENIZER
@@ -870,7 +899,7 @@ fun createMicrogptTrainingSession(
     //
     // Tokens are the discrete symbols the model operates on.
     // Here, each character is one token.
-    val uniqueCharacters = documents.joinToString("").toSet().toList().sorted()
+    val uniqueCharacters = shuffledDocuments.joinToString("").toSet().toList().sorted()
 
     /**
      * Sequence boundary token.
@@ -911,9 +940,9 @@ fun createMicrogptTrainingSession(
     //
     // Hyperparameters define the architecture and training behavior but are
     // not themselves learned from data.
-    val layerCount = 1
-    val embeddingSize = 16
-    val contextWindowSize = 10
+    val layerCount = 3
+    val embeddingSize = 32
+    val contextWindowSize = 16
     val attentionHeadCount = 4
     val config = TransformerConfig(
         layerCount = layerCount,
@@ -1003,7 +1032,7 @@ fun createMicrogptTrainingSession(
             tokenizer = tokenizer
         ),
         documents = documents,
+        validationDocuments = validationDocuments,
         trainingStepCount = trainingStepCount
     )
 }
-

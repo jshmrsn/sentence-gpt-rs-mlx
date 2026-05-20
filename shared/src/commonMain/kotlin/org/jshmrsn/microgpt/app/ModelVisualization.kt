@@ -41,14 +41,6 @@ private val VocabLabelWidth = 72.dp
 private val NetworkHorizontalPadding = 18.dp
 private val NetworkVerticalPadding = 14.dp
 
-private fun networkDiagramHeight(trainedMicrogpt: TrainedMicrogpt): Dp {
-    val largestExpandedColumn = max(
-        trainedMicrogpt.config.contextWindowSize * trainedMicrogpt.config.embeddingSize * 4,
-        trainedMicrogpt.config.contextWindowSize * trainedMicrogpt.tokenizer.vocabularySize
-    )
-    return max(1400, largestExpandedColumn * 10).dp
-}
-
 @Composable
 fun MicrogptModelVisualization(
     trainedMicrogpt: TrainedMicrogpt?,
@@ -73,12 +65,12 @@ fun MicrogptModelVisualization(
             text = "Step $completedStepCount | layers ${trainedMicrogpt.config.layerCount} | embedding ${trainedMicrogpt.config.embeddingSize} | heads ${trainedMicrogpt.config.attentionHeadCount} x ${trainedMicrogpt.config.attentionHeadSize} | context ${trainedMicrogpt.config.contextWindowSize} | vocab ${trainedMicrogpt.tokenizer.vocabularySize}",
             style = MaterialTheme.typography.labelMedium
         )
-        NetworkDiagram(
-            trainedMicrogpt = trainedMicrogpt,
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(networkDiagramHeight(trainedMicrogpt))
-        )
+//        NetworkDiagram(
+//            trainedMicrogpt = trainedMicrogpt,
+//            modifier = Modifier
+//                .fillMaxWidth()
+//                .height(networkDiagramHeight(trainedMicrogpt))
+//        )
         EmbeddingAndHeadHeatmaps(trainedMicrogpt)
         TransformerLayerVisualizations(trainedMicrogpt)
     }

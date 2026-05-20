@@ -8,29 +8,21 @@ import org.jshmrsn.microgpt.lib.generateSamples
 import org.jshmrsn.microgpt.lib.trainMicrogptStep
 import kotlin.random.Random
 
-private const val GeneratedExpressionCount = 50_000
-private const val MaximumOperand = 100
+private const val MaximumOperand = 999
 
-fun generateMicrogptInputText(expressionCount: Int = GeneratedExpressionCount): String =
+fun generateMathTrainingText(): String =
     buildString {
-        val operandCount = MaximumOperand + 1
-        repeat(expressionCount) { expressionIndex ->
-            val a = expressionIndex % operandCount
-            val b = (expressionIndex / operandCount) % operandCount
-            append(a)
-            append('+')
-            append(b)
-            append('=')
-            append(a + b)
-            append('\n')
+        for (a in 0..MaximumOperand) {
+            for (b in 0..MaximumOperand) {
+                append(a)
+                append('+')
+                append(b)
+                append('=')
+                append(a + b)
+                append('\n')
+            }
         }
     }
-
-fun createMicrogptDemoTrainingSession(randomNumberGenerator: Random = Random(0)): MicrogptTrainingSession =
-    createMicrogptTrainingSession(
-        inputText = generateMicrogptInputText(),
-        randomNumberGenerator = randomNumberGenerator
-    )
 
 fun trainMicrogptDemoStep(session: MicrogptTrainingSession): MicrogptTrainingStepResult? =
     trainMicrogptStep(session)
