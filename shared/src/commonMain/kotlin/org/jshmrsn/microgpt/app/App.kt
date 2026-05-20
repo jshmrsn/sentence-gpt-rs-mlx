@@ -20,7 +20,7 @@ fun App() {
     MaterialTheme {
         var trainedMicrogpt by remember { mutableStateOf<TrainedMicrogpt?>(null) }
         var microgptStatus by remember { mutableStateOf("Training...") }
-        var prefix by remember { mutableStateOf("") }
+        var prefix by remember { mutableStateOf("1+3=") }
         var samples by remember { mutableStateOf(emptyList<String>()) }
         val sampleRandomNumberGenerator = remember { Random(1) }
 
