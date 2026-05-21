@@ -1,1 +1,2 @@
 data/input-stories-00.json filter=lfs diff=lfs merge=lfs -text
+screenshot.png filter=lfs diff=lfs merge=lfs -text

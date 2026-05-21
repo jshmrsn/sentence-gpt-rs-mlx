@@ -3255,54 +3255,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "microgpt-app"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "dioxus",
- "microgpt-config",
- "microgpt-lib",
- "rand 0.8.6",
- "rand_chacha 0.3.1",
- "rfd 0.15.4",
- "tokio",
-]
-
-[[package]]
-name = "microgpt-config"
-version = "0.1.0"
-dependencies = [
- "microgpt-lib",
- "rand_chacha 0.3.1",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "microgpt-lib"
-version = "0.1.0"
-dependencies = [
- "bincode",
- "mlx-rs",
- "rand 0.8.6",
- "rand_chacha 0.3.1",
- "rayon",
- "serde",
-]
-
-[[package]]
-name = "microgpt-tui"
-version = "0.1.0"
-dependencies = [
- "crossterm",
- "microgpt-config",
- "microgpt-lib",
- "rand 0.8.6",
- "rand_chacha 0.3.1",
- "ratatui",
-]
-
-[[package]]
 name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4903,6 +4855,54 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cd0b0ec5f1c1ca621c432a25813d8d60c88abe6d3e08a3eb9cf37d97a0fe3d73"
 dependencies = [
  "futures-core",
+]
+
+[[package]]
+name = "sentence-gpt-rs-mlx-app"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "dioxus",
+ "rand 0.8.6",
+ "rand_chacha 0.3.1",
+ "rfd 0.15.4",
+ "sentence-gpt-rs-mlx-config",
+ "sentence-gpt-rs-mlx-lib",
+ "tokio",
+]
+
+[[package]]
+name = "sentence-gpt-rs-mlx-config"
+version = "0.1.0"
+dependencies = [
+ "rand_chacha 0.3.1",
+ "sentence-gpt-rs-mlx-lib",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "sentence-gpt-rs-mlx-lib"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "mlx-rs",
+ "rand 0.8.6",
+ "rand_chacha 0.3.1",
+ "rayon",
+ "serde",
+]
+
+[[package]]
+name = "sentence-gpt-rs-mlx-tui"
+version = "0.1.0"
+dependencies = [
+ "crossterm",
+ "rand 0.8.6",
+ "rand_chacha 0.3.1",
+ "ratatui",
+ "sentence-gpt-rs-mlx-config",
+ "sentence-gpt-rs-mlx-lib",
 ]
 
 [[package]]

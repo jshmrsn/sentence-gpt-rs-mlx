@@ -1,7 +1,7 @@
 [application]
-name = "microgpt-rust-visualized"
+name = "sentence-gpt-rs-mlx"
 default_platform = "desktop"
 out_dir = "dist"
 
 [web.app]
-title = "microgpt Rust Visualized"
+title = "sentence-gpt-rs-mlx"

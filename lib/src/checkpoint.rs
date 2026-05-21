@@ -66,7 +66,7 @@ pub fn load_checkpoint_from_path(path: impl AsRef<Path>) -> Result<MicrogptCheck
     let bytes = fs::read(path).map_err(|error| error.to_string())?;
     if bytes.len() < CHECKPOINT_MAGIC.len() || &bytes[..CHECKPOINT_MAGIC.len()] != CHECKPOINT_MAGIC
     {
-        return Err("not a microgpt checkpoint file".into());
+        return Err("not a sentence-gpt-rs-mlx checkpoint file".into());
     }
     bincode::deserialize(&bytes[CHECKPOINT_MAGIC.len()..]).map_err(|error| error.to_string())
 }

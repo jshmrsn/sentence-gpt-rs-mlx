@@ -3,7 +3,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use microgpt_lib::{
+use rand_chacha::ChaCha8Rng;
+use sentence_gpt_rs_mlx_lib::{
     checkpoint::{CheckpointBackend, MicrogptCheckpoint},
     microgpt::{
         attach_validation_loss as attach_cpu_validation_loss,
@@ -24,10 +25,9 @@ use microgpt_lib::{
         train_mlx_microgpt_step, MlxMicrogptTrainingSession, MlxTrainedMicrogpt,
     },
 };
-use rand_chacha::ChaCha8Rng;
 use serde::Deserialize;
 
-pub use microgpt_lib::microgpt::AdamOptimizerConfig;
+pub use sentence_gpt_rs_mlx_lib::microgpt::AdamOptimizerConfig;
 
 pub const TRAINING_FRAME_BUDGET: Duration = Duration::from_millis(500);
 pub const VALIDATION_STEP_INTERVAL: usize = 25;

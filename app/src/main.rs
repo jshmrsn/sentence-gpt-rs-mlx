@@ -1,13 +1,17 @@
 // Dioxus desktop app for watching the tiny Transformer train.
 //
-// The ML concepts live in `microgpt-lib`; this file is mainly about turning
+// The ML concepts live in `sentence-gpt-rs-mlx-lib`; this file is mainly about turning
 // training into an interactive learning tool. The important production lesson
 // here is scheduling: training and sample generation are CPU/GPU-heavy work, so
 // they run in blocking worker tasks while the UI stays responsive.
 
 use chrono::Local;
+use dioxus::desktop::{Config, WindowBuilder};
 use dioxus::prelude::*;
-use microgpt_config::{
+use rand::{Rng, SeedableRng};
+use rand_chacha::ChaCha8Rng;
+use rfd::FileDialog;
+use sentence_gpt_rs_mlx_config::{
     create_training_session, format_compact, format_count, format_learning_rate, format_loss,
     format_percent, format_percent_style, get_optimizer_config, load_input_documents,
     next_validation_step_after, running_mean_loss, running_mean_loss_values,
@@ -15,18 +19,15 @@ use microgpt_config::{
     TrainingSession, ATTENTION_HEADS, CONTEXT_WINDOW_SIZE, EMBEDDING_SIZE, LAYER_COUNT,
     TRAINING_DOCUMENT_BATCH_SIZE, VALIDATION_STEP_INTERVAL,
 };
-use microgpt_lib::checkpoint::{load_checkpoint_from_path, save_checkpoint_to_path};
-use microgpt_lib::microgpt::{
+use sentence_gpt_rs_mlx_lib::checkpoint::{load_checkpoint_from_path, save_checkpoint_to_path};
+use sentence_gpt_rs_mlx_lib::microgpt::{
     generate_samples as generate_cpu_samples, Matrix, MicrogptTrainingProgress, TrainedMicrogpt,
     TransformerConfig, Vector,
 };
-use microgpt_lib::mlx_microgpt::{
+use sentence_gpt_rs_mlx_lib::mlx_microgpt::{
     generate_samples as generate_mlx_samples, matrix_heatmaps as build_mlx_matrix_heatmaps,
     MlxMatrixHeatmap,
 };
-use rand::{Rng, SeedableRng};
-use rand_chacha::ChaCha8Rng;
-use rfd::FileDialog;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -131,7 +132,9 @@ struct GenerationResult {
 }
 
 fn main() {
-    dioxus::launch(App);
+    dioxus::LaunchBuilder::desktop()
+        .with_cfg(Config::new().with_window(WindowBuilder::new().with_title("sentence-gpt-rs-mlx")))
+        .launch(App);
 }
 
 #[component]
@@ -270,8 +273,8 @@ fn App() -> Element {
             div { class: "shell",
                 div { class: "topbar",
                     div {
-                        h1 { class: "title", "microgpt Rust Visualized" }
-                        p { class: "subtitle", "Transformer training ported from Kotlin Multiplatform Compose to Rust and Dioxus, with MLX and dry Rust CPU backends." }
+                        h1 { class: "title", "sentence-gpt-rs-mlx" }
+                        p { class: "subtitle", "GPT training demo based on microgpt, but targeting full simple sentences, accelerated on Apple Silicon with MLX (via mlx-rs) with additional optimizations, written in Rust, with both Dioxus GUI and ratatui TUI frontends." }
                     }
                     div { class: "actions",
                         button {
@@ -318,8 +321,8 @@ fn App() -> Element {
                                 // the dialog runs a nested event loop, so holding a Dioxus
                                 // signal borrow here can conflict with background task wakeups.
                                 if let Some(path) = FileDialog::new()
-                                    .set_title("Import microgpt checkpoint")
-                                    .add_filter("microgpt checkpoint", &["bin"])
+                                    .set_title("Import sentence-gpt-rs-mlx checkpoint")
+                                    .add_filter("sentence-gpt-rs-mlx checkpoint", &["bin"])
                                     .pick_file()
                                 {
                                     state.write().import_checkpoint_from_path(path);
@@ -1114,7 +1117,7 @@ fn snapshot_checkpoint_file_name(session: &TrainingSession) -> String {
         .latest_loss()
         .map(|loss| format!("{loss:.4}"))
         .unwrap_or_else(|| "pending".into());
-    format!("microgpt-{backend}-{timestamp}-step-{step:06}-train-loss-{loss}.bin")
+    format!("sentence-gpt-rs-mlx-{backend}-{timestamp}-step-{step:06}-train-loss-{loss}.bin")
 }
 
 fn metric(label: &str, value: String) -> Element {

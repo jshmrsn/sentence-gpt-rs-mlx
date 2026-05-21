@@ -10,22 +10,6 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use microgpt_config::{
-    create_training_session, format_compact, format_count, format_learning_rate, format_loss,
-    get_optimizer_config, load_input_documents, next_validation_step_after, running_mean_loss,
-    train_session_until_budget as train_shared_session_until_budget, Backend, TrainingSession,
-    ATTENTION_HEADS, CONTEXT_WINDOW_SIZE, EMBEDDING_SIZE, LAYER_COUNT,
-    TRAINING_DOCUMENT_BATCH_SIZE, VALIDATION_STEP_INTERVAL,
-};
-use microgpt_lib::checkpoint::{load_checkpoint_from_path, save_checkpoint_to_path};
-use microgpt_lib::microgpt::{
-    generate_samples as generate_cpu_samples, Matrix, MicrogptTrainingProgress, TrainedMicrogpt,
-    TransformerConfig, Vector,
-};
-use microgpt_lib::mlx_microgpt::{
-    generate_samples as generate_mlx_samples, matrix_summaries as build_mlx_matrix_summaries,
-    MlxMatrixSummary,
-};
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use ratatui::{
@@ -35,6 +19,22 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Gauge, List, ListItem, Paragraph, Sparkline, Wrap},
     Frame, Terminal,
+};
+use sentence_gpt_rs_mlx_config::{
+    create_training_session, format_compact, format_count, format_learning_rate, format_loss,
+    get_optimizer_config, load_input_documents, next_validation_step_after, running_mean_loss,
+    train_session_until_budget as train_shared_session_until_budget, Backend, TrainingSession,
+    ATTENTION_HEADS, CONTEXT_WINDOW_SIZE, EMBEDDING_SIZE, LAYER_COUNT,
+    TRAINING_DOCUMENT_BATCH_SIZE, VALIDATION_STEP_INTERVAL,
+};
+use sentence_gpt_rs_mlx_lib::checkpoint::{load_checkpoint_from_path, save_checkpoint_to_path};
+use sentence_gpt_rs_mlx_lib::microgpt::{
+    generate_samples as generate_cpu_samples, Matrix, MicrogptTrainingProgress, TrainedMicrogpt,
+    TransformerConfig, Vector,
+};
+use sentence_gpt_rs_mlx_lib::mlx_microgpt::{
+    generate_samples as generate_mlx_samples, matrix_summaries as build_mlx_matrix_summaries,
+    MlxMatrixSummary,
 };
 use std::{
     io::{self, Stdout},
@@ -488,7 +488,7 @@ fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let text = vec![
         Line::from(vec![
             Span::styled(
-                "microgpt Rust TUI",
+                "sentence-gpt-rs-mlx TUI",
                 Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
             ),
             Span::raw(format!("  {}", app.status_message)),
@@ -797,7 +797,7 @@ impl From<MlxMatrixSummary> for MatrixSummary {
 fn checkpoint_file_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
-        .join("microgpt-checkpoint.bin")
+        .join("sentence-gpt-rs-mlx-checkpoint.bin")
 }
 
 fn sparkline_losses(progress_history: &[MicrogptTrainingProgress]) -> Vec<u64> {

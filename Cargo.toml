@@ -6,6 +6,7 @@ resolver = "2"
 edition = "2021"
 license = "MIT"
 version = "0.1.0"
+description = "GPT training demo based on microgpt, targeting full simple sentences with Rust, MLX acceleration on Apple Silicon, and Dioxus plus ratatui frontends."
 
 [workspace.dependencies]
 rand = "0.8"
