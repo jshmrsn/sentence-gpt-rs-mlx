@@ -285,12 +285,6 @@ fn App() -> Element {
                         }
                         button {
                             class: "button secondary",
-                            disabled: snapshot.session.is_none() || is_complete || snapshot.is_training_busy,
-                            onclick: move |_| state.write().request_training_chunk(),
-                            "Step chunk"
-                        }
-                        button {
-                            class: "button secondary",
                             disabled: snapshot.is_training_busy || snapshot.is_generating_samples,
                             onclick: move |_| state.write().toggle_backend(),
                             "Backend: {backend_label}"
@@ -344,13 +338,7 @@ fn App() -> Element {
                                     state.write().set_snapshot_export_directory(directory);
                                 }
                             },
-                            "Snapshot dir"
-                        }
-                        button {
-                            class: "button secondary",
-                            disabled: snapshot.session.is_none(),
-                            onclick: move |_| state.write().toggle_network_value_visualization(),
-                            if snapshot.visualize_network_values { "Values: On" } else { "Values: Off" }
+                            "Set snapshot dir"
                         }
                         button {
                             class: "button secondary",
@@ -535,23 +523,23 @@ fn App() -> Element {
                     }
                 }
 
-                section { class: "panel",
-                    div { class: "model-header",
-                        h2 { class: "section-title", "Model values" }
-                        button {
-                            class: "button secondary",
-                            disabled: snapshot.session.is_none(),
-                            onclick: move |_| state.write().toggle_network_value_visualization(),
-                            if snapshot.visualize_network_values { "Hide values" } else { "Show values" }
-                        }
-                    }
-                    {model_visualization(
-                        snapshot.session.as_ref(),
-                        snapshot.visualize_network_values,
-                        &snapshot.model_heatmaps,
-                        snapshot.completed_step_count(),
-                    )}
-                }
+                // section { class: "panel",
+                //     div { class: "model-header",
+                //         h2 { class: "section-title", "Model values" }
+                //         button {
+                //             class: "button secondary",
+                //             disabled: snapshot.session.is_none(),
+                //             onclick: move |_| state.write().toggle_network_value_visualization(),
+                //             if snapshot.visualize_network_values { "Hide values" } else { "Show values" }
+                //         }
+                //     }
+                //     {model_visualization(
+                //         snapshot.session.as_ref(),
+                //         snapshot.visualize_network_values,
+                //         &snapshot.model_heatmaps,
+                //         snapshot.completed_step_count(),
+                //     )}
+                // }
             }
         }
     }

@@ -492,29 +492,22 @@ pub fn load_input_documents() -> Result<Vec<String>, String> {
 }
 
 fn stories_to_sentences(stories: Vec<Story>) -> Vec<String> {
-    const EXCLUDE_CHARACTERS: &[char] = &[
+    const SENTENCE_DISQUALIFYING_CHARACTERS: &[char] = &[
         '$', '&', '"', '“', '”', '(', ')', '*', '\'', '_', '-', '–', '…', '%', '~', '`', '[', ']',
         '{', '}', '\\', ';', '|', '—', 'é', '/', '’', '‘', ':', '0', '1', '2', '3', '4', '5', '6',
         '7', '8', '9',
     ];
 
-    eprintln!("stories_to_sentences: stories len = {}", stories.len());
-
-    let gpt_stories = stories
+    let filtered_stories = stories
         .into_iter()
         .filter(|story| story.source == "GPT-4")
         .collect::<Vec<_>>();
 
-    eprintln!(
-        "stories_to_sentences: gpt_stories len = {}",
-        gpt_stories.len()
-    );
-
-    let all_sentences = gpt_stories
+    filtered_stories
         .into_iter()
         .flat_map(|story| split_sentences_keep_punctuation(&story.story))
         .filter(|sentence| {
-            !EXCLUDE_CHARACTERS
+            !SENTENCE_DISQUALIFYING_CHARACTERS
                 .iter()
                 .any(|excluded| sentence.contains(*excluded))
         })
@@ -524,18 +517,7 @@ fn stories_to_sentences(stories: Vec<Story>) -> Vec<String> {
                 && sentence.contains(' ')
                 && sentence.chars().count() < CONTEXT_WINDOW_SIZE
         })
-        .collect::<Vec<_>>();
-
-    eprintln!(
-        "stories_to_sentences: all filtered sentences before cap = {}",
-        all_sentences.len()
-    );
-    let capped_sentences = cap_filtered_documents(all_sentences);
-    eprintln!(
-        "stories_to_sentences: capped sentences after MAX_DOCUMENT_COUNT = {}",
-        capped_sentences.len()
-    );
-    capped_sentences
+        .collect::<Vec<_>>()
 }
 
 fn split_sentences_keep_punctuation(story: &str) -> Vec<String> {
@@ -552,15 +534,6 @@ fn split_sentences_keep_punctuation(story: &str) -> Vec<String> {
         sentences.push(story[sentence_start..].to_string());
     }
     sentences
-}
-
-fn cap_filtered_documents(mut documents: Vec<String>) -> Vec<String> {
-    // `MAX_DOCUMENT_COUNT` is only a cap, not a promise that this many examples
-    // survived source filtering. Collect first so the cap is applied against the
-    // actual filtered size instead of treating the configured maximum as the
-    // dataset size.
-    documents.truncate(documents.len().min(MAX_DOCUMENT_COUNT));
-    documents
 }
 
 #[cfg(test)]
