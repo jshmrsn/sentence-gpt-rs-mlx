@@ -34,7 +34,7 @@ const EMBEDDING_SIZE: usize = 64;
 
 fn get_optimizer_config() -> AdamOptimizerConfig {
     AdamOptimizerConfig {
-        learning_rate: 0.01,
+        learning_rate: 0.002,
         first_moment_decay: 0.85,
         second_moment_decay: 0.99,
         epsilon: 1e-8,
@@ -226,12 +226,6 @@ button, input {
     padding: 5px 8px;
     cursor: pointer;
     min-width: 34px;
-}
-
-.page-button.active {
-    background: #28533f;
-    border-color: #28533f;
-    color: #fff;
 }
 
 .document-item {
@@ -633,6 +627,11 @@ fn App() -> Element {
         .as_ref()
         .is_some_and(TrainingSession::is_complete);
     let visible_training_documents = selected_training_documents(&snapshot);
+    let is_training_document_search_empty = snapshot.training_document_search.trim().is_empty();
+    let training_document_page_count = snapshot.training_document_page_count();
+    let current_training_document_page = snapshot
+        .training_document_page
+        .min(training_document_page_count.saturating_sub(1));
 
     rsx! {
         style { "{CSS}" }
@@ -714,16 +713,47 @@ fn App() -> Element {
                         input {
                             class: "text-input",
                             value: "{snapshot.training_document_search}",
-                            placeholder: "Show first 10, or type to rank matches",
-                            oninput: move |event| state.write().training_document_search = event.value(),
+                            placeholder: "Use pages below, or type to rank matches",
+                            oninput: move |event| state.write().set_training_document_search(event.value()),
                             autocapitalize: false,
                             autocomplete: false,
                             autocorrect: false,
                             spellcheck: false
                         }
                     }
+                    if is_training_document_search_empty && training_document_page_count > 1 {
+                        div { class: "document-controls",
+                            button {
+                                class: "page-button",
+                                disabled: current_training_document_page == 0,
+                                onclick: move |_| state.write().first_training_document_page(),
+                                "First"
+                            }
+                            button {
+                                class: "page-button",
+                                disabled: current_training_document_page == 0,
+                                onclick: move |_| state.write().previous_training_document_page(),
+                                "Prev"
+                            }
+                            button {
+                                class: "page-button",
+                                disabled: current_training_document_page + 1 >= training_document_page_count,
+                                onclick: move |_| state.write().next_training_document_page(),
+                                "Next"
+                            }
+                            button {
+                                class: "page-button",
+                                onclick: move |_| state.write().random_training_document_page(),
+                                "Random"
+                            }
+                        }
+                    }
                     div { class: "model-summary",
-                        "Showing {visible_training_documents.len()} of {training_example_count} training examples"
+                        if is_training_document_search_empty {
+                            "Showing page {current_training_document_page + 1} of {training_document_page_count.max(1)} | {training_example_count} training examples"
+                        } else {
+                            "Showing {visible_training_documents.len()} best matches from {training_example_count} training examples"
+                        }
                     }
                     div { class: "document-list",
                         for (document_index, document) in visible_training_documents.iter() {
@@ -774,7 +804,7 @@ fn App() -> Element {
                         }
                     }
                     div { class: "samples",
-                        for (index, sample) in snapshot.samples.iter().enumerate() {
+                        for sample in snapshot.samples.iter() {
                             div { class: "sample", "{sample}" }
                         }
                     }
@@ -831,10 +861,12 @@ impl AppState {
                             accumulated_training_millis: 0,
                             prefix: String::new(),
                             training_document_search: String::new(),
+                            training_document_page: 0,
                             temperature: 0.5,
                             samples: Vec::new(),
                             initialization_error: Some(error),
                             sample_rng: ChaCha8Rng::seed_from_u64(1),
+                            training_document_page_rng: ChaCha8Rng::seed_from_u64(2),
                         };
                     }
                 };
@@ -853,10 +885,12 @@ impl AppState {
                     accumulated_training_millis: 0,
                     prefix: String::new(),
                     training_document_search: String::new(),
+                    training_document_page: 0,
                     temperature: 0.5,
                     samples: Vec::new(),
                     initialization_error: None,
                     sample_rng: ChaCha8Rng::seed_from_u64(1),
+                    training_document_page_rng: ChaCha8Rng::seed_from_u64(2),
                 }
             }
             Err(error) => Self {
@@ -872,12 +906,49 @@ impl AppState {
                 accumulated_training_millis: 0,
                 prefix: String::new(),
                 training_document_search: String::new(),
+                training_document_page: 0,
                 temperature: 0.5,
                 samples: Vec::new(),
                 initialization_error: Some(error),
                 sample_rng: ChaCha8Rng::seed_from_u64(1),
+                training_document_page_rng: ChaCha8Rng::seed_from_u64(2),
             },
         }
+    }
+
+    fn set_training_document_search(&mut self, search: String) {
+        self.training_document_search = search;
+        self.training_document_page = 0;
+    }
+
+    fn random_training_document_page(&mut self) {
+        let page_count = self.training_document_page_count();
+        if page_count > 0 {
+            self.training_document_page = self.training_document_page_rng.gen_range(0..page_count);
+        }
+    }
+
+    fn first_training_document_page(&mut self) {
+        self.training_document_page = 0;
+    }
+
+    fn previous_training_document_page(&mut self) {
+        self.training_document_page = self.training_document_page.saturating_sub(1);
+    }
+
+    fn next_training_document_page(&mut self) {
+        let page_count = self.training_document_page_count();
+        if page_count > 0 {
+            self.training_document_page =
+                (self.training_document_page + 1).min(page_count.saturating_sub(1));
+        }
+    }
+
+    fn training_document_page_count(&self) -> usize {
+        self.session
+            .as_ref()
+            .map(|session| session.training_document_count().div_ceil(10))
+            .unwrap_or(0)
     }
 
     fn toggle_backend(&mut self) {
@@ -1278,10 +1349,15 @@ fn selected_training_documents(state: &AppState) -> Vec<(usize, String)> {
     let documents = session.training_documents();
     let query = state.training_document_search.trim().to_lowercase();
     if query.is_empty() {
+        let page_start = state
+            .training_document_page
+            .min(state.training_document_page_count().saturating_sub(1))
+            * 10;
         return documents
             .iter()
-            .take(10)
             .enumerate()
+            .skip(page_start)
+            .take(10)
             .map(|(index, document)| (index, document.clone()))
             .collect();
     }
