@@ -16,17 +16,26 @@ use microgpt_config::{
     TRAINING_DOCUMENT_BATCH_SIZE, TRAINING_FRAME_BUDGET, VALIDATION_EVALUATION_DOCUMENT_COUNT,
     VALIDATION_SET_DIVISOR, VALIDATION_STEP_INTERVAL,
 };
+use microgpt_lib::checkpoint::{
+    load_checkpoint_from_path, save_checkpoint_to_path, CheckpointBackend,
+};
 use microgpt_lib::microgpt::{
     attach_validation_loss as attach_cpu_validation_loss,
     calculate_training_loss_baseline as calculate_cpu_training_loss_baseline,
     calculate_validation_loss as calculate_cpu_validation_loss, create_microgpt_training_session,
-    generate_samples as generate_cpu_samples, train_microgpt_step, Matrix,
-    MicrogptTrainingProgress, MicrogptTrainingSession, TrainedMicrogpt, TransformerConfig, Vector,
+    export_training_session_checkpoint as export_cpu_training_session_checkpoint,
+    generate_samples as generate_cpu_samples,
+    import_training_session_checkpoint as import_cpu_training_session_checkpoint,
+    train_microgpt_step, Matrix, MicrogptTrainingProgress, MicrogptTrainingSession,
+    TrainedMicrogpt, TransformerConfig, Vector,
 };
 use microgpt_lib::mlx_microgpt::{
     attach_validation_loss as attach_mlx_validation_loss,
     calculate_validation_loss as calculate_mlx_validation_loss,
-    create_mlx_microgpt_training_session, generate_samples as generate_mlx_samples,
+    create_mlx_microgpt_training_session,
+    export_training_session_checkpoint as export_mlx_training_session_checkpoint,
+    generate_samples as generate_mlx_samples,
+    import_training_session_checkpoint as import_mlx_training_session_checkpoint,
     matrix_summaries as build_mlx_matrix_summaries, train_mlx_microgpt_step, MlxMatrixSummary,
     MlxMicrogptTrainingSession,
 };
@@ -152,6 +161,45 @@ impl TrainingSession {
         match self {
             TrainingSession::Mlx(session) => session.trained_microgpt.tokenizer.vocabulary_size(),
             TrainingSession::Cpu(session) => session.trained_microgpt.tokenizer.vocabulary_size(),
+        }
+    }
+
+    fn parameter_count(&self) -> usize {
+        match self {
+            TrainingSession::Mlx(session) => session
+                .trained_microgpt
+                .model
+                .values()
+                .iter()
+                .map(|array| {
+                    array
+                        .shape()
+                        .iter()
+                        .map(|dimension| *dimension as usize)
+                        .product::<usize>()
+                })
+                .sum(),
+            TrainingSession::Cpu(session) => session.trained_microgpt.model.parameter_count(),
+        }
+    }
+
+    fn export_checkpoint(&self) -> Result<microgpt_lib::checkpoint::MicrogptCheckpoint, String> {
+        match self {
+            TrainingSession::Mlx(session) => export_mlx_training_session_checkpoint(session),
+            TrainingSession::Cpu(session) => Ok(export_cpu_training_session_checkpoint(session)),
+        }
+    }
+
+    fn import_checkpoint(
+        checkpoint: &microgpt_lib::checkpoint::MicrogptCheckpoint,
+    ) -> Result<Self, String> {
+        match checkpoint.backend {
+            CheckpointBackend::Mlx => {
+                import_mlx_training_session_checkpoint(checkpoint).map(TrainingSession::Mlx)
+            }
+            CheckpointBackend::Cpu => Ok(TrainingSession::Cpu(
+                import_cpu_training_session_checkpoint(checkpoint)?,
+            )),
         }
     }
 }
@@ -302,6 +350,14 @@ impl App {
                 self.toggle_network_value_visualization();
                 false
             }
+            KeyCode::F(5) => {
+                self.export_checkpoint();
+                false
+            }
+            KeyCode::F(6) => {
+                self.import_checkpoint();
+                false
+            }
             KeyCode::Char('r') => {
                 if !self.is_training_busy {
                     match App::initialize_with_backend(self.session.backend()) {
@@ -344,6 +400,48 @@ impl App {
         match App::initialize_with_backend(self.session.backend().toggled()) {
             Ok(next) => *self = next,
             Err(error) => self.status_message = error,
+        }
+    }
+
+    fn export_checkpoint(&mut self) {
+        if self.is_training_busy {
+            return;
+        }
+        let path = checkpoint_file_path();
+        match self
+            .session
+            .export_checkpoint()
+            .and_then(|checkpoint| save_checkpoint_to_path(&checkpoint, &path))
+        {
+            Ok(()) => self.status_message = format!("Exported {}", path.display()),
+            Err(error) => self.status_message = format!("Export failed: {error}"),
+        }
+    }
+
+    fn import_checkpoint(&mut self) {
+        if self.is_training_busy {
+            return;
+        }
+        let path = checkpoint_file_path();
+        match load_checkpoint_from_path(&path)
+            .and_then(|checkpoint| TrainingSession::import_checkpoint(&checkpoint))
+        {
+            Ok(session) => {
+                self.session = session;
+                self.next_validation_step =
+                    next_validation_step_after(self.session.completed_step_count());
+                self.accumulated_training_millis = 0;
+                self.is_training_active = false;
+                self.generation_requested = false;
+                self.training_receiver = None;
+                self.matrix_summaries = if self.visualize_network_values {
+                    build_matrix_summaries(&self.session)
+                } else {
+                    Vec::new()
+                };
+                self.status_message = format!("Imported {}", path.display());
+            }
+            Err(error) => self.status_message = format!("Import failed: {error}"),
         }
     }
 
@@ -555,8 +653,9 @@ fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
             Span::raw(format!("  {}", app.status_message)),
         ]),
         Line::from(format!(
-            "backend {} | values {} | layers {} | embedding {} | heads {} x {} | context {} | vocab {} | prefix {:?} | temp {:.1}",
+            "backend {} | params {} | values {} | layers {} | embedding {} | heads {} x {} | context {} | vocab {} | prefix {:?} | temp {:.1}",
             backend,
+            format_count(app.session.parameter_count()),
             if app.visualize_network_values { "on" } else { "off" },
             config.layer_count,
             config.embedding_size,
@@ -676,7 +775,7 @@ fn render_samples(frame: &mut Frame<'_>, app: &App, area: Rect) {
 }
 
 fn render_help(frame: &mut Frame<'_>, area: Rect) {
-    let help = "s start/pause | c step chunk | g/Enter generate | b backend | v values | type prefix | Backspace edit | +/- temperature | r reset | q/Esc quit";
+    let help = "s start/pause | c step chunk | g/Enter generate | b backend | v values | F5 export | F6 import | type prefix | Backspace edit | +/- temp | r reset | q/Esc quit";
     frame.render_widget(
         Paragraph::new(help).block(Block::default().title("Keys").borders(Borders::ALL)),
         area,
@@ -999,6 +1098,16 @@ fn load_input_documents() -> Result<Vec<String>, String> {
     }
 }
 
+fn checkpoint_file_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("microgpt-checkpoint.bin")
+}
+
+fn next_validation_step_after(completed_step_count: usize) -> usize {
+    ((completed_step_count / VALIDATION_STEP_INTERVAL) + 1) * VALIDATION_STEP_INTERVAL
+}
+
 fn stories_to_sentences(stories: Vec<Story>) -> Vec<String> {
     const EXCLUDE_CHARACTERS: &[char] = &[
         '$', '&', '"', '“', '”', '(', ')', '*', '\'', '_', '-', '–', '…', '%', '~', '`', '[', ']',
@@ -1051,6 +1160,16 @@ fn sparkline_losses(progress_history: &[MicrogptTrainingProgress]) -> Vec<u64> {
 
 fn format_loss(loss: f64) -> String {
     format!("{loss:.4}")
+}
+
+fn format_count(value: usize) -> String {
+    if value >= 1_000_000 {
+        format!("{:.2}M", value as f64 / 1_000_000.0)
+    } else if value >= 1_000 {
+        format!("{:.1}k", value as f64 / 1_000.0)
+    } else {
+        value.to_string()
+    }
 }
 
 fn format_compact(value: f64) -> String {

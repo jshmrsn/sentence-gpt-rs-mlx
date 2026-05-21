@@ -5,6 +5,7 @@
 // here is scheduling: training and sample generation are CPU/GPU-heavy work, so
 // they run in blocking worker tasks while the UI stays responsive.
 
+use chrono::Local;
 use dioxus::prelude::*;
 use microgpt_config::{
     get_optimizer_config, AdamOptimizerConfig, ATTENTION_HEADS, CONTEXT_WINDOW_SIZE,
@@ -12,22 +13,32 @@ use microgpt_config::{
     TRAINING_DOCUMENT_BATCH_SIZE, TRAINING_FRAME_BUDGET, VALIDATION_EVALUATION_DOCUMENT_COUNT,
     VALIDATION_SET_DIVISOR, VALIDATION_STEP_INTERVAL,
 };
+use microgpt_lib::checkpoint::{
+    load_checkpoint_from_path, save_checkpoint_to_path, CheckpointBackend,
+};
 use microgpt_lib::microgpt::{
     attach_validation_loss as attach_cpu_validation_loss,
     calculate_training_loss_baseline as calculate_cpu_training_loss_baseline,
     calculate_validation_loss as calculate_cpu_validation_loss, create_microgpt_training_session,
-    generate_samples as generate_cpu_samples, train_microgpt_step, CharacterTokenizer, Matrix,
-    MicrogptTrainingProgress, MicrogptTrainingSession, TrainedMicrogpt, TransformerConfig, Vector,
+    export_training_session_checkpoint as export_cpu_training_session_checkpoint,
+    generate_samples as generate_cpu_samples,
+    import_training_session_checkpoint as import_cpu_training_session_checkpoint,
+    train_microgpt_step, CharacterTokenizer, Matrix, MicrogptTrainingProgress,
+    MicrogptTrainingSession, TrainedMicrogpt, TransformerConfig, Vector,
 };
 use microgpt_lib::mlx_microgpt::{
     attach_validation_loss as attach_mlx_validation_loss,
     calculate_validation_loss as calculate_mlx_validation_loss,
-    create_mlx_microgpt_training_session, generate_samples as generate_mlx_samples,
+    create_mlx_microgpt_training_session,
+    export_training_session_checkpoint as export_mlx_training_session_checkpoint,
+    generate_samples as generate_mlx_samples,
+    import_training_session_checkpoint as import_mlx_training_session_checkpoint,
     matrix_heatmaps as build_mlx_matrix_heatmaps, train_mlx_microgpt_step, MlxMatrixHeatmap,
     MlxMicrogptTrainingSession, MlxTrainedMicrogpt,
 };
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
+use rfd::FileDialog;
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -471,6 +482,25 @@ impl TrainingSession {
         }
     }
 
+    fn parameter_count(&self) -> usize {
+        match self {
+            TrainingSession::Mlx(session) => session
+                .trained_microgpt
+                .model
+                .values()
+                .iter()
+                .map(|array| {
+                    array
+                        .shape()
+                        .iter()
+                        .map(|dimension| *dimension as usize)
+                        .product::<usize>()
+                })
+                .sum(),
+            TrainingSession::Cpu(session) => session.trained_microgpt.model.parameter_count(),
+        }
+    }
+
     fn progress_history(&self) -> &[MicrogptTrainingProgress] {
         match self {
             TrainingSession::Mlx(session) => session.progress_history.as_slice(),
@@ -482,6 +512,26 @@ impl TrainingSession {
         match self {
             TrainingSession::Mlx(session) => TrainedSnapshot::Mlx(session.trained_microgpt.clone()),
             TrainingSession::Cpu(session) => TrainedSnapshot::Cpu(session.trained_microgpt.clone()),
+        }
+    }
+
+    fn export_checkpoint(&self) -> Result<microgpt_lib::checkpoint::MicrogptCheckpoint, String> {
+        match self {
+            TrainingSession::Mlx(session) => export_mlx_training_session_checkpoint(session),
+            TrainingSession::Cpu(session) => Ok(export_cpu_training_session_checkpoint(session)),
+        }
+    }
+
+    fn import_checkpoint(
+        checkpoint: &microgpt_lib::checkpoint::MicrogptCheckpoint,
+    ) -> Result<Self, String> {
+        match checkpoint.backend {
+            CheckpointBackend::Mlx => {
+                import_mlx_training_session_checkpoint(checkpoint).map(TrainingSession::Mlx)
+            }
+            CheckpointBackend::Cpu => Ok(TrainingSession::Cpu(
+                import_cpu_training_session_checkpoint(checkpoint)?,
+            )),
         }
     }
 }
@@ -528,6 +578,7 @@ struct AppState {
     temperature: f64,
     samples: Vec<String>,
     initialization_error: Option<String>,
+    checkpoint_message: Option<String>,
     sample_rng: ChaCha8Rng,
     training_document_page_rng: ChaCha8Rng,
 }
@@ -718,6 +769,18 @@ fn App() -> Element {
                         }
                         button {
                             class: "button secondary",
+                            disabled: snapshot.session.is_none() || snapshot.is_training_busy || snapshot.is_generating_samples,
+                            onclick: move |_| state.write().export_checkpoint(),
+                            "Export"
+                        }
+                        button {
+                            class: "button secondary",
+                            disabled: snapshot.is_training_busy || snapshot.is_generating_samples,
+                            onclick: move |_| state.write().import_checkpoint(),
+                            "Import"
+                        }
+                        button {
+                            class: "button secondary",
                             disabled: snapshot.session.is_none(),
                             onclick: move |_| state.write().toggle_network_value_visualization(),
                             if snapshot.visualize_network_values { "Values: On" } else { "Values: Off" }
@@ -736,11 +799,15 @@ fn App() -> Element {
                 if let Some(error) = &snapshot.initialization_error {
                     div { class: "panel", "Error: {error}" }
                 }
+                if let Some(message) = &snapshot.checkpoint_message {
+                    div { class: "panel", "{message}" }
+                }
 
                 section { class: "panel",
                     div { class: "status-grid",
                         {metric("Status", status)}
                         {metric("Backend", backend_label.into())}
+                        {metric("Params", format_count(snapshot.session.as_ref().map(TrainingSession::parameter_count).unwrap_or(0)))}
                         {metric("Step", format!("{} / {}", snapshot.completed_step_count(), snapshot.training_step_count()))}
                         {metric("Train loss", latest_loss.map(format_loss).unwrap_or_else(|| "pending".into()))}
                         {metric("Validation", latest_validation_loss.map(format_loss).unwrap_or_else(|| "pending".into()))}
@@ -950,6 +1017,7 @@ impl AppState {
                             temperature: 0.5,
                             samples: Vec::new(),
                             initialization_error: Some(error),
+                            checkpoint_message: None,
                             sample_rng: ChaCha8Rng::seed_from_u64(1),
                             training_document_page_rng: ChaCha8Rng::seed_from_u64(2),
                         };
@@ -974,6 +1042,7 @@ impl AppState {
                     temperature: 0.5,
                     samples: Vec::new(),
                     initialization_error: None,
+                    checkpoint_message: None,
                     sample_rng: ChaCha8Rng::seed_from_u64(1),
                     training_document_page_rng: ChaCha8Rng::seed_from_u64(2),
                 }
@@ -997,6 +1066,7 @@ impl AppState {
                 temperature: 0.5,
                 samples: Vec::new(),
                 initialization_error: Some(error),
+                checkpoint_message: None,
                 sample_rng: ChaCha8Rng::seed_from_u64(1),
                 training_document_page_rng: ChaCha8Rng::seed_from_u64(2),
             },
@@ -1063,6 +1133,65 @@ impl AppState {
             return;
         }
         *self = Self::initialize_with_backend(self.backend.toggled());
+    }
+
+    fn export_checkpoint(&mut self) {
+        if self.is_training_busy || self.is_generating_samples {
+            return;
+        }
+        let Some(session) = &self.session else {
+            return;
+        };
+        let path = checkpoint_file_path();
+        match session
+            .export_checkpoint()
+            .and_then(|checkpoint| save_checkpoint_to_path(&checkpoint, &path))
+        {
+            Ok(()) => {
+                self.initialization_error = None;
+                self.checkpoint_message =
+                    Some(format!("Exported checkpoint to {}", path.display()));
+            }
+            Err(error) => {
+                self.initialization_error = Some(format!("Export failed: {error}"));
+                self.checkpoint_message = None;
+            }
+        }
+    }
+
+    fn import_checkpoint(&mut self) {
+        if self.is_training_busy || self.is_generating_samples {
+            return;
+        }
+        let path = checkpoint_file_path();
+        match load_checkpoint_from_path(&path)
+            .and_then(|checkpoint| TrainingSession::import_checkpoint(&checkpoint))
+        {
+            Ok(session) => {
+                self.backend = session.backend();
+                self.next_validation_step =
+                    next_validation_step_after(session.completed_step_count());
+                self.accumulated_training_millis = 0;
+                self.is_training_active = false;
+                self.manual_training_chunk_requested = false;
+                self.generation_requested = false;
+                self.is_generating_samples = false;
+                self.training_document_page = 0;
+                self.initialization_error = None;
+                self.checkpoint_message =
+                    Some(format!("Imported checkpoint from {}", path.display()));
+                self.model_heatmaps = if self.visualize_network_values {
+                    build_model_heatmaps(&session)
+                } else {
+                    Vec::new()
+                };
+                self.session = Some(session);
+            }
+            Err(error) => {
+                self.initialization_error = Some(format!("Import failed: {error}"));
+                self.checkpoint_message = None;
+            }
+        }
     }
 
     fn toggle_network_value_visualization(&mut self) {
@@ -1473,6 +1602,16 @@ fn stories_to_sentences(stories: Vec<Story>) -> Vec<String> {
         })
         .take(MAX_DOCUMENT_COUNT)
         .collect()
+}
+
+fn checkpoint_file_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("microgpt-checkpoint.bin")
+}
+
+fn next_validation_step_after(completed_step_count: usize) -> usize {
+    ((completed_step_count / VALIDATION_STEP_INTERVAL) + 1) * VALIDATION_STEP_INTERVAL
 }
 
 fn metric(label: &str, value: String) -> Element {
@@ -1898,6 +2037,16 @@ fn format_percent_style(value: f64) -> String {
 
 fn format_rate(value: f64) -> String {
     format!("{value:.1}")
+}
+
+fn format_count(value: usize) -> String {
+    if value >= 1_000_000 {
+        format!("{:.2}M", value as f64 / 1_000_000.0)
+    } else if value >= 1_000 {
+        format!("{:.1}k", value as f64 / 1_000.0)
+    } else {
+        value.to_string()
+    }
 }
 
 fn format_elapsed_training_time(milliseconds: u128) -> String {

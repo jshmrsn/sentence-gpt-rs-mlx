@@ -7,6 +7,7 @@
 //! the model, read `value.rs` first, then `microgpt.rs`, then compare the tensor
 //! version in `mlx_microgpt.rs`.
 
+pub mod checkpoint;
 pub mod microgpt;
 #[cfg(feature = "mlx")]
 pub mod mlx_microgpt;

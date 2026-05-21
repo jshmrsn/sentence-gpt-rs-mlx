@@ -15,9 +15,11 @@
 //! weight decay, warmup, cosine learning-rate decay, validation loss, and
 //! constrained sampling.
 
+use crate::checkpoint::{CheckpointBackend, CheckpointTensor, MicrogptCheckpoint};
 use crate::value::Value;
 use rand::Rng;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::f64::consts::PI;
 
@@ -185,6 +187,43 @@ impl TransformerModelParameters {
         }
     }
 
+    fn zero_initialized(
+        vocabulary_size: usize,
+        context_window_size: usize,
+        embedding_size: usize,
+        layer_count: usize,
+    ) -> Self {
+        let feed_forward_size = 3 * embedding_size;
+        Self {
+            token_embedding: zero_matrix(vocabulary_size, embedding_size),
+            position_embedding: zero_matrix(context_window_size, embedding_size),
+            language_model_head: zero_matrix(vocabulary_size, embedding_size),
+            language_model_head_biases: zero_vector(vocabulary_size),
+            layers: (0..layer_count)
+                .map(|_| TransformerLayerParameters {
+                    attention: AttentionParameters {
+                        query_weights: zero_matrix(embedding_size, embedding_size),
+                        query_biases: zero_vector(embedding_size),
+                        key_weights: zero_matrix(embedding_size, embedding_size),
+                        key_biases: zero_vector(embedding_size),
+                        value_weights: zero_matrix(embedding_size, embedding_size),
+                        value_biases: zero_vector(embedding_size),
+                        output_projection_weights: zero_matrix(embedding_size, embedding_size),
+                        output_projection_biases: zero_vector(embedding_size),
+                    },
+                    feed_forward: FeedForwardParameters {
+                        expansion_weights: zero_matrix(feed_forward_size, embedding_size),
+                        expansion_biases: zero_vector(feed_forward_size),
+                        gate_weights: zero_matrix(feed_forward_size, embedding_size),
+                        gate_biases: zero_vector(feed_forward_size),
+                        projection_weights: zero_matrix(embedding_size, feed_forward_size),
+                        projection_biases: zero_vector(embedding_size),
+                    },
+                })
+                .collect(),
+        }
+    }
+
     // Flatten every trainable scalar into a stable order. Optimizers and
     // autodiff gradients operate on flat lists; `with_values` below rebuilds the
     // structured model afterward.
@@ -339,9 +378,47 @@ impl TransformerModelParameters {
     pub fn parameter_count(&self) -> usize {
         self.values().len()
     }
+
+    fn checkpoint_tensors(&self) -> Vec<CheckpointTensor> {
+        let mut tensors = vec![
+            matrix_checkpoint_tensor(&self.token_embedding),
+            matrix_checkpoint_tensor(&self.position_embedding),
+            matrix_checkpoint_tensor(&self.language_model_head),
+            vector_checkpoint_tensor(&self.language_model_head_biases),
+        ];
+        for layer in &self.layers {
+            tensors.push(matrix_checkpoint_tensor(&layer.attention.query_weights));
+            tensors.push(vector_checkpoint_tensor(&layer.attention.query_biases));
+            tensors.push(matrix_checkpoint_tensor(&layer.attention.key_weights));
+            tensors.push(vector_checkpoint_tensor(&layer.attention.key_biases));
+            tensors.push(matrix_checkpoint_tensor(&layer.attention.value_weights));
+            tensors.push(vector_checkpoint_tensor(&layer.attention.value_biases));
+            tensors.push(matrix_checkpoint_tensor(
+                &layer.attention.output_projection_weights,
+            ));
+            tensors.push(vector_checkpoint_tensor(
+                &layer.attention.output_projection_biases,
+            ));
+            tensors.push(matrix_checkpoint_tensor(
+                &layer.feed_forward.expansion_weights,
+            ));
+            tensors.push(vector_checkpoint_tensor(
+                &layer.feed_forward.expansion_biases,
+            ));
+            tensors.push(matrix_checkpoint_tensor(&layer.feed_forward.gate_weights));
+            tensors.push(vector_checkpoint_tensor(&layer.feed_forward.gate_biases));
+            tensors.push(matrix_checkpoint_tensor(
+                &layer.feed_forward.projection_weights,
+            ));
+            tensors.push(vector_checkpoint_tensor(
+                &layer.feed_forward.projection_biases,
+            ));
+        }
+        tensors
+    }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TransformerConfig {
     // Number of repeated Transformer blocks.
     pub layer_count: usize,
@@ -389,7 +466,7 @@ impl TransformerConfig {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CharacterTokenizer {
     // This toy model deliberately uses characters, not subwords. That makes the
     // vocabulary tiny and easy to inspect, but it makes long-range language
@@ -444,7 +521,7 @@ pub struct AdamOptimizerState {
     pub second_moment_estimates: Vec<f64>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AdamOptimizerConfig {
     // The base step size before warmup/cosine scheduling.
     pub learning_rate: f64,
@@ -471,7 +548,7 @@ pub struct TrainedMicrogpt {
     pub tokenizer: CharacterTokenizer,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MicrogptTrainingProgress {
     pub completed_step_count: usize,
     pub training_step_count: usize,
@@ -519,6 +596,112 @@ impl MicrogptTrainingSession {
         self.progress_history = vec![progress];
         self
     }
+}
+
+pub fn export_training_session_checkpoint(session: &MicrogptTrainingSession) -> MicrogptCheckpoint {
+    let parameter_tensors = session.trained_microgpt.model.checkpoint_tensors();
+    MicrogptCheckpoint {
+        backend: CheckpointBackend::Cpu,
+        config: session.trained_microgpt.config.clone(),
+        tokenizer: session.trained_microgpt.tokenizer.clone(),
+        documents: session.documents.clone(),
+        validation_documents: session.validation_documents.clone(),
+        training_step_count: session.training_step_count,
+        validation_evaluation_document_count: session.validation_evaluation_document_count,
+        optimizer_config: session.optimizer_config.clone(),
+        completed_step_count: session.completed_step_count,
+        latest_loss: session.latest_loss,
+        latest_validation_loss: session.latest_validation_loss,
+        progress_history: session.progress_history.clone(),
+        parameters: parameter_tensors.clone(),
+        first_moment_estimates: flat_values_to_checkpoint_tensors(
+            &session.optimizer_state.first_moment_estimates,
+            &parameter_tensors,
+        )
+        .expect("CPU first moment state should match model parameter shapes"),
+        second_moment_estimates: flat_values_to_checkpoint_tensors(
+            &session.optimizer_state.second_moment_estimates,
+            &parameter_tensors,
+        )
+        .expect("CPU second moment state should match model parameter shapes"),
+    }
+}
+
+pub fn import_training_session_checkpoint(
+    checkpoint: &MicrogptCheckpoint,
+) -> Result<MicrogptTrainingSession, String> {
+    let tokenizer = CharacterTokenizer::new(
+        checkpoint.tokenizer.unique_characters.clone(),
+        checkpoint.tokenizer.sequence_boundary_token_id,
+    );
+    let model_template = TransformerModelParameters::zero_initialized(
+        tokenizer.vocabulary_size(),
+        checkpoint.config.context_window_size,
+        checkpoint.config.embedding_size,
+        checkpoint.config.layer_count,
+    );
+    let expected_tensors = model_template.checkpoint_tensors();
+    let parameter_values = flatten_checkpoint_tensors(&checkpoint.parameters, &expected_tensors)?
+        .into_iter()
+        .map(Value::new)
+        .collect();
+    let model = model_template.with_values(parameter_values);
+    let first_moment_estimates =
+        flatten_checkpoint_tensors(&checkpoint.first_moment_estimates, &expected_tensors)?;
+    let second_moment_estimates =
+        flatten_checkpoint_tensors(&checkpoint.second_moment_estimates, &expected_tensors)?;
+
+    Ok(MicrogptTrainingSession {
+        trained_microgpt: TrainedMicrogpt {
+            model,
+            config: checkpoint.config.clone(),
+            tokenizer,
+        },
+        documents: checkpoint.documents.clone(),
+        validation_documents: checkpoint.validation_documents.clone(),
+        training_step_count: checkpoint.training_step_count,
+        validation_evaluation_document_count: checkpoint.validation_evaluation_document_count,
+        optimizer_config: checkpoint.optimizer_config.clone(),
+        optimizer_state: AdamOptimizerState {
+            first_moment_estimates,
+            second_moment_estimates,
+        },
+        completed_step_count: checkpoint.completed_step_count,
+        latest_loss: checkpoint.latest_loss,
+        latest_validation_loss: checkpoint.latest_validation_loss,
+        progress_history: checkpoint.progress_history.clone(),
+    })
+}
+
+fn flat_values_to_checkpoint_tensors(
+    values: &[f64],
+    expected_tensors: &[CheckpointTensor],
+) -> Result<Vec<CheckpointTensor>, String> {
+    let expected_value_count = expected_tensors
+        .iter()
+        .map(|tensor| tensor.values.len())
+        .sum::<usize>();
+    if values.len() != expected_value_count {
+        return Err(format!(
+            "optimizer state has {} values, expected {expected_value_count}",
+            values.len()
+        ));
+    }
+
+    let mut value_offset = 0;
+    let tensors = expected_tensors
+        .iter()
+        .map(|expected| {
+            let value_count = expected.values.len();
+            let tensor = CheckpointTensor {
+                shape: expected.shape.clone(),
+                values: values[value_offset..value_offset + value_count].to_vec(),
+            };
+            value_offset += value_count;
+            tensor
+        })
+        .collect();
+    Ok(tensors)
 }
 
 #[derive(Clone, Debug)]
@@ -570,6 +753,57 @@ fn push_vector_values(values: &mut Vec<Value>, vector: &Vector) {
     values.extend(vector.iter().cloned());
 }
 
+fn matrix_checkpoint_tensor(matrix: &Matrix) -> CheckpointTensor {
+    CheckpointTensor {
+        shape: vec![matrix.len(), matrix.first().map(Vec::len).unwrap_or(0)],
+        values: matrix
+            .iter()
+            .flat_map(|row| row.iter().map(Value::data))
+            .collect(),
+    }
+}
+
+fn vector_checkpoint_tensor(vector: &Vector) -> CheckpointTensor {
+    CheckpointTensor {
+        shape: vec![vector.len()],
+        values: vector.iter().map(Value::data).collect(),
+    }
+}
+
+fn flatten_checkpoint_tensors(
+    tensors: &[CheckpointTensor],
+    expected_tensors: &[CheckpointTensor],
+) -> Result<Vec<f64>, String> {
+    if tensors.len() != expected_tensors.len() {
+        return Err(format!(
+            "checkpoint has {} parameter tensors, expected {}",
+            tensors.len(),
+            expected_tensors.len()
+        ));
+    }
+
+    let mut values = Vec::new();
+    for (tensor_index, (tensor, expected)) in
+        tensors.iter().zip(expected_tensors.iter()).enumerate()
+    {
+        if tensor.shape != expected.shape {
+            return Err(format!(
+                "checkpoint tensor {tensor_index} has shape {:?}, expected {:?}",
+                tensor.shape, expected.shape
+            ));
+        }
+        let expected_value_count = tensor.shape.iter().product::<usize>();
+        if tensor.values.len() != expected_value_count {
+            return Err(format!(
+                "checkpoint tensor {tensor_index} has {} values, expected {expected_value_count}",
+                tensor.values.len()
+            ));
+        }
+        values.extend(tensor.values.iter().copied());
+    }
+    Ok(values)
+}
+
 pub fn random_gaussian(
     random_number_generator: &mut impl Rng,
     mean: f64,
@@ -616,6 +850,10 @@ pub fn matrix(
                 .collect()
         })
         .collect()
+}
+
+pub fn zero_matrix(output_size: usize, input_size: usize) -> Matrix {
+    (0..output_size).map(|_| zero_vector(input_size)).collect()
 }
 
 pub fn zero_vector(size: usize) -> Vector {
@@ -1608,6 +1846,51 @@ mod tests {
         let result = train_microgpt_step(session, 2).expect("training should run");
 
         assert!(bias_abs_sum(&result.session.trained_microgpt.model) > 0.0);
+    }
+
+    #[test]
+    fn cpu_checkpoint_restores_training_progress_and_parameters() {
+        let mut rng = ChaCha8Rng::seed_from_u64(8);
+        let config = TransformerConfig::new(1, 8, 12, 2).unwrap();
+        let optimizer = AdamOptimizerConfig {
+            learning_rate: 0.006,
+            first_moment_decay: 0.9,
+            second_moment_decay: 0.999,
+            epsilon: 1e-8,
+            weight_decay: 0.0,
+            warmup_step_count: 0,
+            minimum_learning_rate_ratio: 0.0,
+        };
+        let session = create_microgpt_training_session(
+            vec!["anna".into(), "anne".into(), "emma".into(), "ella".into()],
+            &mut rng,
+            3,
+            4,
+            1,
+            config,
+            optimizer,
+        );
+        let session = train_microgpt_step(session, 2)
+            .expect("first training step should run")
+            .session;
+
+        let checkpoint = export_training_session_checkpoint(&session);
+        let restored =
+            import_training_session_checkpoint(&checkpoint).expect("checkpoint should restore");
+
+        assert_eq!(restored.completed_step_count, session.completed_step_count);
+        assert_eq!(
+            restored.progress_history.len(),
+            session.progress_history.len()
+        );
+        assert_eq!(
+            restored.trained_microgpt.model.values().len(),
+            session.trained_microgpt.model.values().len()
+        );
+        assert_eq!(
+            restored.optimizer_state.first_moment_estimates.len(),
+            session.optimizer_state.first_moment_estimates.len()
+        );
     }
 
     fn bias_abs_sum(model: &TransformerModelParameters) -> f64 {

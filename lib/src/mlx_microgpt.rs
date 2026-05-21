@@ -20,6 +20,7 @@
 //! it later. Calls such as `eval`, `item`, and `as_slice` force materialization
 //! because they need concrete values on the Rust side.
 
+use crate::checkpoint::{CheckpointBackend, CheckpointTensor, MicrogptCheckpoint};
 use crate::microgpt::{
     apply_sampling_constraints, normalize_training_document, random_gaussian,
     scheduled_learning_rate, shuffled_by, AdamOptimizerConfig, CharacterTokenizer,
@@ -178,6 +179,43 @@ impl MlxTransformerModelParameters {
         }
     }
 
+    fn zero_initialized(
+        vocabulary_size: usize,
+        context_window_size: usize,
+        embedding_size: usize,
+        layer_count: usize,
+    ) -> Self {
+        let feed_forward_size = 3 * embedding_size;
+        Self {
+            token_embedding: mlx_zero_matrix(vocabulary_size, embedding_size),
+            position_embedding: mlx_zero_matrix(context_window_size, embedding_size),
+            language_model_head: mlx_zero_matrix(vocabulary_size, embedding_size),
+            language_model_head_biases: mlx_zero_vector(vocabulary_size),
+            layers: (0..layer_count)
+                .map(|_| MlxTransformerLayerParameters {
+                    attention: MlxAttentionParameters {
+                        query_weights: mlx_zero_matrix(embedding_size, embedding_size),
+                        query_biases: mlx_zero_vector(embedding_size),
+                        key_weights: mlx_zero_matrix(embedding_size, embedding_size),
+                        key_biases: mlx_zero_vector(embedding_size),
+                        value_weights: mlx_zero_matrix(embedding_size, embedding_size),
+                        value_biases: mlx_zero_vector(embedding_size),
+                        output_projection_weights: mlx_zero_matrix(embedding_size, embedding_size),
+                        output_projection_biases: mlx_zero_vector(embedding_size),
+                    },
+                    feed_forward: MlxFeedForwardParameters {
+                        expansion_weights: mlx_zero_matrix(feed_forward_size, embedding_size),
+                        expansion_biases: mlx_zero_vector(feed_forward_size),
+                        gate_weights: mlx_zero_matrix(feed_forward_size, embedding_size),
+                        gate_biases: mlx_zero_vector(feed_forward_size),
+                        projection_weights: mlx_zero_matrix(embedding_size, feed_forward_size),
+                        projection_biases: mlx_zero_vector(embedding_size),
+                    },
+                })
+                .collect(),
+        }
+    }
+
     pub fn values(&self) -> Vec<Array> {
         // MLX's gradient transform works over a flat slice of Array arguments.
         // This order must match `with_values` and `params_from_arrays`.
@@ -248,6 +286,24 @@ impl MlxTransformerModelParameters {
                 .collect(),
         }
     }
+
+    fn checkpoint_tensor_shapes(&self) -> Vec<CheckpointTensor> {
+        self.values()
+            .iter()
+            .map(|array| {
+                let shape = array
+                    .shape()
+                    .iter()
+                    .map(|dimension| *dimension as usize)
+                    .collect::<Vec<_>>();
+                let value_count = shape.iter().product::<usize>();
+                CheckpointTensor {
+                    shape,
+                    values: vec![0.0; value_count],
+                }
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -307,6 +363,76 @@ impl MlxMicrogptTrainingSession {
         self.progress_history = vec![progress];
         Ok(self)
     }
+}
+
+pub fn export_training_session_checkpoint(
+    session: &MlxMicrogptTrainingSession,
+) -> Result<MicrogptCheckpoint, String> {
+    let parameter_arrays = session.trained_microgpt.model.values();
+    Ok(MicrogptCheckpoint {
+        backend: CheckpointBackend::Mlx,
+        config: session.trained_microgpt.config.clone(),
+        tokenizer: session.trained_microgpt.tokenizer.clone(),
+        documents: session.documents.clone(),
+        validation_documents: session.validation_documents.clone(),
+        training_step_count: session.training_step_count,
+        validation_evaluation_document_count: session.validation_evaluation_document_count,
+        optimizer_config: session.optimizer_config.clone(),
+        completed_step_count: session.completed_step_count,
+        latest_loss: session.latest_loss,
+        latest_validation_loss: session.latest_validation_loss,
+        progress_history: session.progress_history.clone(),
+        parameters: arrays_to_checkpoint_tensors(&parameter_arrays)?,
+        first_moment_estimates: arrays_to_checkpoint_tensors(
+            &session.optimizer_state.first_moment_estimates,
+        )?,
+        second_moment_estimates: arrays_to_checkpoint_tensors(
+            &session.optimizer_state.second_moment_estimates,
+        )?,
+    })
+}
+
+pub fn import_training_session_checkpoint(
+    checkpoint: &MicrogptCheckpoint,
+) -> Result<MlxMicrogptTrainingSession, String> {
+    let tokenizer = CharacterTokenizer::new(
+        checkpoint.tokenizer.unique_characters.clone(),
+        checkpoint.tokenizer.sequence_boundary_token_id,
+    );
+    let model_template = MlxTransformerModelParameters::zero_initialized(
+        tokenizer.vocabulary_size(),
+        checkpoint.config.context_window_size,
+        checkpoint.config.embedding_size,
+        checkpoint.config.layer_count,
+    );
+    let expected_tensors = model_template.checkpoint_tensor_shapes();
+    let parameter_arrays = checkpoint_tensors_to_arrays(&checkpoint.parameters, &expected_tensors)?;
+    let first_moment_estimates =
+        checkpoint_tensors_to_arrays(&checkpoint.first_moment_estimates, &expected_tensors)?;
+    let second_moment_estimates =
+        checkpoint_tensors_to_arrays(&checkpoint.second_moment_estimates, &expected_tensors)?;
+    let model = model_template.with_values(&parameter_arrays);
+
+    Ok(MlxMicrogptTrainingSession {
+        trained_microgpt: MlxTrainedMicrogpt {
+            model,
+            config: checkpoint.config.clone(),
+            tokenizer,
+        },
+        documents: checkpoint.documents.clone(),
+        validation_documents: checkpoint.validation_documents.clone(),
+        training_step_count: checkpoint.training_step_count,
+        validation_evaluation_document_count: checkpoint.validation_evaluation_document_count,
+        optimizer_config: checkpoint.optimizer_config.clone(),
+        optimizer_state: MlxAdamOptimizerState {
+            first_moment_estimates,
+            second_moment_estimates,
+        },
+        completed_step_count: checkpoint.completed_step_count,
+        latest_loss: checkpoint.latest_loss,
+        latest_validation_loss: checkpoint.latest_validation_loss,
+        progress_history: checkpoint.progress_history.clone(),
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -1363,8 +1489,82 @@ fn mlx_matrix(
     Array::from_slice(&data, &[output_size as i32, input_size as i32])
 }
 
+fn mlx_zero_matrix(output_size: usize, input_size: usize) -> Array {
+    Array::from_slice(
+        &vec![0.0_f32; output_size * input_size],
+        &[output_size as i32, input_size as i32],
+    )
+}
+
 fn mlx_zero_vector(size: usize) -> Array {
     Array::from_slice(&vec![0.0_f32; size], &[size as i32])
+}
+
+fn arrays_to_checkpoint_tensors(arrays: &[Array]) -> Result<Vec<CheckpointTensor>, String> {
+    arrays
+        .iter()
+        .map(array_to_checkpoint_tensor)
+        .collect::<Result<Vec<_>, _>>()
+}
+
+fn array_to_checkpoint_tensor(array: &Array) -> Result<CheckpointTensor, String> {
+    array.eval().map_err(|error| error.to_string())?;
+    let shape = array
+        .shape()
+        .iter()
+        .map(|dimension| *dimension as usize)
+        .collect::<Vec<_>>();
+    let values = array
+        .as_slice::<f32>()
+        .iter()
+        .map(|value| *value as f64)
+        .collect::<Vec<_>>();
+    CheckpointTensor::new(shape, values)
+}
+
+fn checkpoint_tensors_to_arrays(
+    tensors: &[CheckpointTensor],
+    expected_tensors: &[CheckpointTensor],
+) -> Result<Vec<Array>, String> {
+    if tensors.len() != expected_tensors.len() {
+        return Err(format!(
+            "checkpoint has {} tensors, expected {}",
+            tensors.len(),
+            expected_tensors.len()
+        ));
+    }
+
+    tensors
+        .iter()
+        .zip(expected_tensors.iter())
+        .enumerate()
+        .map(|(tensor_index, (tensor, expected))| {
+            if tensor.shape != expected.shape {
+                return Err(format!(
+                    "checkpoint tensor {tensor_index} has shape {:?}, expected {:?}",
+                    tensor.shape, expected.shape
+                ));
+            }
+            let expected_value_count = tensor.shape.iter().product::<usize>();
+            if tensor.values.len() != expected_value_count {
+                return Err(format!(
+                    "checkpoint tensor {tensor_index} has {} values, expected {expected_value_count}",
+                    tensor.values.len()
+                ));
+            }
+            let values = tensor
+                .values
+                .iter()
+                .map(|value| *value as f32)
+                .collect::<Vec<_>>();
+            let shape = tensor
+                .shape
+                .iter()
+                .map(|dimension| *dimension as i32)
+                .collect::<Vec<_>>();
+            Ok(Array::from_slice(&values, shape.as_slice()))
+        })
+        .collect()
 }
 
 fn weighted_choice(weights: &[f64], random_number_generator: &mut impl Rng) -> usize {
@@ -1438,9 +1638,18 @@ mod tests {
     use super::*;
     use rand::SeedableRng;
     use rand_chacha::ChaCha8Rng;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    fn mlx_test_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("MLX test lock should not be poisoned")
+    }
 
     #[test]
     fn mlx_can_train_one_tiny_step_and_generate() {
+        let _guard = mlx_test_lock();
         let mut rng = ChaCha8Rng::seed_from_u64(1);
         let config = TransformerConfig::new(1, 8, 12, 2).unwrap();
         let optimizer = AdamOptimizerConfig {
@@ -1482,6 +1691,7 @@ mod tests {
 
     #[test]
     fn mlx_rope_handles_app_sized_attention_inside_training() {
+        let _guard = mlx_test_lock();
         let mut rng = ChaCha8Rng::seed_from_u64(2);
         let config = TransformerConfig::new(2, 64, 20, 16).unwrap();
         let optimizer = AdamOptimizerConfig {
@@ -1514,5 +1724,55 @@ mod tests {
             .expect("step should run without indexing panic");
 
         assert_eq!(result.progress.completed_step_count, 1);
+    }
+
+    #[test]
+    fn mlx_checkpoint_restores_training_progress_and_parameters() {
+        let _guard = mlx_test_lock();
+        let mut rng = ChaCha8Rng::seed_from_u64(3);
+        let config = TransformerConfig::new(1, 8, 12, 2).unwrap();
+        let optimizer = AdamOptimizerConfig {
+            learning_rate: 0.006,
+            first_moment_decay: 0.9,
+            second_moment_decay: 0.999,
+            epsilon: 1e-8,
+            weight_decay: 0.0,
+            warmup_step_count: 0,
+            minimum_learning_rate_ratio: 0.0,
+        };
+        let session = create_mlx_microgpt_training_session(
+            vec!["anna".into(), "anne".into(), "emma".into(), "ella".into()],
+            &mut rng,
+            3,
+            4,
+            1,
+            config,
+            optimizer,
+        )
+        .with_initial_progress()
+        .unwrap();
+        let session = train_mlx_microgpt_step(session, 2)
+            .unwrap()
+            .expect("training step should run")
+            .session;
+
+        let checkpoint = export_training_session_checkpoint(&session)
+            .expect("checkpoint export should read MLX tensors");
+        let restored =
+            import_training_session_checkpoint(&checkpoint).expect("checkpoint should restore");
+
+        assert_eq!(restored.completed_step_count, session.completed_step_count);
+        assert_eq!(
+            restored.progress_history.len(),
+            session.progress_history.len()
+        );
+        assert_eq!(
+            restored.trained_microgpt.model.values().len(),
+            session.trained_microgpt.model.values().len()
+        );
+        assert_eq!(
+            restored.optimizer_state.first_moment_estimates.len(),
+            session.optimizer_state.first_moment_estimates.len()
+        );
     }
 }

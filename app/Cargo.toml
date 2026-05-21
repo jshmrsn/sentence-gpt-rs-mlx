@@ -6,10 +6,12 @@ license.workspace = true
 
 [dependencies]
 dioxus = { version = "0.7.9", features = ["desktop"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 microgpt-config = { path = "../config" }
 microgpt-lib = { path = "../lib" }
 rand.workspace = true
 rand_chacha.workspace = true
+rfd = "0.15"
 serde.workspace = true
 serde_json.workspace = true
 tokio = { version = "1", features = ["time"] }
