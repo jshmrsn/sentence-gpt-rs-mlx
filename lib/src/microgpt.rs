@@ -75,10 +75,15 @@ pub struct FeedForwardParameters {
 pub struct TransformerLayerParameters {
     // Learned RMSNorm scale before attention. RMSNorm fixes the vector length;
     // this gain vector lets the model learn which channels should be louder or
-    // quieter after normalization.
+    // quieter after normalization. Without this, normalization would force every
+    // channel to use the same scale forever; with it, the model can learn that
+    // some features are usually more important than others.
     pub attention_norm_gain: Vector,
     pub attention: AttentionParameters,
-    // Learned RMSNorm scale before the feed-forward block.
+    // Learned RMSNorm scale before the feed-forward block. Attention mixes
+    // information across positions; the feed-forward block then transforms each
+    // position's features. Giving each sub-block its own gain vector lets those
+    // two jobs prefer different channel scales.
     pub feed_forward_norm_gain: Vector,
     pub feed_forward: FeedForwardParameters,
 }
@@ -89,14 +94,18 @@ pub struct TransformerModelParameters {
     pub token_embedding: Matrix,
     // Kept for checkpoint/UI compatibility, but the active model is now RoPE
     // only. Character models get cleaner extrapolation from relative rotary
-    // positions than from also learning a tiny absolute position table.
+    // positions than from also learning a tiny absolute position table. In
+    // other words: the model now learns "how far apart are these characters?"
+    // through attention rotations instead of memorizing "position 17 means..."
     pub position_embedding: Matrix,
     // Kept for checkpoint/UI compatibility. The active logits are tied to
     // `token_embedding`, a common LM trick that improves sample efficiency for
     // small vocabularies by sharing input and output character representations.
     pub language_model_head: Matrix,
     pub language_model_head_biases: Vector,
-    // Final learned RMSNorm scale before tied output logits.
+    // Final learned RMSNorm scale before tied output logits. This is the last
+    // chance to put the hidden vector into a predictable numeric range before
+    // dotting it against every token embedding to produce next-character scores.
     pub final_norm_gain: Vector,
     pub layers: Vec<TransformerLayerParameters>,
 }
@@ -1039,6 +1048,12 @@ pub fn tied_language_model_logits(
     // Weight tying reuses each token's input embedding row as that token's
     // output classifier. If the final hidden state points in the same direction
     // as the embedding for "a", the logit for "a" becomes larger.
+    //
+    // This matters a lot for a tiny character model. The embedding row for a
+    // character already learns what that character "means" as an input. Tying
+    // says that same learned meaning should also define what it means to predict
+    // that character as output. That reduces redundant parameters and often
+    // improves generalization when data is limited.
     linear(hidden_state, token_embedding, biases)
 }
 
@@ -1417,6 +1432,11 @@ fn apply_cpu_residual_dropout(
     position_id: usize,
     stream: usize,
 ) {
+    // Dropout is training-only noise: randomly erase some residual-block output
+    // channels so the model cannot rely too heavily on any one feature. The
+    // residual connection still carries the original state around the block, so
+    // dropout regularizes the block's proposed "edit" rather than deleting the
+    // whole representation.
     let Some(dropout_context) = dropout_context else {
         return;
     };
@@ -1431,6 +1451,10 @@ fn apply_cpu_residual_dropout(
             channel_index,
         );
         let multiplier = if random < keep_probability {
+            // Inverted dropout: kept values are scaled up by 1 / keep_probability
+            // so the average activation size during training matches inference.
+            // Example: if we keep 95%, multiplying kept values by 1/0.95 keeps
+            // the expected average unchanged.
             1.0 / keep_probability
         } else {
             0.0
@@ -1447,6 +1471,11 @@ fn deterministic_unit_float(
     stream: usize,
     channel_index: usize,
 ) -> f64 {
+    // This is a deterministic pseudo-random number in [0, 1). It is not used
+    // for security; it is used so training can be noisy enough for dropout while
+    // still being exactly reproducible after importing a checkpoint. The inputs
+    // identify a unique training location: step, batch item, layer, sequence
+    // position, residual stream, and channel.
     let mixed = splitmix64(
         (step as u64)
             .wrapping_mul(0xa076_1d64_78bd_642f)
@@ -1470,6 +1499,12 @@ pub fn training_batch_token_windows(
     // than cycling through whole sentences. The "randomness" is deterministic:
     // it is a pure function of step + batch slot, so checkpoint restore does not
     // need to serialize a mutable RNG stream to reproduce later batches.
+    //
+    // Character-level language modeling benefits from windows because a single
+    // story sentence can teach many overlapping next-character predictions. If
+    // we always trained only from the beginning of each sentence, later words
+    // would be under-trained and the model would see the same rhythms every
+    // epoch.
     (0..batch_document_count)
         .map(|batch_offset| {
             let document_index = deterministic_index(step, batch_offset, 0x9e37, documents.len());
@@ -1492,6 +1527,11 @@ fn token_window_from_tokens(
     context_window_size: usize,
     pad_token_id: usize,
 ) -> TrainingTokenWindow {
+    // A window contains exactly `context_window_size` input positions. Targets
+    // are shifted by one character: input position t predicts target position t.
+    // Short documents are padded with the boundary token and excluded from loss
+    // by `loss_mask`, so padding can flow through the model without teaching the
+    // model fake examples.
     let prediction_count = tokens.len().saturating_sub(1).min(context_window_size);
     let max_start = tokens.len().saturating_sub(context_window_size + 1);
     let start = if max_start == 0 {
@@ -1712,6 +1752,12 @@ fn train_on_token_window_with_dropout(
     token_window: &TrainingTokenWindow,
     dropout_context: Option<CpuDropoutContext>,
 ) -> Value {
+    // The CPU backend stays intentionally literal: it still walks one character
+    // position at a time so every Value in the autodiff graph is inspectable.
+    // The optimization improvement here is not tensor parallelism; it is the
+    // better objective/data shape. We now train on random fixed-size windows and
+    // apply the same architecture choices as MLX: RoPE-only positions, learned
+    // RMSNorm gains, final norm, tied output embeddings, and training dropout.
     let mut keys = create_key_value_cache(config.layer_count);
     let mut values = create_key_value_cache(config.layer_count);
     let mut loss = Value::new(0.0);

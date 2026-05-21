@@ -68,6 +68,9 @@ pub struct MlxFeedForwardParameters {
 
 #[derive(Clone, Debug)]
 pub struct MlxTransformerLayerParameters {
+    // Same learned RMSNorm gains as the CPU backend, but stored as MLX tensors.
+    // Shape: [embedding_size]. MLX broadcasts this across batch and sequence
+    // dimensions when normalizing [batch, sequence, embedding_size] activations.
     pub attention_norm_gain: Array,
     pub attention: MlxAttentionParameters,
     pub feed_forward_norm_gain: Array,
@@ -80,9 +83,14 @@ pub struct MlxTransformerModelParameters {
     // single MLX tensor. Keeping the shapes and names aligned makes it easier to
     // compare CPU and MLX behavior.
     pub token_embedding: Array,
+    // Retained for checkpoint/UI compatibility. The active MLX forward pass is
+    // RoPE-only and does not add this learned absolute position table.
     pub position_embedding: Array,
+    // Retained for checkpoint/UI compatibility. Active output logits use tied
+    // token embeddings instead of this independent head matrix.
     pub language_model_head: Array,
     pub language_model_head_biases: Array,
+    // Shape: [embedding_size]. Applied before tied output logits.
     pub final_norm_gain: Array,
     pub layers: Vec<MlxTransformerLayerParameters>,
 }
@@ -1146,6 +1154,15 @@ fn batch_loss(
     // large matrix work instead of thousands of tiny scalar-shaped operations.
     let batch_size = batch_windows.len();
     let sequence_len = config.context_window_size;
+    // Convert the Rust-side training windows into compact device tensors:
+    //
+    // input_tokens:  [batch, sequence]
+    // target_tokens: [batch * sequence, 1] after flattening, for gather
+    // loss_mask:     [batch * sequence], 1 for real targets and 0 for padding
+    //
+    // The token ids are small integers; MLX uses them to gather rows from the
+    // embedding table. The loss mask is what lets short sentences share the same
+    // fixed tensor shape as long sentences without teaching on padding.
     let flat_input_tokens = batch_windows
         .iter()
         .flat_map(|window| window.input_tokens.iter().map(|token| *token as i32))
@@ -1171,6 +1188,12 @@ fn batch_loss(
 
     let logits = run_transformer_batch(params, config, &input_tokens, dropout_masks)?;
     let vocabulary_size = params.token_embedding.shape()[0];
+    // `logits` is [batch, sequence, vocab]. Flatten to [tokens, vocab] so each
+    // row is one next-character prediction. Cross-entropy is:
+    //
+    // log(sum(exp(all logits))) - logit(correct target)
+    //
+    // `logsumexp_axis` computes the first term stably without overflow.
     let flat_logits = logits.reshape(&[(batch_size * sequence_len) as i32, vocabulary_size])?;
     let log_normalizer = ops::logsumexp_axis(&flat_logits, 1, true)?;
     let target_logits = flat_logits
@@ -1187,6 +1210,10 @@ fn run_transformer_batch(
     input_tokens: &Array,
     dropout_masks: Option<&BatchDropoutMasks>,
 ) -> MlxResult<Array> {
+    // Gather token vectors for every batch item and every sequence position at
+    // once. Shape changes from token ids [batch, sequence] to hidden states
+    // [batch, sequence, embedding_size]. This single gather replaces the
+    // token-by-token embedding lookup loop used by the reference backend.
     let mut hidden_state = params.token_embedding.take_axis(input_tokens, 0)?;
 
     for (layer_index, layer) in params.layers.iter().enumerate() {
@@ -1200,6 +1227,9 @@ fn run_transformer_batch(
         )?;
     }
 
+    // Final norm makes the scale of the hidden states predictable before the
+    // output dot products. With tied embeddings, this is especially helpful:
+    // logits are literal dot products against token embedding rows.
     hidden_state = rmsnorm_last_axis(&hidden_state, params.final_norm_gain)?;
     tied_language_model_logits_batch(
         &hidden_state,
@@ -1217,6 +1247,10 @@ fn run_transformer_layer_batch(
     dropout_masks: Option<&BatchDropoutMasks>,
 ) -> MlxResult<Array> {
     let residual_state = hidden_state.clone();
+    // Pre-norm Transformer layout: normalize before each sub-block, then add the
+    // sub-block output back to the residual stream. Pre-norm is generally easier
+    // to train because gradients can flow through the residual path even when a
+    // sub-block is poorly initialized.
     let normalized_state = rmsnorm_last_axis(hidden_state, layer.attention_norm_gain)?;
 
     let query = apply_rotary_position_embedding_batch(
@@ -1250,6 +1284,9 @@ fn run_transformer_layer_batch(
         layer.attention.output_projection_biases,
     )?;
     if let Some(dropout_masks) = dropout_masks {
+        // Drop only the residual update, not the residual state itself. The
+        // model still has a clean path for information to move forward while
+        // the proposed attention edit is regularized during training.
         block_output *= &dropout_masks.attention_residual_masks[layer_index];
     }
     let updated_hidden_state = block_output + residual_state;
@@ -1273,6 +1310,9 @@ fn run_transformer_layer_batch(
         layer.feed_forward.projection_biases,
     )?;
     if let Some(dropout_masks) = dropout_masks {
+        // Same idea for the feed-forward update. During inference this mask is
+        // absent, and inverted-dropout scaling makes the expected train-time
+        // magnitude match inference-time magnitude.
         block_output *= &dropout_masks.feed_forward_residual_masks[layer_index];
     }
     Ok(block_output + residual_state)
@@ -1284,6 +1324,20 @@ fn run_multi_head_attention_batch(
     value: &Array,
     config: &TransformerConfig,
 ) -> MlxResult<Array> {
+    // Batched attention shape walkthrough:
+    //
+    // query/key/value start as [batch, sequence, embedding].
+    // Reshape splits the embedding into heads:
+    //   [batch, sequence, head, head_size]
+    // Transpose puts heads before sequence:
+    //   [batch, head, sequence, head_size]
+    //
+    // Then `query.matmul(key_transposed)` computes every query-position versus
+    // every key-position score for every batch item and head in one operation:
+    //   [batch, head, sequence, sequence]
+    //
+    // That is the core win over the earlier Rust loop: MLX sees one large tensor
+    // problem instead of many tiny per-character dot products.
     let shape = query.shape();
     let batch_size = shape[0];
     let sequence_len = shape[1];
@@ -1312,6 +1366,14 @@ fn run_multi_head_attention_batch(
 }
 
 fn causal_attention_mask(sequence_len: usize) -> Array {
+    // A language model must not look at future characters while predicting the
+    // next one. The mask adds a huge negative number above the diagonal:
+    //
+    // row 0 can attend to column 0
+    // row 1 can attend to columns 0..1
+    // row 2 can attend to columns 0..2
+    //
+    // After softmax, those huge negative future scores become probability ~0.
     let values = (0..sequence_len)
         .flat_map(|query_position| {
             (0..sequence_len).map(move |key_position| {
@@ -1331,6 +1393,13 @@ fn apply_rotary_position_embedding_batch(
     rotary_position_matrices: &[Array],
     config: &TransformerConfig,
 ) -> MlxResult<Array> {
+    // RoPE rotates query/key channels by a position-dependent angle. This
+    // batched version stacks one rotation matrix per sequence position, then
+    // multiplies every [batch, position] vector by that position's matrix.
+    //
+    // We rotate queries and keys, not values, because attention scores are dot
+    // products between query/key. Applying the same rotation rule to both makes
+    // those dot products sensitive to relative distance between characters.
     let shape = vectors.shape();
     let batch_size = shape[0];
     let sequence_len = shape[1];
@@ -1349,6 +1418,9 @@ fn apply_rotary_position_embedding_batch(
 }
 
 fn linear_last_axis(input: &Array, weights: &Array, biases: &Array) -> MlxResult<Array> {
+    // Apply the same dense layer independently at every [batch, sequence]
+    // location. `input` is [..., input_size], weights are [output_size,
+    // input_size], so transposing weights lets MLX produce [..., output_size].
     Ok(input.matmul(&weights.transpose()?)? + biases)
 }
 
@@ -1357,10 +1429,16 @@ fn tied_language_model_logits_batch(
     token_embedding: &Array,
     biases: &Array,
 ) -> MlxResult<Array> {
+    // Tied output head: every final hidden vector is dotted against every token
+    // embedding row. Result shape is [batch, sequence, vocabulary_size].
     Ok(hidden_state.matmul(&token_embedding.transpose()?)? + biases)
 }
 
 fn rmsnorm_last_axis(input: &Array, gain: &Array) -> MlxResult<Array> {
+    // Normalize only the feature/channel axis, not batch or time. For a hidden
+    // vector [x1, x2, ...], RMSNorm divides by sqrt(mean(x_i^2) + epsilon), then
+    // multiplies by the learned gain vector. The gain is the trainable "how loud
+    // should this channel be after normalization?" parameter.
     let mean_square = ops::mean_axis(&ops::square(input)?, -1, true)?;
     let scale = (mean_square + Array::from_f32(1e-5)).sqrt()?;
     Ok((input / scale) * gain)
@@ -1374,6 +1452,10 @@ fn batch_dropout_masks(
     layer_count: usize,
     dropout_probability: f32,
 ) -> BatchDropoutMasks {
+    // Build deterministic dropout masks on the Rust side and hand them to MLX as
+    // tensors. Deterministic means "recomputable from step/layer/index", not
+    // "same every step". This keeps checkpoint resume simple: if training
+    // resumes at step N, the same masks for step N are regenerated.
     let attention_residual_masks = (0..layer_count)
         .map(|layer_index| {
             dropout_mask_array(
@@ -1415,6 +1497,13 @@ fn dropout_mask_array(
     embedding_size: usize,
     dropout_probability: f32,
 ) -> Array {
+    // Inverted dropout mask:
+    //
+    // - dropped channels get 0
+    // - kept channels get 1 / keep_probability
+    //
+    // The scale-up means average activation magnitude during training matches
+    // inference, where dropout is disabled and every channel is kept.
     if dropout_probability <= 0.0 {
         return Array::from_slice(
             &vec![1.0_f32; batch_size * sequence_len * embedding_size],
@@ -1448,6 +1537,9 @@ fn dropout_mask_array(
 }
 
 fn deterministic_unit_float(step: usize, layer_index: usize, stream: usize, index: usize) -> f32 {
+    // Fast deterministic pseudo-random float in [0, 1). `stream` separates the
+    // attention residual mask from the feed-forward residual mask so both blocks
+    // do not drop the exact same channels.
     let mixed = splitmix64(
         (step as u64)
             .wrapping_mul(0xa076_1d64_78bd_642f)
