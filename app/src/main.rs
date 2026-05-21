@@ -17,7 +17,7 @@ use microgpt_lib::microgpt::{
     calculate_training_loss_baseline as calculate_cpu_training_loss_baseline,
     calculate_validation_loss as calculate_cpu_validation_loss, create_microgpt_training_session,
     generate_samples as generate_cpu_samples, train_microgpt_step, CharacterTokenizer, Matrix,
-    MicrogptTrainingProgress, MicrogptTrainingSession, TrainedMicrogpt, TransformerConfig,
+    MicrogptTrainingProgress, MicrogptTrainingSession, TrainedMicrogpt, TransformerConfig, Vector,
 };
 use microgpt_lib::mlx_microgpt::{
     attach_validation_loss as attach_mlx_validation_loss,
@@ -1707,6 +1707,7 @@ fn build_cpu_model_heatmaps(trained_microgpt: &TrainedMicrogpt) -> Vec<ModelHeat
         matrix_heatmap_data("Token embedding", &model.token_embedding),
         matrix_heatmap_data("Position embedding", &model.position_embedding),
         matrix_heatmap_data("Language head", &model.language_model_head),
+        vector_heatmap_data("Language head bias", &model.language_model_head_biases),
     ];
     for (layer_index, layer) in model.layers.iter().enumerate() {
         let prefix = format!("Layer {}", layer_index + 1);
@@ -1714,29 +1715,57 @@ fn build_cpu_model_heatmaps(trained_microgpt: &TrainedMicrogpt) -> Vec<ModelHeat
             &format!("{prefix} Q"),
             &layer.attention.query_weights,
         ));
+        heatmaps.push(vector_heatmap_data(
+            &format!("{prefix} Q bias"),
+            &layer.attention.query_biases,
+        ));
         heatmaps.push(matrix_heatmap_data(
             &format!("{prefix} K"),
             &layer.attention.key_weights,
+        ));
+        heatmaps.push(vector_heatmap_data(
+            &format!("{prefix} K bias"),
+            &layer.attention.key_biases,
         ));
         heatmaps.push(matrix_heatmap_data(
             &format!("{prefix} V"),
             &layer.attention.value_weights,
         ));
+        heatmaps.push(vector_heatmap_data(
+            &format!("{prefix} V bias"),
+            &layer.attention.value_biases,
+        ));
         heatmaps.push(matrix_heatmap_data(
             &format!("{prefix} Attn out"),
             &layer.attention.output_projection_weights,
+        ));
+        heatmaps.push(vector_heatmap_data(
+            &format!("{prefix} Attn out bias"),
+            &layer.attention.output_projection_biases,
         ));
         heatmaps.push(matrix_heatmap_data(
             &format!("{prefix} FF expand"),
             &layer.feed_forward.expansion_weights,
         ));
+        heatmaps.push(vector_heatmap_data(
+            &format!("{prefix} FF expand bias"),
+            &layer.feed_forward.expansion_biases,
+        ));
         heatmaps.push(matrix_heatmap_data(
             &format!("{prefix} FF gate"),
             &layer.feed_forward.gate_weights,
         ));
+        heatmaps.push(vector_heatmap_data(
+            &format!("{prefix} FF gate bias"),
+            &layer.feed_forward.gate_biases,
+        ));
         heatmaps.push(matrix_heatmap_data(
             &format!("{prefix} FF project"),
             &layer.feed_forward.projection_weights,
+        ));
+        heatmaps.push(vector_heatmap_data(
+            &format!("{prefix} FF project bias"),
+            &layer.feed_forward.projection_biases,
         ));
     }
     heatmaps
@@ -1756,6 +1785,25 @@ fn matrix_heatmap_data(label: &str, matrix: &Matrix) -> ModelHeatmap {
         label: label.into(),
         rows,
         columns,
+        values,
+        min,
+        max,
+        mean_abs,
+    }
+}
+
+fn vector_heatmap_data(label: &str, vector: &Vector) -> ModelHeatmap {
+    let values = vector
+        .iter()
+        .map(|value| value.data() as f32)
+        .collect::<Vec<_>>();
+    let min = values.iter().copied().fold(f32::INFINITY, f32::min);
+    let max = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mean_abs = values.iter().map(|value| value.abs()).sum::<f32>() / values.len().max(1) as f32;
+    ModelHeatmap {
+        label: label.into(),
+        rows: 1,
+        columns: vector.len(),
         values,
         min,
         max,

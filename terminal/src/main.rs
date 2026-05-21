@@ -21,7 +21,7 @@ use microgpt_lib::microgpt::{
     calculate_training_loss_baseline as calculate_cpu_training_loss_baseline,
     calculate_validation_loss as calculate_cpu_validation_loss, create_microgpt_training_session,
     generate_samples as generate_cpu_samples, train_microgpt_step, Matrix,
-    MicrogptTrainingProgress, MicrogptTrainingSession, TrainedMicrogpt, TransformerConfig,
+    MicrogptTrainingProgress, MicrogptTrainingSession, TrainedMicrogpt, TransformerConfig, Vector,
 };
 use microgpt_lib::mlx_microgpt::{
     attach_validation_loss as attach_mlx_validation_loss,
@@ -851,6 +851,7 @@ fn build_cpu_matrix_summaries(trained_microgpt: &TrainedMicrogpt) -> Vec<MatrixS
         matrix_summary("Token embedding", &model.token_embedding),
         matrix_summary("Position embedding", &model.position_embedding),
         matrix_summary("Language head", &model.language_model_head),
+        vector_summary("Language head bias", &model.language_model_head_biases),
     ];
     for (layer_index, layer) in model.layers.iter().enumerate() {
         let prefix = format!("Layer {}", layer_index + 1);
@@ -858,29 +859,57 @@ fn build_cpu_matrix_summaries(trained_microgpt: &TrainedMicrogpt) -> Vec<MatrixS
             &format!("{prefix} Q"),
             &layer.attention.query_weights,
         ));
+        summaries.push(vector_summary(
+            &format!("{prefix} Q bias"),
+            &layer.attention.query_biases,
+        ));
         summaries.push(matrix_summary(
             &format!("{prefix} K"),
             &layer.attention.key_weights,
+        ));
+        summaries.push(vector_summary(
+            &format!("{prefix} K bias"),
+            &layer.attention.key_biases,
         ));
         summaries.push(matrix_summary(
             &format!("{prefix} V"),
             &layer.attention.value_weights,
         ));
+        summaries.push(vector_summary(
+            &format!("{prefix} V bias"),
+            &layer.attention.value_biases,
+        ));
         summaries.push(matrix_summary(
             &format!("{prefix} Attn out"),
             &layer.attention.output_projection_weights,
+        ));
+        summaries.push(vector_summary(
+            &format!("{prefix} Attn out bias"),
+            &layer.attention.output_projection_biases,
         ));
         summaries.push(matrix_summary(
             &format!("{prefix} FF expand"),
             &layer.feed_forward.expansion_weights,
         ));
+        summaries.push(vector_summary(
+            &format!("{prefix} FF expand bias"),
+            &layer.feed_forward.expansion_biases,
+        ));
         summaries.push(matrix_summary(
             &format!("{prefix} FF gate"),
             &layer.feed_forward.gate_weights,
         ));
+        summaries.push(vector_summary(
+            &format!("{prefix} FF gate bias"),
+            &layer.feed_forward.gate_biases,
+        ));
         summaries.push(matrix_summary(
             &format!("{prefix} FF project"),
             &layer.feed_forward.projection_weights,
+        ));
+        summaries.push(vector_summary(
+            &format!("{prefix} FF project bias"),
+            &layer.feed_forward.projection_biases,
         ));
     }
     summaries
@@ -900,6 +929,24 @@ fn matrix_summary(label: &str, matrix: &Matrix) -> MatrixSummary {
         label: label.into(),
         rows,
         columns,
+        min,
+        max,
+        mean_abs,
+    }
+}
+
+fn vector_summary(label: &str, vector: &Vector) -> MatrixSummary {
+    let values = vector
+        .iter()
+        .map(|value| value.data() as f32)
+        .collect::<Vec<_>>();
+    let min = values.iter().copied().fold(f32::INFINITY, f32::min);
+    let max = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mean_abs = values.iter().map(|value| value.abs()).sum::<f32>() / values.len().max(1) as f32;
+    MatrixSummary {
+        label: label.into(),
+        rows: 1,
+        columns: vector.len(),
         min,
         max,
         mean_abs,

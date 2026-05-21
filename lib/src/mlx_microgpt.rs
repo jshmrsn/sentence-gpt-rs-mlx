@@ -40,9 +40,13 @@ pub struct MlxAttentionParameters {
     //   [output_size, input_size]
     // For attention projections here that is [embedding_size, embedding_size].
     pub query_weights: Array,
+    pub query_biases: Array,
     pub key_weights: Array,
+    pub key_biases: Array,
     pub value_weights: Array,
+    pub value_biases: Array,
     pub output_projection_weights: Array,
+    pub output_projection_biases: Array,
 }
 
 #[derive(Clone, Debug)]
@@ -52,8 +56,11 @@ pub struct MlxFeedForwardParameters {
     //   gate_weights:      [3 * embedding_size, embedding_size]
     //   projection_weights:[embedding_size, 3 * embedding_size]
     pub expansion_weights: Array,
+    pub expansion_biases: Array,
     pub gate_weights: Array,
+    pub gate_biases: Array,
     pub projection_weights: Array,
+    pub projection_biases: Array,
 }
 
 #[derive(Clone, Debug)]
@@ -70,6 +77,7 @@ pub struct MlxTransformerModelParameters {
     pub token_embedding: Array,
     pub position_embedding: Array,
     pub language_model_head: Array,
+    pub language_model_head_biases: Array,
     pub layers: Vec<MlxTransformerLayerParameters>,
 }
 
@@ -109,6 +117,7 @@ impl MlxTransformerModelParameters {
                 random_number_generator,
                 projection_std,
             ),
+            language_model_head_biases: mlx_zero_vector(vocabulary_size),
             layers: (0..layer_count)
                 .map(|_| MlxTransformerLayerParameters {
                     attention: MlxAttentionParameters {
@@ -118,24 +127,28 @@ impl MlxTransformerModelParameters {
                             random_number_generator,
                             projection_std,
                         ),
+                        query_biases: mlx_zero_vector(embedding_size),
                         key_weights: mlx_matrix(
                             embedding_size,
                             embedding_size,
                             random_number_generator,
                             projection_std,
                         ),
+                        key_biases: mlx_zero_vector(embedding_size),
                         value_weights: mlx_matrix(
                             embedding_size,
                             embedding_size,
                             random_number_generator,
                             projection_std,
                         ),
+                        value_biases: mlx_zero_vector(embedding_size),
                         output_projection_weights: mlx_matrix(
                             embedding_size,
                             embedding_size,
                             random_number_generator,
                             residual_projection_std,
                         ),
+                        output_projection_biases: mlx_zero_vector(embedding_size),
                     },
                     feed_forward: MlxFeedForwardParameters {
                         expansion_weights: mlx_matrix(
@@ -144,18 +157,21 @@ impl MlxTransformerModelParameters {
                             random_number_generator,
                             projection_std,
                         ),
+                        expansion_biases: mlx_zero_vector(feed_forward_size),
                         gate_weights: mlx_matrix(
                             feed_forward_size,
                             embedding_size,
                             random_number_generator,
                             projection_std,
                         ),
+                        gate_biases: mlx_zero_vector(feed_forward_size),
                         projection_weights: mlx_matrix(
                             embedding_size,
                             feed_forward_size,
                             random_number_generator,
                             residual_projection_std,
                         ),
+                        projection_biases: mlx_zero_vector(embedding_size),
                     },
                 })
                 .collect(),
@@ -169,15 +185,23 @@ impl MlxTransformerModelParameters {
             self.token_embedding.clone(),
             self.position_embedding.clone(),
             self.language_model_head.clone(),
+            self.language_model_head_biases.clone(),
         ];
         for layer in &self.layers {
             values.push(layer.attention.query_weights.clone());
+            values.push(layer.attention.query_biases.clone());
             values.push(layer.attention.key_weights.clone());
+            values.push(layer.attention.key_biases.clone());
             values.push(layer.attention.value_weights.clone());
+            values.push(layer.attention.value_biases.clone());
             values.push(layer.attention.output_projection_weights.clone());
+            values.push(layer.attention.output_projection_biases.clone());
             values.push(layer.feed_forward.expansion_weights.clone());
+            values.push(layer.feed_forward.expansion_biases.clone());
             values.push(layer.feed_forward.gate_weights.clone());
+            values.push(layer.feed_forward.gate_biases.clone());
             values.push(layer.feed_forward.projection_weights.clone());
+            values.push(layer.feed_forward.projection_biases.clone());
         }
         values
     }
@@ -197,20 +221,28 @@ impl MlxTransformerModelParameters {
             token_embedding: next(),
             position_embedding: next(),
             language_model_head: next(),
+            language_model_head_biases: next(),
             layers: self
                 .layers
                 .iter()
                 .map(|_| MlxTransformerLayerParameters {
                     attention: MlxAttentionParameters {
                         query_weights: next(),
+                        query_biases: next(),
                         key_weights: next(),
+                        key_biases: next(),
                         value_weights: next(),
+                        value_biases: next(),
                         output_projection_weights: next(),
+                        output_projection_biases: next(),
                     },
                     feed_forward: MlxFeedForwardParameters {
                         expansion_weights: next(),
+                        expansion_biases: next(),
                         gate_weights: next(),
+                        gate_biases: next(),
                         projection_weights: next(),
+                        projection_biases: next(),
                     },
                 })
                 .collect(),
@@ -312,6 +344,7 @@ struct MlxParamView<'a> {
     token_embedding: &'a Array,
     position_embedding: &'a Array,
     language_model_head: &'a Array,
+    language_model_head_biases: &'a Array,
     rotary_position_matrices: &'a [Array],
     layers: Vec<MlxLayerParamView<'a>>,
 }
@@ -325,15 +358,22 @@ struct MlxLayerParamView<'a> {
 
 struct MlxAttentionParamView<'a> {
     query_weights: &'a Array,
+    query_biases: &'a Array,
     key_weights: &'a Array,
+    key_biases: &'a Array,
     value_weights: &'a Array,
+    value_biases: &'a Array,
     output_projection_weights: &'a Array,
+    output_projection_biases: &'a Array,
 }
 
 struct MlxFeedForwardParamView<'a> {
     expansion_weights: &'a Array,
+    expansion_biases: &'a Array,
     gate_weights: &'a Array,
+    gate_biases: &'a Array,
     projection_weights: &'a Array,
+    projection_biases: &'a Array,
 }
 
 pub fn create_mlx_microgpt_training_session(
@@ -698,6 +738,7 @@ pub fn matrix_summaries(model: &MlxTransformerModelParameters) -> Vec<MlxMatrixS
         matrix_summary("Token embedding", &model.token_embedding),
         matrix_summary("Position embedding", &model.position_embedding),
         matrix_summary("Language head", &model.language_model_head),
+        matrix_summary("Language head bias", &model.language_model_head_biases),
     ];
     for (layer_index, layer) in model.layers.iter().enumerate() {
         let prefix = format!("Layer {}", layer_index + 1);
@@ -706,28 +747,56 @@ pub fn matrix_summaries(model: &MlxTransformerModelParameters) -> Vec<MlxMatrixS
             &layer.attention.query_weights,
         ));
         summaries.push(matrix_summary(
+            &format!("{prefix} Q bias"),
+            &layer.attention.query_biases,
+        ));
+        summaries.push(matrix_summary(
             &format!("{prefix} K"),
             &layer.attention.key_weights,
+        ));
+        summaries.push(matrix_summary(
+            &format!("{prefix} K bias"),
+            &layer.attention.key_biases,
         ));
         summaries.push(matrix_summary(
             &format!("{prefix} V"),
             &layer.attention.value_weights,
         ));
         summaries.push(matrix_summary(
+            &format!("{prefix} V bias"),
+            &layer.attention.value_biases,
+        ));
+        summaries.push(matrix_summary(
             &format!("{prefix} Attn out"),
             &layer.attention.output_projection_weights,
+        ));
+        summaries.push(matrix_summary(
+            &format!("{prefix} Attn out bias"),
+            &layer.attention.output_projection_biases,
         ));
         summaries.push(matrix_summary(
             &format!("{prefix} FF expand"),
             &layer.feed_forward.expansion_weights,
         ));
         summaries.push(matrix_summary(
+            &format!("{prefix} FF expand bias"),
+            &layer.feed_forward.expansion_biases,
+        ));
+        summaries.push(matrix_summary(
             &format!("{prefix} FF gate"),
             &layer.feed_forward.gate_weights,
         ));
         summaries.push(matrix_summary(
+            &format!("{prefix} FF gate bias"),
+            &layer.feed_forward.gate_biases,
+        ));
+        summaries.push(matrix_summary(
             &format!("{prefix} FF project"),
             &layer.feed_forward.projection_weights,
+        ));
+        summaries.push(matrix_summary(
+            &format!("{prefix} FF project bias"),
+            &layer.feed_forward.projection_biases,
         ));
     }
     summaries
@@ -741,6 +810,7 @@ pub fn matrix_heatmaps(model: &MlxTransformerModelParameters) -> Vec<MlxMatrixHe
         matrix_heatmap("Token embedding", &model.token_embedding),
         matrix_heatmap("Position embedding", &model.position_embedding),
         matrix_heatmap("Language head", &model.language_model_head),
+        matrix_heatmap("Language head bias", &model.language_model_head_biases),
     ];
     for (layer_index, layer) in model.layers.iter().enumerate() {
         let prefix = format!("Layer {}", layer_index + 1);
@@ -749,28 +819,56 @@ pub fn matrix_heatmaps(model: &MlxTransformerModelParameters) -> Vec<MlxMatrixHe
             &layer.attention.query_weights,
         ));
         heatmaps.push(matrix_heatmap(
+            &format!("{prefix} Q bias"),
+            &layer.attention.query_biases,
+        ));
+        heatmaps.push(matrix_heatmap(
             &format!("{prefix} K"),
             &layer.attention.key_weights,
+        ));
+        heatmaps.push(matrix_heatmap(
+            &format!("{prefix} K bias"),
+            &layer.attention.key_biases,
         ));
         heatmaps.push(matrix_heatmap(
             &format!("{prefix} V"),
             &layer.attention.value_weights,
         ));
         heatmaps.push(matrix_heatmap(
+            &format!("{prefix} V bias"),
+            &layer.attention.value_biases,
+        ));
+        heatmaps.push(matrix_heatmap(
             &format!("{prefix} Attn out"),
             &layer.attention.output_projection_weights,
+        ));
+        heatmaps.push(matrix_heatmap(
+            &format!("{prefix} Attn out bias"),
+            &layer.attention.output_projection_biases,
         ));
         heatmaps.push(matrix_heatmap(
             &format!("{prefix} FF expand"),
             &layer.feed_forward.expansion_weights,
         ));
         heatmaps.push(matrix_heatmap(
+            &format!("{prefix} FF expand bias"),
+            &layer.feed_forward.expansion_biases,
+        ));
+        heatmaps.push(matrix_heatmap(
             &format!("{prefix} FF gate"),
             &layer.feed_forward.gate_weights,
         ));
         heatmaps.push(matrix_heatmap(
+            &format!("{prefix} FF gate bias"),
+            &layer.feed_forward.gate_biases,
+        ));
+        heatmaps.push(matrix_heatmap(
             &format!("{prefix} FF project"),
             &layer.feed_forward.projection_weights,
+        ));
+        heatmaps.push(matrix_heatmap(
+            &format!("{prefix} FF project bias"),
+            &layer.feed_forward.projection_biases,
         ));
     }
     heatmaps
@@ -809,19 +907,27 @@ fn params_from_arrays<'a>(
         token_embedding: next(),
         position_embedding: next(),
         language_model_head: next(),
+        language_model_head_biases: next(),
         rotary_position_matrices,
         layers: (0..layer_count)
             .map(|_| MlxLayerParamView {
                 attention: MlxAttentionParamView {
                     query_weights: next(),
+                    query_biases: next(),
                     key_weights: next(),
+                    key_biases: next(),
                     value_weights: next(),
+                    value_biases: next(),
                     output_projection_weights: next(),
+                    output_projection_biases: next(),
                 },
                 feed_forward: MlxFeedForwardParamView {
                     expansion_weights: next(),
+                    expansion_biases: next(),
                     gate_weights: next(),
+                    gate_biases: next(),
                     projection_weights: next(),
+                    projection_biases: next(),
                 },
             })
             .collect(),
@@ -924,7 +1030,11 @@ fn run_transformer_model(
     }
 
     Ok(TransformerRun {
-        logits: linear(&hidden_state, params.language_model_head)?,
+        logits: linear(
+            &hidden_state,
+            params.language_model_head,
+            params.language_model_head_biases,
+        )?,
         keys: current_keys,
         values: current_values,
     })
@@ -947,14 +1057,26 @@ fn run_transformer_layer(
     // `linear` returns [embedding_size]. The precomputed RoPE matrix keeps the
     // same shape while rotating pairs of values inside each attention head.
     let query = apply_rotary_position_embedding(
-        &linear(&normalized_state, layer.attention.query_weights)?,
+        &linear(
+            &normalized_state,
+            layer.attention.query_weights,
+            layer.attention.query_biases,
+        )?,
         rotary_position_matrix,
     )?;
     let key = apply_rotary_position_embedding(
-        &linear(&normalized_state, layer.attention.key_weights)?,
+        &linear(
+            &normalized_state,
+            layer.attention.key_weights,
+            layer.attention.key_biases,
+        )?,
         rotary_position_matrix,
     )?;
-    let value = linear(&normalized_state, layer.attention.value_weights)?;
+    let value = linear(
+        &normalized_state,
+        layer.attention.value_weights,
+        layer.attention.value_biases,
+    )?;
 
     // Cache entries are per layer. At time step t, `keys[layer_index]` contains
     // t+1 tensors, each shaped [embedding_size].
@@ -963,7 +1085,11 @@ fn run_transformer_layer(
 
     let attention_output =
         run_multi_head_attention(&query, &keys[layer_index], &values[layer_index], config)?;
-    let block_output = linear(&attention_output, layer.attention.output_projection_weights)?;
+    let block_output = linear(
+        &attention_output,
+        layer.attention.output_projection_weights,
+        layer.attention.output_projection_biases,
+    )?;
     let mut updated_hidden_state = block_output + residual_state;
 
     let residual_state = updated_hidden_state.clone();
@@ -973,10 +1099,22 @@ fn run_transformer_layer(
     //   expanded_output:  [3 * embedding_size]
     //   gated_output:     [3 * embedding_size]
     //   block_output:     [embedding_size] after projection
-    let expanded_output = linear(&normalized_state, layer.feed_forward.expansion_weights)?;
-    let gated_output = linear(&normalized_state, layer.feed_forward.gate_weights)?;
+    let expanded_output = linear(
+        &normalized_state,
+        layer.feed_forward.expansion_weights,
+        layer.feed_forward.expansion_biases,
+    )?;
+    let gated_output = linear(
+        &normalized_state,
+        layer.feed_forward.gate_weights,
+        layer.feed_forward.gate_biases,
+    )?;
     let block_output = silu(&expanded_output)? * gated_output;
-    let block_output = linear(&block_output, layer.feed_forward.projection_weights)?;
+    let block_output = linear(
+        &block_output,
+        layer.feed_forward.projection_weights,
+        layer.feed_forward.projection_biases,
+    )?;
     updated_hidden_state = block_output + residual_state;
 
     Ok(TransformerLayerRun {
@@ -1029,10 +1167,11 @@ fn run_multi_head_attention(
     ops::sum_axis(&weighted_values, 1, None)?.reshape(&[config.embedding_size as i32])
 }
 
-fn linear(input_vector: &Array, weights: &Array) -> MlxResult<Array> {
+fn linear(input_vector: &Array, weights: &Array, biases: &Array) -> MlxResult<Array> {
     // MLX matmul is the high-performance version of the CPU backend's row-wise
-    // dot-product loop.
-    weights.matmul(input_vector)
+    // dot-product loop. Adding the bias vector turns pure matrix multiplication
+    // into the affine projection used by ordinary dense neural-network layers.
+    Ok(weights.matmul(input_vector)? + biases)
 }
 
 fn apply_rotary_position_embedding(
@@ -1224,6 +1363,10 @@ fn mlx_matrix(
     Array::from_slice(&data, &[output_size as i32, input_size as i32])
 }
 
+fn mlx_zero_vector(size: usize) -> Array {
+    Array::from_slice(&vec![0.0_f32; size], &[size as i32])
+}
+
 fn weighted_choice(weights: &[f64], random_number_generator: &mut impl Rng) -> usize {
     // Sampling is deliberately kept in Rust, not MLX, because the vocabulary is
     // tiny and the CPU backend uses the same helper. That makes generated output
@@ -1246,13 +1389,14 @@ fn matrix_summary(label: &str, matrix: &Array) -> MlxMatrixSummary {
     matrix.eval().unwrap();
     let shape = matrix.shape();
     let data = matrix.as_slice::<f32>();
+    let (rows, columns) = matrix_rows_and_columns(shape);
     let min = data.iter().copied().fold(f32::INFINITY, f32::min);
     let max = data.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mean_abs = data.iter().map(|value| value.abs()).sum::<f32>() / data.len().max(1) as f32;
     MlxMatrixSummary {
         label: label.into(),
-        rows: shape.first().copied().unwrap_or(0) as usize,
-        columns: shape.get(1).copied().unwrap_or(0) as usize,
+        rows,
+        columns,
         min,
         max,
         mean_abs,
@@ -1266,17 +1410,26 @@ fn matrix_heatmap(label: &str, matrix: &Array) -> MlxMatrixHeatmap {
     matrix.eval().unwrap();
     let shape = matrix.shape();
     let values = matrix.as_slice::<f32>().to_vec();
+    let (rows, columns) = matrix_rows_and_columns(shape);
     let min = values.iter().copied().fold(f32::INFINITY, f32::min);
     let max = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mean_abs = values.iter().map(|value| value.abs()).sum::<f32>() / values.len().max(1) as f32;
     MlxMatrixHeatmap {
         label: label.into(),
-        rows: shape.first().copied().unwrap_or(0) as usize,
-        columns: shape.get(1).copied().unwrap_or(0) as usize,
+        rows,
+        columns,
         values,
         min,
         max,
         mean_abs,
+    }
+}
+
+fn matrix_rows_and_columns(shape: &[i32]) -> (usize, usize) {
+    match shape {
+        [columns] => (1, *columns as usize),
+        [rows, columns, ..] => (*rows as usize, *columns as usize),
+        _ => (0, 0),
     }
 }
 

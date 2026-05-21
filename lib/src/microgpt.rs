@@ -22,9 +22,12 @@ use std::collections::HashMap;
 use std::f64::consts::PI;
 
 // A matrix is stored as rows of scalar autodiff Values. The shape convention in
-// this file is `[output_size][input_size]`, so `linear(input, weights)` computes
-// one dot product per row.
+// this file is `[output_size][input_size]`, so `linear(input, weights, biases)`
+// computes one dot product per row plus that row's learned bias.
 pub type Matrix = Vec<Vec<Value>>;
+// A bias vector has one learned offset per output row of a linear layer. If a
+// weight matrix produces 64 numbers, its bias vector also has 64 numbers.
+pub type Vector = Vec<Value>;
 // During autoregressive generation/training, each layer remembers all previous
 // keys and values. This is the same idea as a KV cache in production LLM
 // inference, just stored in plain Rust vectors.
@@ -41,11 +44,15 @@ pub struct AttentionParameters {
     // Query, key, and value are three learned projections of the same hidden
     // state. Attention compares query to keys, then mixes values.
     pub query_weights: Matrix,
+    pub query_biases: Vector,
     pub key_weights: Matrix,
+    pub key_biases: Vector,
     pub value_weights: Matrix,
+    pub value_biases: Vector,
     // After all heads are concatenated, this projects the result back into the
     // normal embedding size so the residual stream shape stays constant.
     pub output_projection_weights: Matrix,
+    pub output_projection_biases: Vector,
 }
 
 #[derive(Clone, Debug)]
@@ -53,9 +60,12 @@ pub struct FeedForwardParameters {
     // SwiGLU uses two parallel projections. `expansion_weights` creates candidate
     // features; `gate_weights` decides which candidate features should pass.
     pub expansion_weights: Matrix,
+    pub expansion_biases: Vector,
     pub gate_weights: Matrix,
+    pub gate_biases: Vector,
     // Projection returns the wider feed-forward vector to the embedding size.
     pub projection_weights: Matrix,
+    pub projection_biases: Vector,
 }
 
 #[derive(Clone, Debug)]
@@ -74,6 +84,7 @@ pub struct TransformerModelParameters {
     // The language-model head maps the final hidden state to one score per next
     // character. Those scores are logits, not probabilities yet.
     pub language_model_head: Matrix,
+    pub language_model_head_biases: Vector,
     pub layers: Vec<TransformerLayerParameters>,
 }
 
@@ -113,6 +124,7 @@ impl TransformerModelParameters {
                 random_number_generator,
                 projection_std,
             ),
+            language_model_head_biases: zero_vector(vocabulary_size),
             layers: (0..layer_count)
                 .map(|_| TransformerLayerParameters {
                     attention: AttentionParameters {
@@ -122,24 +134,28 @@ impl TransformerModelParameters {
                             random_number_generator,
                             projection_std,
                         ),
+                        query_biases: zero_vector(embedding_size),
                         key_weights: matrix(
                             embedding_size,
                             embedding_size,
                             random_number_generator,
                             projection_std,
                         ),
+                        key_biases: zero_vector(embedding_size),
                         value_weights: matrix(
                             embedding_size,
                             embedding_size,
                             random_number_generator,
                             projection_std,
                         ),
+                        value_biases: zero_vector(embedding_size),
                         output_projection_weights: matrix(
                             embedding_size,
                             embedding_size,
                             random_number_generator,
                             residual_projection_std,
                         ),
+                        output_projection_biases: zero_vector(embedding_size),
                     },
                     feed_forward: FeedForwardParameters {
                         expansion_weights: matrix(
@@ -148,18 +164,21 @@ impl TransformerModelParameters {
                             random_number_generator,
                             projection_std,
                         ),
+                        expansion_biases: zero_vector(feed_forward_size),
                         gate_weights: matrix(
                             feed_forward_size,
                             embedding_size,
                             random_number_generator,
                             projection_std,
                         ),
+                        gate_biases: zero_vector(feed_forward_size),
                         projection_weights: matrix(
                             embedding_size,
                             feed_forward_size,
                             random_number_generator,
                             residual_projection_std,
                         ),
+                        projection_biases: zero_vector(embedding_size),
                     },
                 })
                 .collect(),
@@ -174,14 +193,22 @@ impl TransformerModelParameters {
         push_matrix_values(&mut values, &self.token_embedding);
         push_matrix_values(&mut values, &self.position_embedding);
         push_matrix_values(&mut values, &self.language_model_head);
+        push_vector_values(&mut values, &self.language_model_head_biases);
         for layer in &self.layers {
             push_matrix_values(&mut values, &layer.attention.query_weights);
+            push_vector_values(&mut values, &layer.attention.query_biases);
             push_matrix_values(&mut values, &layer.attention.key_weights);
+            push_vector_values(&mut values, &layer.attention.key_biases);
             push_matrix_values(&mut values, &layer.attention.value_weights);
+            push_vector_values(&mut values, &layer.attention.value_biases);
             push_matrix_values(&mut values, &layer.attention.output_projection_weights);
+            push_vector_values(&mut values, &layer.attention.output_projection_biases);
             push_matrix_values(&mut values, &layer.feed_forward.expansion_weights);
+            push_vector_values(&mut values, &layer.feed_forward.expansion_biases);
             push_matrix_values(&mut values, &layer.feed_forward.gate_weights);
+            push_vector_values(&mut values, &layer.feed_forward.gate_biases);
             push_matrix_values(&mut values, &layer.feed_forward.projection_weights);
+            push_vector_values(&mut values, &layer.feed_forward.projection_biases);
         }
         values
     }
@@ -189,42 +216,120 @@ impl TransformerModelParameters {
     // Rebuild the nested model with replacement parameter Values in the exact
     // same order produced by `values`.
     fn with_values(&self, values: Vec<Value>) -> Self {
-        let mut value_index = 0;
-        let mut next_matrix = |matrix: &Matrix| {
+        fn next_matrix(values: &[Value], value_index: &mut usize, matrix: &Matrix) -> Matrix {
             matrix
                 .iter()
                 .map(|row| {
                     row.iter()
                         .map(|_| {
-                            let value = values[value_index].clone();
-                            value_index += 1;
+                            let value = values[*value_index].clone();
+                            *value_index += 1;
                             value
                         })
                         .collect()
                 })
                 .collect()
-        };
+        }
+
+        fn next_vector(values: &[Value], value_index: &mut usize, vector: &Vector) -> Vector {
+            vector
+                .iter()
+                .map(|_| {
+                    let value = values[*value_index].clone();
+                    *value_index += 1;
+                    value
+                })
+                .collect()
+        }
+
+        let mut value_index = 0;
 
         Self {
-            token_embedding: next_matrix(&self.token_embedding),
-            position_embedding: next_matrix(&self.position_embedding),
-            language_model_head: next_matrix(&self.language_model_head),
+            token_embedding: next_matrix(&values, &mut value_index, &self.token_embedding),
+            position_embedding: next_matrix(&values, &mut value_index, &self.position_embedding),
+            language_model_head: next_matrix(&values, &mut value_index, &self.language_model_head),
+            language_model_head_biases: next_vector(
+                &values,
+                &mut value_index,
+                &self.language_model_head_biases,
+            ),
             layers: self
                 .layers
                 .iter()
                 .map(|layer| TransformerLayerParameters {
                     attention: AttentionParameters {
-                        query_weights: next_matrix(&layer.attention.query_weights),
-                        key_weights: next_matrix(&layer.attention.key_weights),
-                        value_weights: next_matrix(&layer.attention.value_weights),
+                        query_weights: next_matrix(
+                            &values,
+                            &mut value_index,
+                            &layer.attention.query_weights,
+                        ),
+                        query_biases: next_vector(
+                            &values,
+                            &mut value_index,
+                            &layer.attention.query_biases,
+                        ),
+                        key_weights: next_matrix(
+                            &values,
+                            &mut value_index,
+                            &layer.attention.key_weights,
+                        ),
+                        key_biases: next_vector(
+                            &values,
+                            &mut value_index,
+                            &layer.attention.key_biases,
+                        ),
+                        value_weights: next_matrix(
+                            &values,
+                            &mut value_index,
+                            &layer.attention.value_weights,
+                        ),
+                        value_biases: next_vector(
+                            &values,
+                            &mut value_index,
+                            &layer.attention.value_biases,
+                        ),
                         output_projection_weights: next_matrix(
+                            &values,
+                            &mut value_index,
                             &layer.attention.output_projection_weights,
+                        ),
+                        output_projection_biases: next_vector(
+                            &values,
+                            &mut value_index,
+                            &layer.attention.output_projection_biases,
                         ),
                     },
                     feed_forward: FeedForwardParameters {
-                        expansion_weights: next_matrix(&layer.feed_forward.expansion_weights),
-                        gate_weights: next_matrix(&layer.feed_forward.gate_weights),
-                        projection_weights: next_matrix(&layer.feed_forward.projection_weights),
+                        expansion_weights: next_matrix(
+                            &values,
+                            &mut value_index,
+                            &layer.feed_forward.expansion_weights,
+                        ),
+                        expansion_biases: next_vector(
+                            &values,
+                            &mut value_index,
+                            &layer.feed_forward.expansion_biases,
+                        ),
+                        gate_weights: next_matrix(
+                            &values,
+                            &mut value_index,
+                            &layer.feed_forward.gate_weights,
+                        ),
+                        gate_biases: next_vector(
+                            &values,
+                            &mut value_index,
+                            &layer.feed_forward.gate_biases,
+                        ),
+                        projection_weights: next_matrix(
+                            &values,
+                            &mut value_index,
+                            &layer.feed_forward.projection_weights,
+                        ),
+                        projection_biases: next_vector(
+                            &values,
+                            &mut value_index,
+                            &layer.feed_forward.projection_biases,
+                        ),
                     },
                 })
                 .collect(),
@@ -461,6 +566,10 @@ fn push_matrix_values(values: &mut Vec<Value>, matrix: &Matrix) {
     }
 }
 
+fn push_vector_values(values: &mut Vec<Value>, vector: &Vector) {
+    values.extend(vector.iter().cloned());
+}
+
 pub fn random_gaussian(
     random_number_generator: &mut impl Rng,
     mean: f64,
@@ -509,19 +618,27 @@ pub fn matrix(
         .collect()
 }
 
-pub fn linear(input_vector: &[Value], weights: &[Vec<Value>]) -> Vec<Value> {
-    // A linear layer is just many weighted sums. If the input has values
+pub fn zero_vector(size: usize) -> Vector {
+    (0..size).map(|_| Value::new(0.0)).collect()
+}
+
+pub fn linear(input_vector: &[Value], weights: &[Vec<Value>], biases: &[Value]) -> Vec<Value> {
+    // A linear layer is many weighted sums plus one learned offset per output.
+    // If the input has values
     // [x1, x2, x3], one output row computes:
     //
-    // y = w1*x1 + w2*x2 + w3*x3
+    // y = w1*x1 + w2*x2 + w3*x3 + b
     //
-    // No activation happens here; this is pure matrix-vector multiplication.
+    // The bias `b` lets the model learn a default tendency even when the input
+    // feature evidence is near zero. No activation happens here; this is pure
+    // affine projection.
     weights
         .iter()
-        .map(|row| {
+        .zip(biases.iter())
+        .map(|(row, bias)| {
             row.iter()
                 .zip(input_vector.iter())
-                .fold(Value::new(0.0), |output_value, (weight, input)| {
+                .fold(bias.clone(), |output_value, (weight, input)| {
                     output_value.add(&weight.mul(input))
                 })
         })
@@ -639,7 +756,11 @@ pub fn run_transformer_model(
     }
 
     TransformerRun {
-        logits: linear(&hidden_state, &model.language_model_head),
+        logits: linear(
+            &hidden_state,
+            &model.language_model_head,
+            &model.language_model_head_biases,
+        ),
         keys: current_keys,
         values: current_values,
     }
@@ -665,16 +786,28 @@ pub fn run_transformer_layer(
     let normalized_state = rmsnorm(hidden_state);
 
     let query = apply_rotary_position_embedding(
-        &linear(&normalized_state, &layer.attention.query_weights),
+        &linear(
+            &normalized_state,
+            &layer.attention.query_weights,
+            &layer.attention.query_biases,
+        ),
         position_id,
         config,
     );
     let key = apply_rotary_position_embedding(
-        &linear(&normalized_state, &layer.attention.key_weights),
+        &linear(
+            &normalized_state,
+            &layer.attention.key_weights,
+            &layer.attention.key_biases,
+        ),
         position_id,
         config,
     );
-    let value = linear(&normalized_state, &layer.attention.value_weights);
+    let value = linear(
+        &normalized_state,
+        &layer.attention.value_weights,
+        &layer.attention.value_biases,
+    );
 
     // Store this step's key/value so future positions can attend to it.
     keys[layer_index].push(key);
@@ -685,6 +818,7 @@ pub fn run_transformer_layer(
     let block_output = linear(
         &attention_output,
         &layer.attention.output_projection_weights,
+        &layer.attention.output_projection_biases,
     );
     let mut updated_hidden_state: Vec<_> = block_output
         .iter()
@@ -694,8 +828,16 @@ pub fn run_transformer_layer(
 
     let residual_state = updated_hidden_state.clone();
     let normalized_state = rmsnorm(&updated_hidden_state);
-    let expanded_output = linear(&normalized_state, &layer.feed_forward.expansion_weights);
-    let gated_output = linear(&normalized_state, &layer.feed_forward.gate_weights);
+    let expanded_output = linear(
+        &normalized_state,
+        &layer.feed_forward.expansion_weights,
+        &layer.feed_forward.expansion_biases,
+    );
+    let gated_output = linear(
+        &normalized_state,
+        &layer.feed_forward.gate_weights,
+        &layer.feed_forward.gate_biases,
+    );
     // SwiGLU: silu(candidate) * gate. The multiplication lets the model suppress
     // or emphasize features depending on context, which is more expressive than
     // a plain ReLU MLP at similar compute.
@@ -704,7 +846,11 @@ pub fn run_transformer_layer(
         .zip(gated_output.iter())
         .map(|(expanded_value, gate_value)| silu(expanded_value).mul(gate_value))
         .collect::<Vec<_>>();
-    let block_output = linear(&block_output, &layer.feed_forward.projection_weights);
+    let block_output = linear(
+        &block_output,
+        &layer.feed_forward.projection_weights,
+        &layer.feed_forward.projection_biases,
+    );
 
     updated_hidden_state = block_output
         .iter()
@@ -1415,5 +1561,78 @@ pub fn create_microgpt_training_session(
         latest_loss: None,
         latest_validation_loss: None,
         progress_history: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha8Rng;
+
+    #[test]
+    fn linear_adds_learned_bias() {
+        let input = vec![Value::new(2.0), Value::new(3.0)];
+        let weights = vec![vec![Value::new(4.0), Value::new(5.0)]];
+        let biases = vec![Value::new(6.0)];
+        let output = linear(&input, &weights, &biases);
+
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].data(), 29.0);
+    }
+
+    #[test]
+    fn cpu_training_updates_bias_parameters() {
+        let mut rng = ChaCha8Rng::seed_from_u64(7);
+        let config = TransformerConfig::new(1, 8, 12, 2).unwrap();
+        let optimizer = AdamOptimizerConfig {
+            learning_rate: 0.006,
+            first_moment_decay: 0.9,
+            second_moment_decay: 0.999,
+            epsilon: 1e-8,
+            weight_decay: 0.0,
+            warmup_step_count: 0,
+            minimum_learning_rate_ratio: 0.0,
+        };
+        let session = create_microgpt_training_session(
+            vec!["anna".into(), "anne".into(), "emma".into(), "ella".into()],
+            &mut rng,
+            1,
+            4,
+            1,
+            config,
+            optimizer,
+        );
+        assert_eq!(bias_abs_sum(&session.trained_microgpt.model), 0.0);
+
+        let result = train_microgpt_step(session, 2).expect("training should run");
+
+        assert!(bias_abs_sum(&result.session.trained_microgpt.model) > 0.0);
+    }
+
+    fn bias_abs_sum(model: &TransformerModelParameters) -> f64 {
+        let head_biases = model
+            .language_model_head_biases
+            .iter()
+            .map(|value| value.data().abs())
+            .sum::<f64>();
+        head_biases
+            + model
+                .layers
+                .iter()
+                .map(|layer| {
+                    vector_abs_sum(&layer.attention.query_biases)
+                        + vector_abs_sum(&layer.attention.key_biases)
+                        + vector_abs_sum(&layer.attention.value_biases)
+                        + vector_abs_sum(&layer.attention.output_projection_biases)
+                        + vector_abs_sum(&layer.feed_forward.expansion_biases)
+                        + vector_abs_sum(&layer.feed_forward.gate_biases)
+                        + vector_abs_sum(&layer.feed_forward.projection_biases)
+                })
+                .sum::<f64>()
+    }
+
+    fn vector_abs_sum(vector: &Vector) -> f64 {
+        vector.iter().map(|value| value.data().abs()).sum()
     }
 }
