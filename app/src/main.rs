@@ -1969,9 +1969,14 @@ fn build_cpu_model_heatmaps(trained_microgpt: &TrainedMicrogpt) -> Vec<ModelHeat
         matrix_heatmap_data("Position embedding", &model.position_embedding),
         matrix_heatmap_data("Language head", &model.language_model_head),
         vector_heatmap_data("Language head bias", &model.language_model_head_biases),
+        vector_heatmap_data("Final norm gain", &model.final_norm_gain),
     ];
     for (layer_index, layer) in model.layers.iter().enumerate() {
         let prefix = format!("Layer {}", layer_index + 1);
+        heatmaps.push(vector_heatmap_data(
+            &format!("{prefix} attention norm gain"),
+            &layer.attention_norm_gain,
+        ));
         heatmaps.push(matrix_heatmap_data(
             &format!("{prefix} Q"),
             &layer.attention.query_weights,
@@ -2003,6 +2008,10 @@ fn build_cpu_model_heatmaps(trained_microgpt: &TrainedMicrogpt) -> Vec<ModelHeat
         heatmaps.push(vector_heatmap_data(
             &format!("{prefix} Attn out bias"),
             &layer.attention.output_projection_biases,
+        ));
+        heatmaps.push(vector_heatmap_data(
+            &format!("{prefix} feed-forward norm gain"),
+            &layer.feed_forward_norm_gain,
         ));
         heatmaps.push(matrix_heatmap_data(
             &format!("{prefix} FF expand"),

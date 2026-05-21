@@ -23,8 +23,9 @@
 use crate::checkpoint::{CheckpointBackend, CheckpointTensor, MicrogptCheckpoint};
 use crate::microgpt::{
     apply_sampling_constraints, normalize_training_document, random_gaussian,
-    scheduled_learning_rate, shuffled_by, AdamOptimizerConfig, CharacterTokenizer,
-    MicrogptTrainingProgress, TransformerConfig,
+    scheduled_learning_rate, shuffled_by, training_batch_token_windows,
+    upgrade_legacy_checkpoint_tensors_for_norm_gains, AdamOptimizerConfig, CharacterTokenizer,
+    MicrogptTrainingProgress, TrainingTokenWindow, TransformerConfig,
 };
 // `ops` contains tensor operations such as softmax, reductions, stacking, and
 // elementwise math. `transforms` contains autodiff transforms such as
@@ -34,6 +35,7 @@ use mlx_rs::{error::Result as MlxResult, ops, ops::indexing::IndexOp, transforms
 use rand::Rng;
 
 const MAX_GRADIENT_NORM: f32 = 1.0;
+const RESIDUAL_DROPOUT_PROBABILITY: f32 = 0.05;
 
 #[derive(Clone, Debug)]
 pub struct MlxAttentionParameters {
@@ -66,7 +68,9 @@ pub struct MlxFeedForwardParameters {
 
 #[derive(Clone, Debug)]
 pub struct MlxTransformerLayerParameters {
+    pub attention_norm_gain: Array,
     pub attention: MlxAttentionParameters,
+    pub feed_forward_norm_gain: Array,
     pub feed_forward: MlxFeedForwardParameters,
 }
 
@@ -79,6 +83,7 @@ pub struct MlxTransformerModelParameters {
     pub position_embedding: Array,
     pub language_model_head: Array,
     pub language_model_head_biases: Array,
+    pub final_norm_gain: Array,
     pub layers: Vec<MlxTransformerLayerParameters>,
 }
 
@@ -119,8 +124,10 @@ impl MlxTransformerModelParameters {
                 projection_std,
             ),
             language_model_head_biases: mlx_zero_vector(vocabulary_size),
+            final_norm_gain: mlx_one_vector(embedding_size),
             layers: (0..layer_count)
                 .map(|_| MlxTransformerLayerParameters {
+                    attention_norm_gain: mlx_one_vector(embedding_size),
                     attention: MlxAttentionParameters {
                         query_weights: mlx_matrix(
                             embedding_size,
@@ -151,6 +158,7 @@ impl MlxTransformerModelParameters {
                         ),
                         output_projection_biases: mlx_zero_vector(embedding_size),
                     },
+                    feed_forward_norm_gain: mlx_one_vector(embedding_size),
                     feed_forward: MlxFeedForwardParameters {
                         expansion_weights: mlx_matrix(
                             feed_forward_size,
@@ -191,8 +199,10 @@ impl MlxTransformerModelParameters {
             position_embedding: mlx_zero_matrix(context_window_size, embedding_size),
             language_model_head: mlx_zero_matrix(vocabulary_size, embedding_size),
             language_model_head_biases: mlx_zero_vector(vocabulary_size),
+            final_norm_gain: mlx_one_vector(embedding_size),
             layers: (0..layer_count)
                 .map(|_| MlxTransformerLayerParameters {
+                    attention_norm_gain: mlx_one_vector(embedding_size),
                     attention: MlxAttentionParameters {
                         query_weights: mlx_zero_matrix(embedding_size, embedding_size),
                         query_biases: mlx_zero_vector(embedding_size),
@@ -203,6 +213,7 @@ impl MlxTransformerModelParameters {
                         output_projection_weights: mlx_zero_matrix(embedding_size, embedding_size),
                         output_projection_biases: mlx_zero_vector(embedding_size),
                     },
+                    feed_forward_norm_gain: mlx_one_vector(embedding_size),
                     feed_forward: MlxFeedForwardParameters {
                         expansion_weights: mlx_zero_matrix(feed_forward_size, embedding_size),
                         expansion_biases: mlx_zero_vector(feed_forward_size),
@@ -224,8 +235,10 @@ impl MlxTransformerModelParameters {
             self.position_embedding.clone(),
             self.language_model_head.clone(),
             self.language_model_head_biases.clone(),
+            self.final_norm_gain.clone(),
         ];
         for layer in &self.layers {
+            values.push(layer.attention_norm_gain.clone());
             values.push(layer.attention.query_weights.clone());
             values.push(layer.attention.query_biases.clone());
             values.push(layer.attention.key_weights.clone());
@@ -234,6 +247,7 @@ impl MlxTransformerModelParameters {
             values.push(layer.attention.value_biases.clone());
             values.push(layer.attention.output_projection_weights.clone());
             values.push(layer.attention.output_projection_biases.clone());
+            values.push(layer.feed_forward_norm_gain.clone());
             values.push(layer.feed_forward.expansion_weights.clone());
             values.push(layer.feed_forward.expansion_biases.clone());
             values.push(layer.feed_forward.gate_weights.clone());
@@ -260,10 +274,12 @@ impl MlxTransformerModelParameters {
             position_embedding: next(),
             language_model_head: next(),
             language_model_head_biases: next(),
+            final_norm_gain: next(),
             layers: self
                 .layers
                 .iter()
                 .map(|_| MlxTransformerLayerParameters {
+                    attention_norm_gain: next(),
                     attention: MlxAttentionParameters {
                         query_weights: next(),
                         query_biases: next(),
@@ -274,6 +290,7 @@ impl MlxTransformerModelParameters {
                         output_projection_weights: next(),
                         output_projection_biases: next(),
                     },
+                    feed_forward_norm_gain: next(),
                     feed_forward: MlxFeedForwardParameters {
                         expansion_weights: next(),
                         expansion_biases: next(),
@@ -406,11 +423,29 @@ pub fn import_training_session_checkpoint(
         checkpoint.config.layer_count,
     );
     let expected_tensors = model_template.checkpoint_tensor_shapes();
-    let parameter_arrays = checkpoint_tensors_to_arrays(&checkpoint.parameters, &expected_tensors)?;
+    let parameter_tensors = upgrade_legacy_checkpoint_tensors_for_norm_gains(
+        &checkpoint.parameters,
+        &expected_tensors,
+        checkpoint.config.layer_count,
+        1.0,
+    )?;
+    let first_moment_tensors = upgrade_legacy_checkpoint_tensors_for_norm_gains(
+        &checkpoint.first_moment_estimates,
+        &expected_tensors,
+        checkpoint.config.layer_count,
+        0.0,
+    )?;
+    let second_moment_tensors = upgrade_legacy_checkpoint_tensors_for_norm_gains(
+        &checkpoint.second_moment_estimates,
+        &expected_tensors,
+        checkpoint.config.layer_count,
+        0.0,
+    )?;
+    let parameter_arrays = checkpoint_tensors_to_arrays(&parameter_tensors, &expected_tensors)?;
     let first_moment_estimates =
-        checkpoint_tensors_to_arrays(&checkpoint.first_moment_estimates, &expected_tensors)?;
+        checkpoint_tensors_to_arrays(&first_moment_tensors, &expected_tensors)?;
     let second_moment_estimates =
-        checkpoint_tensors_to_arrays(&checkpoint.second_moment_estimates, &expected_tensors)?;
+        checkpoint_tensors_to_arrays(&second_moment_tensors, &expected_tensors)?;
     let model = model_template.with_values(&parameter_arrays);
 
     Ok(MlxMicrogptTrainingSession {
@@ -468,9 +503,8 @@ struct MlxParamView<'a> {
     // treat the flat `inputs: &[Array]` from `value_and_grad` as a named model
     // without cloning every tensor.
     token_embedding: &'a Array,
-    position_embedding: &'a Array,
-    language_model_head: &'a Array,
     language_model_head_biases: &'a Array,
+    final_norm_gain: &'a Array,
     rotary_position_matrices: &'a [Array],
     layers: Vec<MlxLayerParamView<'a>>,
 }
@@ -478,7 +512,9 @@ struct MlxParamView<'a> {
 struct MlxLayerParamView<'a> {
     // These borrowed views are not long-lived model objects. They only give
     // names to entries in MLX's flat input slice while the loss closure runs.
+    attention_norm_gain: &'a Array,
     attention: MlxAttentionParamView<'a>,
+    feed_forward_norm_gain: &'a Array,
     feed_forward: MlxFeedForwardParamView<'a>,
 }
 
@@ -500,6 +536,11 @@ struct MlxFeedForwardParamView<'a> {
     gate_biases: &'a Array,
     projection_weights: &'a Array,
     projection_biases: &'a Array,
+}
+
+struct BatchDropoutMasks {
+    attention_residual_masks: Vec<Array>,
+    feed_forward_residual_masks: Vec<Array>,
 }
 
 pub fn create_mlx_microgpt_training_session(
@@ -598,14 +639,13 @@ pub fn train_mlx_microgpt_step(
     );
 
     let step = session.completed_step_count;
-    let batch_documents = training_batch_documents(&session.documents, step, batch_document_count);
-    // Tokens remain normal Rust `usize` values. We only convert model parameters
-    // and activations into MLX tensors; the training text itself is small and
-    // easier to keep in ordinary Rust collections.
-    let batch_tokens = batch_documents
-        .iter()
-        .map(|document| session.trained_microgpt.tokenizer.encode_document(document))
-        .collect::<Vec<_>>();
+    let batch_windows = training_batch_token_windows(
+        &session.documents,
+        &session.trained_microgpt.tokenizer,
+        step,
+        batch_document_count,
+        session.trained_microgpt.config.context_window_size,
+    );
     let mut parameters = session.trained_microgpt.model.values();
     // `argnums` says "differentiate with respect to every parameter array in
     // this input slice." The returned gradient list has the same order.
@@ -616,21 +656,21 @@ pub fn train_mlx_microgpt_step(
     // borrowed view without needing to capture the whole model inside the MLX
     // autodiff closure.
     let layer_count = session.trained_microgpt.model.layers.len();
+    let dropout_masks = batch_dropout_masks(
+        step,
+        batch_document_count,
+        session.trained_microgpt.config.context_window_size,
+        session.trained_microgpt.config.embedding_size,
+        layer_count,
+        RESIDUAL_DROPOUT_PROBABILITY,
+    );
 
     let loss_fn = move |inputs: &[Array]| -> MlxResult<Vec<Array>> {
         // MLX closures receive a flat parameter list. Convert it back into a
         // named view, compute scalar batch loss, and return it as a one-element
         // vector because the transform API is vector-valued.
         let params = params_from_arrays(inputs, layer_count, &rotary_position_matrices);
-        let loss = batch_loss(
-            &params,
-            &config,
-            &batch_tokens,
-            session
-                .trained_microgpt
-                .tokenizer
-                .sequence_boundary_token_id,
-        )?;
+        let loss = batch_loss(&params, &config, &batch_windows, Some(&dropout_masks))?;
         Ok(vec![loss])
     };
 
@@ -762,17 +802,24 @@ pub fn calculate_document_loss(
     // Validation and display code do not need gradients, but they use the same
     // forward loss function so the reported number means the same thing as the
     // training objective.
-    let tokens = tokenizer.encode_document(document);
+    let token_window = training_batch_token_windows(
+        &[document.to_string()],
+        tokenizer,
+        0,
+        1,
+        config.context_window_size,
+    )
+    .into_iter()
+    .next()
+    .unwrap_or_else(|| TrainingTokenWindow {
+        input_tokens: vec![tokenizer.sequence_boundary_token_id; config.context_window_size],
+        target_tokens: vec![tokenizer.sequence_boundary_token_id; config.context_window_size],
+        loss_mask: vec![0.0; config.context_window_size],
+    });
     let model_values = model.values();
     let rotary_position_matrices = rotary_position_matrices(config);
     let params = params_from_arrays(&model_values, model.layers.len(), &rotary_position_matrices);
-    Ok(document_loss(
-        &params,
-        config,
-        &tokens,
-        tokenizer.sequence_boundary_token_id,
-    )?
-    .item::<f32>() as f64)
+    Ok(batch_loss(&params, config, &[token_window], None)?.item::<f32>() as f64)
 }
 
 pub fn generate_samples(
@@ -865,9 +912,14 @@ pub fn matrix_summaries(model: &MlxTransformerModelParameters) -> Vec<MlxMatrixS
         matrix_summary("Position embedding", &model.position_embedding),
         matrix_summary("Language head", &model.language_model_head),
         matrix_summary("Language head bias", &model.language_model_head_biases),
+        matrix_summary("Final norm gain", &model.final_norm_gain),
     ];
     for (layer_index, layer) in model.layers.iter().enumerate() {
         let prefix = format!("Layer {}", layer_index + 1);
+        summaries.push(matrix_summary(
+            &format!("{prefix} attention norm gain"),
+            &layer.attention_norm_gain,
+        ));
         summaries.push(matrix_summary(
             &format!("{prefix} Q"),
             &layer.attention.query_weights,
@@ -899,6 +951,10 @@ pub fn matrix_summaries(model: &MlxTransformerModelParameters) -> Vec<MlxMatrixS
         summaries.push(matrix_summary(
             &format!("{prefix} Attn out bias"),
             &layer.attention.output_projection_biases,
+        ));
+        summaries.push(matrix_summary(
+            &format!("{prefix} feed-forward norm gain"),
+            &layer.feed_forward_norm_gain,
         ));
         summaries.push(matrix_summary(
             &format!("{prefix} FF expand"),
@@ -937,9 +993,14 @@ pub fn matrix_heatmaps(model: &MlxTransformerModelParameters) -> Vec<MlxMatrixHe
         matrix_heatmap("Position embedding", &model.position_embedding),
         matrix_heatmap("Language head", &model.language_model_head),
         matrix_heatmap("Language head bias", &model.language_model_head_biases),
+        matrix_heatmap("Final norm gain", &model.final_norm_gain),
     ];
     for (layer_index, layer) in model.layers.iter().enumerate() {
         let prefix = format!("Layer {}", layer_index + 1);
+        heatmaps.push(matrix_heatmap(
+            &format!("{prefix} attention norm gain"),
+            &layer.attention_norm_gain,
+        ));
         heatmaps.push(matrix_heatmap(
             &format!("{prefix} Q"),
             &layer.attention.query_weights,
@@ -971,6 +1032,10 @@ pub fn matrix_heatmaps(model: &MlxTransformerModelParameters) -> Vec<MlxMatrixHe
         heatmaps.push(matrix_heatmap(
             &format!("{prefix} Attn out bias"),
             &layer.attention.output_projection_biases,
+        ));
+        heatmaps.push(matrix_heatmap(
+            &format!("{prefix} feed-forward norm gain"),
+            &layer.feed_forward_norm_gain,
         ));
         heatmaps.push(matrix_heatmap(
             &format!("{prefix} FF expand"),
@@ -1029,14 +1094,20 @@ fn params_from_arrays<'a>(
         value
     };
 
+    let token_embedding = next();
+    let _position_embedding = next();
+    let _language_model_head = next();
+    let language_model_head_biases = next();
+    let final_norm_gain = next();
+
     MlxParamView {
-        token_embedding: next(),
-        position_embedding: next(),
-        language_model_head: next(),
-        language_model_head_biases: next(),
+        token_embedding,
+        language_model_head_biases,
+        final_norm_gain,
         rotary_position_matrices,
         layers: (0..layer_count)
             .map(|_| MlxLayerParamView {
+                attention_norm_gain: next(),
                 attention: MlxAttentionParamView {
                     query_weights: next(),
                     query_biases: next(),
@@ -1047,6 +1118,7 @@ fn params_from_arrays<'a>(
                     output_projection_weights: next(),
                     output_projection_biases: next(),
                 },
+                feed_forward_norm_gain: next(),
                 feed_forward: MlxFeedForwardParamView {
                     expansion_weights: next(),
                     expansion_biases: next(),
@@ -1063,55 +1135,334 @@ fn params_from_arrays<'a>(
 fn batch_loss(
     params: &MlxParamView<'_>,
     config: &TransformerConfig,
-    batch_tokens: &[Vec<usize>],
-    sequence_boundary_token_id: usize,
+    batch_windows: &[TrainingTokenWindow],
+    dropout_masks: Option<&BatchDropoutMasks>,
 ) -> MlxResult<Array> {
-    // Stack one scalar loss per document, then average. The result is a scalar
-    // tensor so MLX can differentiate it with respect to parameter tensors.
-    let mut losses = Vec::with_capacity(batch_tokens.len());
-    for tokens in batch_tokens {
-        // Each document loss is scalar-shaped. `stack_axis(&losses, 0)` turns
-        // N scalar losses into a length-N tensor, then `mean` makes one scalar
-        // batch loss for autodiff.
-        losses.push(document_loss(
-            params,
-            config,
-            tokens,
-            sequence_boundary_token_id,
-        )?);
-    }
-    ops::mean(&ops::stack_axis(&losses, 0)?, None)
+    // Full-sequence training: instead of looping Rust-side over every character
+    // and growing a KV cache, build [batch, sequence] token tensors, run all
+    // positions through every layer, and compute cross-entropy for the entire
+    // mini-batch in one MLX graph. This is the path that lets Apple Silicon do
+    // large matrix work instead of thousands of tiny scalar-shaped operations.
+    let batch_size = batch_windows.len();
+    let sequence_len = config.context_window_size;
+    let flat_input_tokens = batch_windows
+        .iter()
+        .flat_map(|window| window.input_tokens.iter().map(|token| *token as i32))
+        .collect::<Vec<_>>();
+    let flat_target_tokens = batch_windows
+        .iter()
+        .flat_map(|window| window.target_tokens.iter().map(|token| *token as i32))
+        .collect::<Vec<_>>();
+    let flat_loss_mask = batch_windows
+        .iter()
+        .flat_map(|window| window.loss_mask.iter().map(|mask| *mask as f32))
+        .collect::<Vec<_>>();
+
+    let input_tokens = Array::from_slice(
+        &flat_input_tokens,
+        &[batch_size as i32, sequence_len as i32],
+    );
+    let target_tokens = Array::from_slice(
+        &flat_target_tokens,
+        &[(batch_size * sequence_len) as i32, 1],
+    );
+    let loss_mask = Array::from_slice(&flat_loss_mask, &[(batch_size * sequence_len) as i32]);
+
+    let logits = run_transformer_batch(params, config, &input_tokens, dropout_masks)?;
+    let vocabulary_size = params.token_embedding.shape()[0];
+    let flat_logits = logits.reshape(&[(batch_size * sequence_len) as i32, vocabulary_size])?;
+    let log_normalizer = ops::logsumexp_axis(&flat_logits, 1, true)?;
+    let target_logits = flat_logits
+        .take_along_axis(&target_tokens, 1)?
+        .reshape(&[-1])?;
+    let token_losses = (log_normalizer.reshape(&[-1])? - target_logits) * &loss_mask;
+    ops::sum(&token_losses, None)
+        .and_then(|loss_sum| Ok(loss_sum / (ops::sum(&loss_mask, None)? + Array::from_f32(1e-6))))
 }
 
-fn document_loss(
+fn run_transformer_batch(
     params: &MlxParamView<'_>,
     config: &TransformerConfig,
-    tokens: &[usize],
-    _sequence_boundary_token_id: usize,
+    input_tokens: &Array,
+    dropout_masks: Option<&BatchDropoutMasks>,
 ) -> MlxResult<Array> {
-    // Same teacher-forcing objective as the CPU backend. `logsumexp` implements
-    // stable cross-entropy: log(sum(exp(logits))) - target_logit.
-    let prediction_step_count = config
-        .context_window_size
-        .min(tokens.len().saturating_sub(1));
-    let mut keys = create_key_value_cache(config.layer_count);
-    let mut values = create_key_value_cache(config.layer_count);
-    let mut losses = Vec::with_capacity(prediction_step_count);
+    let mut hidden_state = params.token_embedding.take_axis(input_tokens, 0)?;
 
-    for position_id in 0..prediction_step_count {
-        let token_id = tokens[position_id];
-        let target_token_id = tokens[position_id + 1];
-        let run = run_transformer_model(params, config, token_id, position_id, keys, values)?;
-        keys = run.keys;
-        values = run.values;
-        // `ops::logsumexp(&run.logits, None)` reduces all vocabulary logits to
-        // one scalar. `None` means "all axes"; logits are 1-D here. Indexing the
-        // target log-prob gives the loss for the correct next character.
-        let log_probabilities = &run.logits - ops::logsumexp(&run.logits, None)?;
-        losses.push(-log_probabilities.index(target_token_id as i32));
+    for (layer_index, layer) in params.layers.iter().enumerate() {
+        hidden_state = run_transformer_layer_batch(
+            &hidden_state,
+            layer,
+            layer_index,
+            params.rotary_position_matrices,
+            config,
+            dropout_masks,
+        )?;
     }
 
-    ops::mean(&ops::stack_axis(&losses, 0)?, None)
+    hidden_state = rmsnorm_last_axis(&hidden_state, params.final_norm_gain)?;
+    tied_language_model_logits_batch(
+        &hidden_state,
+        params.token_embedding,
+        params.language_model_head_biases,
+    )
+}
+
+fn run_transformer_layer_batch(
+    hidden_state: &Array,
+    layer: &MlxLayerParamView<'_>,
+    layer_index: usize,
+    rotary_position_matrices: &[Array],
+    config: &TransformerConfig,
+    dropout_masks: Option<&BatchDropoutMasks>,
+) -> MlxResult<Array> {
+    let residual_state = hidden_state.clone();
+    let normalized_state = rmsnorm_last_axis(hidden_state, layer.attention_norm_gain)?;
+
+    let query = apply_rotary_position_embedding_batch(
+        &linear_last_axis(
+            &normalized_state,
+            layer.attention.query_weights,
+            layer.attention.query_biases,
+        )?,
+        rotary_position_matrices,
+        config,
+    )?;
+    let key = apply_rotary_position_embedding_batch(
+        &linear_last_axis(
+            &normalized_state,
+            layer.attention.key_weights,
+            layer.attention.key_biases,
+        )?,
+        rotary_position_matrices,
+        config,
+    )?;
+    let value = linear_last_axis(
+        &normalized_state,
+        layer.attention.value_weights,
+        layer.attention.value_biases,
+    )?;
+
+    let attention_output = run_multi_head_attention_batch(&query, &key, &value, config)?;
+    let mut block_output = linear_last_axis(
+        &attention_output,
+        layer.attention.output_projection_weights,
+        layer.attention.output_projection_biases,
+    )?;
+    if let Some(dropout_masks) = dropout_masks {
+        block_output *= &dropout_masks.attention_residual_masks[layer_index];
+    }
+    let updated_hidden_state = block_output + residual_state;
+
+    let residual_state = updated_hidden_state.clone();
+    let normalized_state = rmsnorm_last_axis(&updated_hidden_state, layer.feed_forward_norm_gain)?;
+    let expanded_output = linear_last_axis(
+        &normalized_state,
+        layer.feed_forward.expansion_weights,
+        layer.feed_forward.expansion_biases,
+    )?;
+    let gated_output = linear_last_axis(
+        &normalized_state,
+        layer.feed_forward.gate_weights,
+        layer.feed_forward.gate_biases,
+    )?;
+    let block_output = silu(&expanded_output)? * gated_output;
+    let mut block_output = linear_last_axis(
+        &block_output,
+        layer.feed_forward.projection_weights,
+        layer.feed_forward.projection_biases,
+    )?;
+    if let Some(dropout_masks) = dropout_masks {
+        block_output *= &dropout_masks.feed_forward_residual_masks[layer_index];
+    }
+    Ok(block_output + residual_state)
+}
+
+fn run_multi_head_attention_batch(
+    query: &Array,
+    key: &Array,
+    value: &Array,
+    config: &TransformerConfig,
+) -> MlxResult<Array> {
+    let shape = query.shape();
+    let batch_size = shape[0];
+    let sequence_len = shape[1];
+    let head_count = config.attention_head_count as i32;
+    let head_size = config.attention_head_size as i32;
+
+    let query = query
+        .reshape(&[batch_size, sequence_len, head_count, head_size])?
+        .transpose_axes(&[0, 2, 1, 3])?;
+    let key = key
+        .reshape(&[batch_size, sequence_len, head_count, head_size])?
+        .transpose_axes(&[0, 2, 1, 3])?;
+    let value = value
+        .reshape(&[batch_size, sequence_len, head_count, head_size])?
+        .transpose_axes(&[0, 2, 1, 3])?;
+
+    let key_transposed = key.transpose_axes(&[0, 1, 3, 2])?;
+    let mut attention_scores = query.matmul(&key_transposed)?
+        / Array::from_f32((config.attention_head_size as f32).sqrt());
+    attention_scores += causal_attention_mask(sequence_len as usize);
+    let attention_weights = ops::softmax_axis(&attention_scores, -1, None)?;
+    attention_weights
+        .matmul(&value)?
+        .transpose_axes(&[0, 2, 1, 3])?
+        .reshape(&[batch_size, sequence_len, config.embedding_size as i32])
+}
+
+fn causal_attention_mask(sequence_len: usize) -> Array {
+    let values = (0..sequence_len)
+        .flat_map(|query_position| {
+            (0..sequence_len).map(move |key_position| {
+                if key_position > query_position {
+                    -1.0e9_f32
+                } else {
+                    0.0
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    Array::from_slice(&values, &[1, 1, sequence_len as i32, sequence_len as i32])
+}
+
+fn apply_rotary_position_embedding_batch(
+    vectors: &Array,
+    rotary_position_matrices: &[Array],
+    config: &TransformerConfig,
+) -> MlxResult<Array> {
+    let shape = vectors.shape();
+    let batch_size = shape[0];
+    let sequence_len = shape[1];
+    let rotary_stack = ops::stack_axis(rotary_position_matrices, 0)?
+        .transpose_axes(&[0, 2, 1])?
+        .reshape(&[
+            1,
+            sequence_len,
+            config.embedding_size as i32,
+            config.embedding_size as i32,
+        ])?;
+    vectors
+        .reshape(&[batch_size, sequence_len, 1, config.embedding_size as i32])?
+        .matmul(&rotary_stack)?
+        .reshape(&[batch_size, sequence_len, config.embedding_size as i32])
+}
+
+fn linear_last_axis(input: &Array, weights: &Array, biases: &Array) -> MlxResult<Array> {
+    Ok(input.matmul(&weights.transpose()?)? + biases)
+}
+
+fn tied_language_model_logits_batch(
+    hidden_state: &Array,
+    token_embedding: &Array,
+    biases: &Array,
+) -> MlxResult<Array> {
+    Ok(hidden_state.matmul(&token_embedding.transpose()?)? + biases)
+}
+
+fn rmsnorm_last_axis(input: &Array, gain: &Array) -> MlxResult<Array> {
+    let mean_square = ops::mean_axis(&ops::square(input)?, -1, true)?;
+    let scale = (mean_square + Array::from_f32(1e-5)).sqrt()?;
+    Ok((input / scale) * gain)
+}
+
+fn batch_dropout_masks(
+    step: usize,
+    batch_size: usize,
+    sequence_len: usize,
+    embedding_size: usize,
+    layer_count: usize,
+    dropout_probability: f32,
+) -> BatchDropoutMasks {
+    let attention_residual_masks = (0..layer_count)
+        .map(|layer_index| {
+            dropout_mask_array(
+                step,
+                layer_index,
+                0,
+                batch_size,
+                sequence_len,
+                embedding_size,
+                dropout_probability,
+            )
+        })
+        .collect();
+    let feed_forward_residual_masks = (0..layer_count)
+        .map(|layer_index| {
+            dropout_mask_array(
+                step,
+                layer_index,
+                1,
+                batch_size,
+                sequence_len,
+                embedding_size,
+                dropout_probability,
+            )
+        })
+        .collect();
+    BatchDropoutMasks {
+        attention_residual_masks,
+        feed_forward_residual_masks,
+    }
+}
+
+fn dropout_mask_array(
+    step: usize,
+    layer_index: usize,
+    stream: usize,
+    batch_size: usize,
+    sequence_len: usize,
+    embedding_size: usize,
+    dropout_probability: f32,
+) -> Array {
+    if dropout_probability <= 0.0 {
+        return Array::from_slice(
+            &vec![1.0_f32; batch_size * sequence_len * embedding_size],
+            &[
+                batch_size as i32,
+                sequence_len as i32,
+                embedding_size as i32,
+            ],
+        );
+    }
+    let keep_probability = 1.0 - dropout_probability;
+    let scale = 1.0 / keep_probability;
+    let values = (0..batch_size * sequence_len * embedding_size)
+        .map(|index| {
+            let random = deterministic_unit_float(step, layer_index, stream, index);
+            if random < keep_probability {
+                scale
+            } else {
+                0.0
+            }
+        })
+        .collect::<Vec<_>>();
+    Array::from_slice(
+        &values,
+        &[
+            batch_size as i32,
+            sequence_len as i32,
+            embedding_size as i32,
+        ],
+    )
+}
+
+fn deterministic_unit_float(step: usize, layer_index: usize, stream: usize, index: usize) -> f32 {
+    let mixed = splitmix64(
+        (step as u64)
+            .wrapping_mul(0xa076_1d64_78bd_642f)
+            .wrapping_add((layer_index as u64).wrapping_mul(0xe703_7ed1_a0b4_28db))
+            .wrapping_add((stream as u64).wrapping_mul(0x8ebc_6af0_9c88_c6e3))
+            .wrapping_add(index as u64),
+    );
+    ((mixed >> 40) as f32) / ((1_u64 << 24) as f32)
+}
+
+fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    let mut mixed = value;
+    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    mixed ^ (mixed >> 31)
 }
 
 fn run_transformer_model(
@@ -1130,10 +1481,7 @@ fn run_transformer_model(
     //   token_embedding row:      [embedding_size]
     //   position_embedding table: [context_window_size, embedding_size]
     //   hidden_state:             [embedding_size]
-    let token_embedding = params.token_embedding.index(token_id as i32);
-    let position_embedding = params.position_embedding.index(position_id as i32);
-    let mut hidden_state = token_embedding + position_embedding;
-    hidden_state = rmsnorm(&hidden_state)?;
+    let mut hidden_state = params.token_embedding.index(token_id as i32);
     let mut current_keys = keys;
     let mut current_values = values;
 
@@ -1154,11 +1502,12 @@ fn run_transformer_model(
         current_keys = layer_run.keys;
         current_values = layer_run.values;
     }
+    hidden_state = rmsnorm(&hidden_state, params.final_norm_gain)?;
 
     Ok(TransformerRun {
-        logits: linear(
+        logits: tied_language_model_logits(
             &hidden_state,
-            params.language_model_head,
+            params.token_embedding,
             params.language_model_head_biases,
         )?,
         keys: current_keys,
@@ -1178,7 +1527,7 @@ fn run_transformer_layer(
     // Same pre-norm residual block as the CPU implementation, now expressed as
     // tensor operations. The residual stream is an Array of shape [embedding].
     let residual_state = hidden_state.clone();
-    let normalized_state = rmsnorm(hidden_state)?;
+    let normalized_state = rmsnorm(hidden_state, layer.attention_norm_gain)?;
 
     // `linear` returns [embedding_size]. The precomputed RoPE matrix keeps the
     // same shape while rotating pairs of values inside each attention head.
@@ -1219,7 +1568,7 @@ fn run_transformer_layer(
     let mut updated_hidden_state = block_output + residual_state;
 
     let residual_state = updated_hidden_state.clone();
-    let normalized_state = rmsnorm(&updated_hidden_state)?;
+    let normalized_state = rmsnorm(&updated_hidden_state, layer.feed_forward_norm_gain)?;
     // Feed-forward tensor shapes:
     //   normalized_state: [embedding_size]
     //   expanded_output:  [3 * embedding_size]
@@ -1300,6 +1649,14 @@ fn linear(input_vector: &Array, weights: &Array, biases: &Array) -> MlxResult<Ar
     Ok(weights.matmul(input_vector)? + biases)
 }
 
+fn tied_language_model_logits(
+    hidden_state: &Array,
+    token_embedding: &Array,
+    biases: &Array,
+) -> MlxResult<Array> {
+    Ok(token_embedding.matmul(hidden_state)? + biases)
+}
+
 fn apply_rotary_position_embedding(
     vector: &Array,
     rotary_position_matrix: &Array,
@@ -1358,11 +1715,11 @@ fn rotary_position_matrix(position_id: usize, config: &TransformerConfig) -> Arr
     )
 }
 
-fn rmsnorm(input_vector: &Array) -> MlxResult<Array> {
+fn rmsnorm(input_vector: &Array, gain: &Array) -> MlxResult<Array> {
     // Tensor RMSNorm. `None` means reduce over every element in this 1-D vector.
     let mean_square = ops::mean(&ops::square(input_vector)?, None)?;
     let scale = (mean_square + Array::from_f32(1e-5)).sqrt()?;
-    Ok(input_vector / scale)
+    Ok((input_vector / scale) * gain)
 }
 
 fn silu(input: &Array) -> MlxResult<Array> {
@@ -1464,17 +1821,6 @@ fn create_key_value_cache(layer_count: usize) -> Vec<Vec<Array>> {
     vec![Vec::new(); layer_count]
 }
 
-fn training_batch_documents(
-    documents: &[String],
-    step: usize,
-    batch_document_count: usize,
-) -> Vec<String> {
-    let batch_start_index = (step * batch_document_count) % documents.len();
-    (0..batch_document_count)
-        .map(|batch_offset| documents[(batch_start_index + batch_offset) % documents.len()].clone())
-        .collect()
-}
-
 fn mlx_matrix(
     output_size: usize,
     input_size: usize,
@@ -1498,6 +1844,10 @@ fn mlx_zero_matrix(output_size: usize, input_size: usize) -> Array {
 
 fn mlx_zero_vector(size: usize) -> Array {
     Array::from_slice(&vec![0.0_f32; size], &[size as i32])
+}
+
+fn mlx_one_vector(size: usize) -> Array {
+    Array::from_slice(&vec![1.0_f32; size], &[size as i32])
 }
 
 fn arrays_to_checkpoint_tensors(arrays: &[Array]) -> Result<Vec<CheckpointTensor>, String> {

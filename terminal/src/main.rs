@@ -974,9 +974,14 @@ fn build_cpu_matrix_summaries(trained_microgpt: &TrainedMicrogpt) -> Vec<MatrixS
         matrix_summary("Position embedding", &model.position_embedding),
         matrix_summary("Language head", &model.language_model_head),
         vector_summary("Language head bias", &model.language_model_head_biases),
+        vector_summary("Final norm gain", &model.final_norm_gain),
     ];
     for (layer_index, layer) in model.layers.iter().enumerate() {
         let prefix = format!("Layer {}", layer_index + 1);
+        summaries.push(vector_summary(
+            &format!("{prefix} attention norm gain"),
+            &layer.attention_norm_gain,
+        ));
         summaries.push(matrix_summary(
             &format!("{prefix} Q"),
             &layer.attention.query_weights,
@@ -1008,6 +1013,10 @@ fn build_cpu_matrix_summaries(trained_microgpt: &TrainedMicrogpt) -> Vec<MatrixS
         summaries.push(vector_summary(
             &format!("{prefix} Attn out bias"),
             &layer.attention.output_projection_biases,
+        ));
+        summaries.push(vector_summary(
+            &format!("{prefix} feed-forward norm gain"),
+            &layer.feed_forward_norm_gain,
         ));
         summaries.push(matrix_summary(
             &format!("{prefix} FF expand"),

@@ -72,7 +72,13 @@ pub struct FeedForwardParameters {
 
 #[derive(Clone, Debug)]
 pub struct TransformerLayerParameters {
+    // Learned RMSNorm scale before attention. RMSNorm fixes the vector length;
+    // this gain vector lets the model learn which channels should be louder or
+    // quieter after normalization.
+    pub attention_norm_gain: Vector,
     pub attention: AttentionParameters,
+    // Learned RMSNorm scale before the feed-forward block.
+    pub feed_forward_norm_gain: Vector,
     pub feed_forward: FeedForwardParameters,
 }
 
@@ -80,13 +86,17 @@ pub struct TransformerLayerParameters {
 pub struct TransformerModelParameters {
     // Token embeddings answer: "what character is this?"
     pub token_embedding: Matrix,
-    // Learned absolute position embeddings answer: "where are we in the
-    // sequence?" RoPE below also injects position into attention comparisons.
+    // Kept for checkpoint/UI compatibility, but the active model is now RoPE
+    // only. Character models get cleaner extrapolation from relative rotary
+    // positions than from also learning a tiny absolute position table.
     pub position_embedding: Matrix,
-    // The language-model head maps the final hidden state to one score per next
-    // character. Those scores are logits, not probabilities yet.
+    // Kept for checkpoint/UI compatibility. The active logits are tied to
+    // `token_embedding`, a common LM trick that improves sample efficiency for
+    // small vocabularies by sharing input and output character representations.
     pub language_model_head: Matrix,
     pub language_model_head_biases: Vector,
+    // Final learned RMSNorm scale before tied output logits.
+    pub final_norm_gain: Vector,
     pub layers: Vec<TransformerLayerParameters>,
 }
 
@@ -127,8 +137,10 @@ impl TransformerModelParameters {
                 projection_std,
             ),
             language_model_head_biases: zero_vector(vocabulary_size),
+            final_norm_gain: one_vector(embedding_size),
             layers: (0..layer_count)
                 .map(|_| TransformerLayerParameters {
+                    attention_norm_gain: one_vector(embedding_size),
                     attention: AttentionParameters {
                         query_weights: matrix(
                             embedding_size,
@@ -159,6 +171,7 @@ impl TransformerModelParameters {
                         ),
                         output_projection_biases: zero_vector(embedding_size),
                     },
+                    feed_forward_norm_gain: one_vector(embedding_size),
                     feed_forward: FeedForwardParameters {
                         expansion_weights: matrix(
                             feed_forward_size,
@@ -199,8 +212,10 @@ impl TransformerModelParameters {
             position_embedding: zero_matrix(context_window_size, embedding_size),
             language_model_head: zero_matrix(vocabulary_size, embedding_size),
             language_model_head_biases: zero_vector(vocabulary_size),
+            final_norm_gain: one_vector(embedding_size),
             layers: (0..layer_count)
                 .map(|_| TransformerLayerParameters {
+                    attention_norm_gain: one_vector(embedding_size),
                     attention: AttentionParameters {
                         query_weights: zero_matrix(embedding_size, embedding_size),
                         query_biases: zero_vector(embedding_size),
@@ -211,6 +226,7 @@ impl TransformerModelParameters {
                         output_projection_weights: zero_matrix(embedding_size, embedding_size),
                         output_projection_biases: zero_vector(embedding_size),
                     },
+                    feed_forward_norm_gain: one_vector(embedding_size),
                     feed_forward: FeedForwardParameters {
                         expansion_weights: zero_matrix(feed_forward_size, embedding_size),
                         expansion_biases: zero_vector(feed_forward_size),
@@ -233,7 +249,9 @@ impl TransformerModelParameters {
         push_matrix_values(&mut values, &self.position_embedding);
         push_matrix_values(&mut values, &self.language_model_head);
         push_vector_values(&mut values, &self.language_model_head_biases);
+        push_vector_values(&mut values, &self.final_norm_gain);
         for layer in &self.layers {
+            push_vector_values(&mut values, &layer.attention_norm_gain);
             push_matrix_values(&mut values, &layer.attention.query_weights);
             push_vector_values(&mut values, &layer.attention.query_biases);
             push_matrix_values(&mut values, &layer.attention.key_weights);
@@ -242,6 +260,7 @@ impl TransformerModelParameters {
             push_vector_values(&mut values, &layer.attention.value_biases);
             push_matrix_values(&mut values, &layer.attention.output_projection_weights);
             push_vector_values(&mut values, &layer.attention.output_projection_biases);
+            push_vector_values(&mut values, &layer.feed_forward_norm_gain);
             push_matrix_values(&mut values, &layer.feed_forward.expansion_weights);
             push_vector_values(&mut values, &layer.feed_forward.expansion_biases);
             push_matrix_values(&mut values, &layer.feed_forward.gate_weights);
@@ -292,10 +311,16 @@ impl TransformerModelParameters {
                 &mut value_index,
                 &self.language_model_head_biases,
             ),
+            final_norm_gain: next_vector(&values, &mut value_index, &self.final_norm_gain),
             layers: self
                 .layers
                 .iter()
                 .map(|layer| TransformerLayerParameters {
+                    attention_norm_gain: next_vector(
+                        &values,
+                        &mut value_index,
+                        &layer.attention_norm_gain,
+                    ),
                     attention: AttentionParameters {
                         query_weights: next_matrix(
                             &values,
@@ -338,6 +363,11 @@ impl TransformerModelParameters {
                             &layer.attention.output_projection_biases,
                         ),
                     },
+                    feed_forward_norm_gain: next_vector(
+                        &values,
+                        &mut value_index,
+                        &layer.feed_forward_norm_gain,
+                    ),
                     feed_forward: FeedForwardParameters {
                         expansion_weights: next_matrix(
                             &values,
@@ -385,8 +415,10 @@ impl TransformerModelParameters {
             matrix_checkpoint_tensor(&self.position_embedding),
             matrix_checkpoint_tensor(&self.language_model_head),
             vector_checkpoint_tensor(&self.language_model_head_biases),
+            vector_checkpoint_tensor(&self.final_norm_gain),
         ];
         for layer in &self.layers {
+            tensors.push(vector_checkpoint_tensor(&layer.attention_norm_gain));
             tensors.push(matrix_checkpoint_tensor(&layer.attention.query_weights));
             tensors.push(vector_checkpoint_tensor(&layer.attention.query_biases));
             tensors.push(matrix_checkpoint_tensor(&layer.attention.key_weights));
@@ -399,6 +431,7 @@ impl TransformerModelParameters {
             tensors.push(vector_checkpoint_tensor(
                 &layer.attention.output_projection_biases,
             ));
+            tensors.push(vector_checkpoint_tensor(&layer.feed_forward_norm_gain));
             tensors.push(matrix_checkpoint_tensor(
                 &layer.feed_forward.expansion_weights,
             ));
@@ -641,15 +674,33 @@ pub fn import_training_session_checkpoint(
         checkpoint.config.layer_count,
     );
     let expected_tensors = model_template.checkpoint_tensors();
-    let parameter_values = flatten_checkpoint_tensors(&checkpoint.parameters, &expected_tensors)?
+    let parameter_tensors = upgrade_legacy_checkpoint_tensors_for_norm_gains(
+        &checkpoint.parameters,
+        &expected_tensors,
+        checkpoint.config.layer_count,
+        1.0,
+    )?;
+    let first_moment_tensors = upgrade_legacy_checkpoint_tensors_for_norm_gains(
+        &checkpoint.first_moment_estimates,
+        &expected_tensors,
+        checkpoint.config.layer_count,
+        0.0,
+    )?;
+    let second_moment_tensors = upgrade_legacy_checkpoint_tensors_for_norm_gains(
+        &checkpoint.second_moment_estimates,
+        &expected_tensors,
+        checkpoint.config.layer_count,
+        0.0,
+    )?;
+    let parameter_values = flatten_checkpoint_tensors(&parameter_tensors, &expected_tensors)?
         .into_iter()
         .map(Value::new)
         .collect();
     let model = model_template.with_values(parameter_values);
     let first_moment_estimates =
-        flatten_checkpoint_tensors(&checkpoint.first_moment_estimates, &expected_tensors)?;
+        flatten_checkpoint_tensors(&first_moment_tensors, &expected_tensors)?;
     let second_moment_estimates =
-        flatten_checkpoint_tensors(&checkpoint.second_moment_estimates, &expected_tensors)?;
+        flatten_checkpoint_tensors(&second_moment_tensors, &expected_tensors)?;
 
     Ok(MicrogptTrainingSession {
         trained_microgpt: TrainedMicrogpt {
@@ -737,6 +788,13 @@ struct DocumentTrainingResult {
     parameter_gradients: Vec<f64>,
 }
 
+#[derive(Clone, Debug)]
+pub struct TrainingTokenWindow {
+    pub input_tokens: Vec<usize>,
+    pub target_tokens: Vec<usize>,
+    pub loss_mask: Vec<f64>,
+}
+
 pub struct ParameterUpdate {
     value: Value,
     first_moment_estimate: f64,
@@ -804,6 +862,77 @@ fn flatten_checkpoint_tensors(
     Ok(values)
 }
 
+pub(crate) fn upgrade_legacy_checkpoint_tensors_for_norm_gains(
+    tensors: &[CheckpointTensor],
+    expected_tensors: &[CheckpointTensor],
+    layer_count: usize,
+    inserted_value: f64,
+) -> Result<Vec<CheckpointTensor>, String> {
+    if tensors.len() == expected_tensors.len() {
+        return Ok(tensors.to_vec());
+    }
+
+    let legacy_tensor_count = 4 + layer_count * 14;
+    if tensors.len() != legacy_tensor_count {
+        return Err(format!(
+            "checkpoint has {} parameter tensors, expected {}",
+            tensors.len(),
+            expected_tensors.len()
+        ));
+    }
+
+    let mut upgraded = Vec::with_capacity(expected_tensors.len());
+    let mut legacy_index = 0;
+    let mut expected_index = 0;
+
+    for _ in 0..4 {
+        upgraded.push(tensors[legacy_index].clone());
+        legacy_index += 1;
+        expected_index += 1;
+    }
+
+    upgraded.push(filled_checkpoint_tensor(
+        &expected_tensors[expected_index],
+        inserted_value,
+    ));
+    expected_index += 1;
+
+    for _ in 0..layer_count {
+        upgraded.push(filled_checkpoint_tensor(
+            &expected_tensors[expected_index],
+            inserted_value,
+        ));
+        expected_index += 1;
+
+        for _ in 0..8 {
+            upgraded.push(tensors[legacy_index].clone());
+            legacy_index += 1;
+            expected_index += 1;
+        }
+
+        upgraded.push(filled_checkpoint_tensor(
+            &expected_tensors[expected_index],
+            inserted_value,
+        ));
+        expected_index += 1;
+
+        for _ in 0..6 {
+            upgraded.push(tensors[legacy_index].clone());
+            legacy_index += 1;
+            expected_index += 1;
+        }
+    }
+
+    Ok(upgraded)
+}
+
+fn filled_checkpoint_tensor(expected_tensor: &CheckpointTensor, value: f64) -> CheckpointTensor {
+    CheckpointTensor {
+        shape: expected_tensor.shape.clone(),
+        values: vec![value; expected_tensor.values.len()],
+    }
+}
+
 pub fn random_gaussian(
     random_number_generator: &mut impl Rng,
     mean: f64,
@@ -860,6 +989,10 @@ pub fn zero_vector(size: usize) -> Vector {
     (0..size).map(|_| Value::new(0.0)).collect()
 }
 
+pub fn one_vector(size: usize) -> Vector {
+    (0..size).map(|_| Value::new(1.0)).collect()
+}
+
 pub fn linear(input_vector: &[Value], weights: &[Vec<Value>], biases: &[Value]) -> Vec<Value> {
     // A linear layer is many weighted sums plus one learned offset per output.
     // If the input has values
@@ -881,6 +1014,17 @@ pub fn linear(input_vector: &[Value], weights: &[Vec<Value>], biases: &[Value]) 
                 })
         })
         .collect()
+}
+
+pub fn tied_language_model_logits(
+    hidden_state: &[Value],
+    token_embedding: &[Vec<Value>],
+    biases: &[Value],
+) -> Vec<Value> {
+    // Weight tying reuses each token's input embedding row as that token's
+    // output classifier. If the final hidden state points in the same direction
+    // as the embedding for "a", the logit for "a" becomes larger.
+    linear(hidden_state, token_embedding, biases)
 }
 
 pub fn softmax(logits: &[Value]) -> Vec<Value> {
@@ -923,7 +1067,7 @@ pub fn cross_entropy_loss(logits: &[Value], target_token_id: usize) -> Value {
         .sub(&logits[target_token_id])
 }
 
-pub fn rmsnorm(input_vector: &[Value]) -> Vec<Value> {
+pub fn rmsnorm(input_vector: &[Value], gain: &[Value]) -> Vec<Value> {
     // RMSNorm rescales a vector so its root-mean-square magnitude is near 1.
     // It does not change direction much; it mainly keeps layer inputs in a
     // predictable numeric range, which makes deep residual networks easier to
@@ -933,7 +1077,11 @@ pub fn rmsnorm(input_vector: &[Value]) -> Vec<Value> {
         .fold(Value::new(0.0), |sum, value| sum.add(&value.mul(value)))
         .div_f64(input_vector.len() as f64);
     let scale = mean_square.add_f64(1e-5).powf(-0.5);
-    input_vector.iter().map(|value| value.mul(&scale)).collect()
+    input_vector
+        .iter()
+        .zip(gain.iter())
+        .map(|(value, gain)| value.mul(&scale).mul(gain))
+        .collect()
 }
 
 pub fn weighted_choice(weights: &[f64], random_number_generator: &mut impl Rng) -> usize {
@@ -966,15 +1114,7 @@ pub fn run_transformer_model(
     // Forward pass for one time step. The model sees the current token and the
     // current position, updates the KV cache, then returns logits for the next
     // token. Training calls this repeatedly over a sentence.
-    let token_embedding = &model.token_embedding[token_id];
-    let position_embedding = &model.position_embedding[position_id];
-    let mut hidden_state: Vec<_> = token_embedding
-        .iter()
-        .zip(position_embedding.iter())
-        .map(|(token_value, position_value)| token_value.add(position_value))
-        .collect();
-
-    hidden_state = rmsnorm(&hidden_state);
+    let mut hidden_state = model.token_embedding[token_id].clone();
     let mut current_keys = keys;
     let mut current_values = values;
 
@@ -993,10 +1133,11 @@ pub fn run_transformer_model(
         current_values = layer_run.values;
     }
 
+    hidden_state = rmsnorm(&hidden_state, &model.final_norm_gain);
     TransformerRun {
-        logits: linear(
+        logits: tied_language_model_logits(
             &hidden_state,
-            &model.language_model_head,
+            &model.token_embedding,
             &model.language_model_head_biases,
         ),
         keys: current_keys,
@@ -1021,7 +1162,7 @@ pub fn run_transformer_layer(
     // Residual additions let each block make an incremental edit instead of
     // relearning the whole representation from scratch.
     let residual_state = hidden_state.to_vec();
-    let normalized_state = rmsnorm(hidden_state);
+    let normalized_state = rmsnorm(hidden_state, &layer.attention_norm_gain);
 
     let query = apply_rotary_position_embedding(
         &linear(
@@ -1065,7 +1206,7 @@ pub fn run_transformer_layer(
         .collect();
 
     let residual_state = updated_hidden_state.clone();
-    let normalized_state = rmsnorm(&updated_hidden_state);
+    let normalized_state = rmsnorm(&updated_hidden_state, &layer.feed_forward_norm_gain);
     let expanded_output = linear(
         &normalized_state,
         &layer.feed_forward.expansion_weights,
@@ -1222,31 +1363,94 @@ pub fn silu(value: &Value) -> Value {
     value.mul(&sigmoid)
 }
 
-fn training_batch_documents(
+pub fn training_batch_token_windows(
     documents: &[String],
+    tokenizer: &CharacterTokenizer,
     step: usize,
     batch_document_count: usize,
-) -> Vec<String> {
-    // This deterministic batching scheme cycles through the shuffled document
-    // list. It avoids extra randomness during a run, which makes learning curves
-    // easier to reproduce while still exposing all documents over time.
-    let batch_start_index = (step * batch_document_count) % documents.len();
+    context_window_size: usize,
+) -> Vec<TrainingTokenWindow> {
+    // Random fixed-length windows give the optimizer more varied local contexts
+    // than cycling through whole sentences. The "randomness" is deterministic:
+    // it is a pure function of step + batch slot, so checkpoint restore does not
+    // need to serialize a mutable RNG stream to reproduce later batches.
     (0..batch_document_count)
-        .map(|batch_offset| documents[(batch_start_index + batch_offset) % documents.len()].clone())
+        .map(|batch_offset| {
+            let document_index = deterministic_index(step, batch_offset, 0x9e37, documents.len());
+            let tokens = tokenizer.encode_document(&documents[document_index]);
+            token_window_from_tokens(
+                &tokens,
+                step,
+                batch_offset,
+                context_window_size,
+                tokenizer.sequence_boundary_token_id,
+            )
+        })
         .collect()
+}
+
+fn token_window_from_tokens(
+    tokens: &[usize],
+    step: usize,
+    batch_offset: usize,
+    context_window_size: usize,
+    pad_token_id: usize,
+) -> TrainingTokenWindow {
+    let prediction_count = tokens.len().saturating_sub(1).min(context_window_size);
+    let max_start = tokens.len().saturating_sub(context_window_size + 1);
+    let start = if max_start == 0 {
+        0
+    } else {
+        deterministic_index(step, batch_offset, 0xd1b5, max_start + 1)
+    };
+    let mut input_tokens = vec![pad_token_id; context_window_size];
+    let mut target_tokens = vec![pad_token_id; context_window_size];
+    let mut loss_mask = vec![0.0; context_window_size];
+
+    for position in 0..prediction_count {
+        input_tokens[position] = tokens[start + position];
+        target_tokens[position] = tokens[start + position + 1];
+        loss_mask[position] = 1.0;
+    }
+
+    TrainingTokenWindow {
+        input_tokens,
+        target_tokens,
+        loss_mask,
+    }
+}
+
+fn deterministic_index(step: usize, batch_offset: usize, salt: u64, upper_bound: usize) -> usize {
+    if upper_bound <= 1 {
+        return 0;
+    }
+    let mixed = splitmix64(
+        (step as u64)
+            .wrapping_mul(0xa076_1d64_78bd_642f)
+            .wrapping_add((batch_offset as u64).wrapping_mul(0xe703_7ed1_a0b4_28db))
+            .wrapping_add(salt),
+    );
+    (mixed as usize) % upper_bound
+}
+
+fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    let mut mixed = value;
+    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    mixed ^ (mixed >> 31)
 }
 
 fn train_on_document_with_gradients(
     model: &TransformerModelParameters,
     config: &TransformerConfig,
-    tokenizer: &CharacterTokenizer,
-    document: &str,
+    token_window: &TrainingTokenWindow,
     parameter_index_by_value: &HashMap<usize, usize>,
     parameter_count: usize,
 ) -> DocumentTrainingResult {
     // One document produces one scalar loss. Calling backward on that loss tells
     // us how every parameter should change to reduce surprise on this document.
-    let loss = train_on_document(model, config, tokenizer, document);
+    let loss = train_on_token_window(model, config, token_window);
     DocumentTrainingResult {
         loss: loss.data(),
         parameter_gradients: loss.backward_for(parameter_index_by_value, parameter_count),
@@ -1284,19 +1488,24 @@ pub fn train_microgpt_step(
         .enumerate()
         .map(|(parameter_index, parameter)| (parameter.id(), parameter_index))
         .collect();
-    let batch_documents = training_batch_documents(&session.documents, step, batch_document_count);
+    let batch_windows = training_batch_token_windows(
+        &session.documents,
+        &session.trained_microgpt.tokenizer,
+        step,
+        batch_document_count,
+        session.trained_microgpt.config.context_window_size,
+    );
     let parameter_count = parameters.len();
 
     // Each document builds an independent scalar computation graph, so CPU
     // training can parallelize documents safely with Rayon.
-    let document_results: Vec<_> = batch_documents
+    let document_results: Vec<_> = batch_windows
         .par_iter()
-        .map(|document| {
+        .map(|token_window| {
             train_on_document_with_gradients(
                 &session.trained_microgpt.model,
                 &session.trained_microgpt.config,
-                &session.trained_microgpt.tokenizer,
-                document,
+                token_window,
                 &parameter_index_by_value,
                 parameter_count,
             )
@@ -1318,7 +1527,7 @@ pub fn train_microgpt_step(
         }
     }
 
-    let inverse_document_count = 1.0 / batch_documents.len() as f64;
+    let inverse_document_count = 1.0 / batch_windows.len() as f64;
     for gradient in &mut accumulated_parameter_gradients {
         *gradient *= inverse_document_count;
     }
@@ -1372,25 +1581,40 @@ pub fn train_on_document(
     // ask the model to predict token t+1. This is how language models learn from
     // plain text without hand-written labels.
     let tokens = tokenizer.encode_document(document);
-    let prediction_step_count = config
-        .context_window_size
-        .min(tokens.len().saturating_sub(1));
+    let token_window = token_window_from_tokens(
+        &tokens,
+        0,
+        0,
+        config.context_window_size,
+        tokenizer.sequence_boundary_token_id,
+    );
+    train_on_token_window(model, config, &token_window)
+}
+
+pub fn train_on_token_window(
+    model: &TransformerModelParameters,
+    config: &TransformerConfig,
+    token_window: &TrainingTokenWindow,
+) -> Value {
     let mut keys = create_key_value_cache(config.layer_count);
     let mut values = create_key_value_cache(config.layer_count);
     let mut loss = Value::new(0.0);
+    let mut active_position_count = 0.0;
 
-    for position_id in 0..prediction_step_count {
-        let token_id = tokens[position_id];
-        let target_token_id = tokens[position_id + 1];
+    for position_id in 0..config.context_window_size {
+        let mask = token_window.loss_mask[position_id];
+        let token_id = token_window.input_tokens[position_id];
+        let target_token_id = token_window.target_tokens[position_id];
         let model_run = run_transformer_model(model, config, token_id, position_id, keys, values);
         keys = model_run.keys;
         values = model_run.values;
         let position_loss = cross_entropy_loss(&model_run.logits, target_token_id);
         // Total document loss is the average surprise across positions.
-        loss = loss.add(&position_loss);
+        loss = loss.add(&position_loss.mul_f64(mask));
+        active_position_count += mask;
     }
 
-    loss.mul_f64(1.0 / prediction_step_count as f64)
+    loss.mul_f64(1.0 / active_position_count.max(1.0))
 }
 
 pub fn calculate_document_loss(
