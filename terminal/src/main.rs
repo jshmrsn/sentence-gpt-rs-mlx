@@ -26,8 +26,8 @@ use microgpt_lib::microgpt::{
     export_training_session_checkpoint as export_cpu_training_session_checkpoint,
     generate_samples as generate_cpu_samples,
     import_training_session_checkpoint as import_cpu_training_session_checkpoint,
-    train_microgpt_step, Matrix, MicrogptTrainingProgress, MicrogptTrainingSession,
-    TrainedMicrogpt, TransformerConfig, Vector,
+    scheduled_learning_rate, train_microgpt_step, Matrix, MicrogptTrainingProgress,
+    MicrogptTrainingSession, TrainedMicrogpt, TransformerConfig, Vector,
 };
 use microgpt_lib::mlx_microgpt::{
     attach_validation_loss as attach_mlx_validation_loss,
@@ -183,6 +183,21 @@ impl TrainingSession {
         }
     }
 
+    fn current_learning_rate(&self) -> f64 {
+        match self {
+            TrainingSession::Mlx(session) => scheduled_learning_rate(
+                &session.optimizer_config,
+                session.completed_step_count,
+                session.training_step_count,
+            ),
+            TrainingSession::Cpu(session) => scheduled_learning_rate(
+                &session.optimizer_config,
+                session.completed_step_count,
+                session.training_step_count,
+            ),
+        }
+    }
+
     fn export_checkpoint(&self) -> Result<microgpt_lib::checkpoint::MicrogptCheckpoint, String> {
         match self {
             TrainingSession::Mlx(session) => export_mlx_training_session_checkpoint(session),
@@ -240,6 +255,7 @@ struct App {
     generation_requested: bool,
     next_validation_step: usize,
     accumulated_training_millis: u128,
+    throughput_start_step: usize,
     prefix: String,
     temperature: f64,
     samples: Vec<String>,
@@ -318,6 +334,7 @@ impl App {
             generation_requested: false,
             next_validation_step: VALIDATION_STEP_INTERVAL,
             accumulated_training_millis: 0,
+            throughput_start_step: 0,
             prefix: String::new(),
             temperature: 0.5,
             samples: Vec::new(),
@@ -431,6 +448,7 @@ impl App {
                 self.next_validation_step =
                     next_validation_step_after(self.session.completed_step_count());
                 self.accumulated_training_millis = 0;
+                self.throughput_start_step = self.session.completed_step_count();
                 self.is_training_active = false;
                 self.generation_requested = false;
                 self.training_receiver = None;
@@ -611,7 +629,11 @@ impl App {
         if self.accumulated_training_millis == 0 {
             return 0.0;
         }
-        self.session.completed_step_count() as f64 * TRAINING_DOCUMENT_BATCH_SIZE as f64 * 60_000.0
+        let completed_steps_since_rate_start = self
+            .session
+            .completed_step_count()
+            .saturating_sub(self.throughput_start_step);
+        completed_steps_since_rate_start as f64 * TRAINING_DOCUMENT_BATCH_SIZE as f64 * 60_000.0
             / self.accumulated_training_millis as f64
     }
 }
@@ -653,9 +675,10 @@ fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
             Span::raw(format!("  {}", app.status_message)),
         ]),
         Line::from(format!(
-            "backend {} | params {} | values {} | layers {} | embedding {} | heads {} x {} | context {} | vocab {} | prefix {:?} | temp {:.1}",
+            "backend {} | params {} | lr {} | values {} | layers {} | embedding {} | heads {} x {} | context {} | vocab {} | prefix {:?} | temp {:.1}",
             backend,
             format_count(app.session.parameter_count()),
+            format_learning_rate(app.session.current_learning_rate()),
             if app.visualize_network_values { "on" } else { "off" },
             config.layer_count,
             config.embedding_size,
@@ -1160,6 +1183,10 @@ fn sparkline_losses(progress_history: &[MicrogptTrainingProgress]) -> Vec<u64> {
 
 fn format_loss(loss: f64) -> String {
     format!("{loss:.4}")
+}
+
+fn format_learning_rate(learning_rate: f64) -> String {
+    format!("{learning_rate:.6}")
 }
 
 fn format_count(value: usize) -> String {

@@ -23,8 +23,8 @@ use microgpt_lib::microgpt::{
     export_training_session_checkpoint as export_cpu_training_session_checkpoint,
     generate_samples as generate_cpu_samples,
     import_training_session_checkpoint as import_cpu_training_session_checkpoint,
-    train_microgpt_step, CharacterTokenizer, Matrix, MicrogptTrainingProgress,
-    MicrogptTrainingSession, TrainedMicrogpt, TransformerConfig, Vector,
+    scheduled_learning_rate, train_microgpt_step, CharacterTokenizer, Matrix,
+    MicrogptTrainingProgress, MicrogptTrainingSession, TrainedMicrogpt, TransformerConfig, Vector,
 };
 use microgpt_lib::mlx_microgpt::{
     attach_validation_loss as attach_mlx_validation_loss,
@@ -501,6 +501,21 @@ impl TrainingSession {
         }
     }
 
+    fn current_learning_rate(&self) -> f64 {
+        match self {
+            TrainingSession::Mlx(session) => scheduled_learning_rate(
+                &session.optimizer_config,
+                session.completed_step_count,
+                session.training_step_count,
+            ),
+            TrainingSession::Cpu(session) => scheduled_learning_rate(
+                &session.optimizer_config,
+                session.completed_step_count,
+                session.training_step_count,
+            ),
+        }
+    }
+
     fn progress_history(&self) -> &[MicrogptTrainingProgress] {
         match self {
             TrainingSession::Mlx(session) => session.progress_history.as_slice(),
@@ -571,6 +586,7 @@ struct AppState {
     is_generating_samples: bool,
     next_validation_step: usize,
     accumulated_training_millis: u128,
+    throughput_start_step: usize,
     prefix: String,
     document_browser_dataset: DocumentBrowserDataset,
     training_document_search: String,
@@ -776,13 +792,36 @@ fn App() -> Element {
                         button {
                             class: "button secondary",
                             disabled: snapshot.session.is_none() || snapshot.is_training_busy || snapshot.is_generating_samples,
-                            onclick: move |_| state.write().export_checkpoint(),
+                            onclick: move |_| {
+                                let selected_directory = {
+                                    state.read().snapshot_export_directory.clone()
+                                };
+                                let directory = selected_directory.or_else(|| {
+                                    FileDialog::new()
+                                        .set_title("Select snapshot export directory")
+                                        .pick_folder()
+                                });
+                                if let Some(directory) = directory {
+                                    state.write().export_checkpoint_to_directory(directory);
+                                }
+                            },
                             "Export"
                         }
                         button {
                             class: "button secondary",
                             disabled: snapshot.is_training_busy || snapshot.is_generating_samples,
-                            onclick: move |_| state.write().import_checkpoint(),
+                            onclick: move |_| {
+                                // Open the native file dialog before borrowing state. On macOS
+                                // the dialog runs a nested event loop, so holding a Dioxus
+                                // signal borrow here can conflict with background task wakeups.
+                                if let Some(path) = FileDialog::new()
+                                    .set_title("Import microgpt checkpoint")
+                                    .add_filter("microgpt checkpoint", &["bin"])
+                                    .pick_file()
+                                {
+                                    state.write().import_checkpoint_from_path(path);
+                                }
+                            },
                             "Import"
                         }
                         button {
@@ -830,6 +869,7 @@ fn App() -> Element {
                         {metric("Status", status)}
                         {metric("Backend", backend_label.into())}
                         {metric("Params", format_count(snapshot.session.as_ref().map(TrainingSession::parameter_count).unwrap_or(0)))}
+                        {metric("LR", snapshot.session.as_ref().map(|session| format_learning_rate(session.current_learning_rate())).unwrap_or_else(|| "pending".into()))}
                         {metric("Step", format!("{} / {}", snapshot.completed_step_count(), snapshot.training_step_count()))}
                         {metric("Train loss", latest_loss.map(format_loss).unwrap_or_else(|| "pending".into()))}
                         {metric("Validation", latest_validation_loss.map(format_loss).unwrap_or_else(|| "pending".into()))}
@@ -1035,6 +1075,7 @@ impl AppState {
                             is_generating_samples: false,
                             next_validation_step: VALIDATION_STEP_INTERVAL,
                             accumulated_training_millis: 0,
+                            throughput_start_step: 0,
                             prefix: String::new(),
                             document_browser_dataset: DocumentBrowserDataset::Training,
                             training_document_search: String::new(),
@@ -1061,6 +1102,7 @@ impl AppState {
                     is_generating_samples: false,
                     next_validation_step: VALIDATION_STEP_INTERVAL,
                     accumulated_training_millis: 0,
+                    throughput_start_step: 0,
                     prefix: String::new(),
                     document_browser_dataset: DocumentBrowserDataset::Training,
                     training_document_search: String::new(),
@@ -1086,6 +1128,7 @@ impl AppState {
                 is_generating_samples: false,
                 next_validation_step: VALIDATION_STEP_INTERVAL,
                 accumulated_training_millis: 0,
+                throughput_start_step: 0,
                 prefix: String::new(),
                 document_browser_dataset: DocumentBrowserDataset::Training,
                 training_document_search: String::new(),
@@ -1163,14 +1206,15 @@ impl AppState {
         *self = Self::initialize_with_backend(self.backend.toggled());
     }
 
-    fn export_checkpoint(&mut self) {
+    fn export_checkpoint_to_directory(&mut self, directory: PathBuf) {
         if self.is_training_busy || self.is_generating_samples {
             return;
         }
         let Some(session) = &self.session else {
             return;
         };
-        let path = checkpoint_file_path();
+        self.snapshot_export_directory = Some(directory.clone());
+        let path = directory.join(snapshot_checkpoint_file_name(session));
         match session
             .export_checkpoint()
             .and_then(|checkpoint| save_checkpoint_to_path(&checkpoint, &path))
@@ -1187,11 +1231,10 @@ impl AppState {
         }
     }
 
-    fn import_checkpoint(&mut self) {
+    fn import_checkpoint_from_path(&mut self, path: PathBuf) {
         if self.is_training_busy || self.is_generating_samples {
             return;
         }
-        let path = checkpoint_file_path();
         match load_checkpoint_from_path(&path)
             .and_then(|checkpoint| TrainingSession::import_checkpoint(&checkpoint))
         {
@@ -1200,6 +1243,7 @@ impl AppState {
                 self.next_validation_step =
                     next_validation_step_after(session.completed_step_count());
                 self.accumulated_training_millis = 0;
+                self.throughput_start_step = session.completed_step_count();
                 self.is_training_active = false;
                 self.manual_training_chunk_requested = false;
                 self.generation_requested = false;
@@ -1412,7 +1456,10 @@ impl AppState {
         if self.accumulated_training_millis == 0 {
             return 0.0;
         }
-        self.completed_document_train_count() as f64 * 60_000.0
+        let completed_steps_since_rate_start = self
+            .completed_step_count()
+            .saturating_sub(self.throughput_start_step);
+        completed_steps_since_rate_start as f64 * TRAINING_DOCUMENT_BATCH_SIZE as f64 * 60_000.0
             / self.accumulated_training_millis as f64
     }
 
@@ -1672,12 +1719,6 @@ fn stories_to_sentences(stories: Vec<Story>) -> Vec<String> {
         })
         .take(MAX_DOCUMENT_COUNT)
         .collect()
-}
-
-fn checkpoint_file_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("microgpt-checkpoint.bin")
 }
 
 fn snapshot_checkpoint_file_name(session: &TrainingSession) -> String {
@@ -2106,6 +2147,10 @@ fn weight_style(value: f32, scale: f64) -> String {
 
 fn format_loss(loss: f64) -> String {
     format!("{loss:.4}")
+}
+
+fn format_learning_rate(learning_rate: f64) -> String {
+    format!("{learning_rate:.6}")
 }
 
 fn format_percent(value: f64) -> String {
