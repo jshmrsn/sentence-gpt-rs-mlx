@@ -873,7 +873,6 @@ pub fn generate_sample(
     let mut token_id = tokenizer.sequence_boundary_token_id;
     let normalized_prefix = prefix
         .trim()
-        .to_lowercase()
         .chars()
         .filter(|character| tokenizer.character_to_token_id.contains_key(character))
         .take(config.context_window_size - 1)

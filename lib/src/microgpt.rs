@@ -2010,7 +2010,6 @@ pub fn generate_sample(
     let mut token_id = tokenizer.sequence_boundary_token_id;
     let normalized_prefix: String = prefix
         .trim()
-        .to_lowercase()
         .chars()
         .filter(|character| tokenizer.character_to_token_id.contains_key(character))
         .take(config.context_window_size - 1)
@@ -2114,23 +2113,7 @@ fn keep_top_k(probabilities: &mut [f64], top_k: usize) {
 }
 
 pub fn normalize_training_document(document: &str) -> String {
-    // Keep this dataset intentionally simple: lowercase a-z plus spaces. A
-    // production tokenizer would preserve far more information, but this tiny
-    // character vocabulary makes every token and probability easy to inspect.
-    let mut normalized = String::with_capacity(document.len());
-    let mut previous_was_space = true;
-
-    for character in document.chars().flat_map(char::to_lowercase) {
-        if character.is_ascii_lowercase() {
-            normalized.push(character);
-            previous_was_space = false;
-        } else if character.is_whitespace() && !previous_was_space {
-            normalized.push(' ');
-            previous_was_space = true;
-        }
-    }
-
-    normalized.trim().to_string()
+    document.into()
 }
 
 pub fn create_microgpt_training_session(

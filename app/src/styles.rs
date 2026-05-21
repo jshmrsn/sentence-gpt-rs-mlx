@@ -151,6 +151,13 @@ button, input {
     background: #fff;
 }
 
+.search-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 8px;
+    align-items: center;
+}
+
 .range {
     width: 100%;
 }
@@ -162,11 +169,28 @@ button, input {
 }
 
 .sample {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 8px;
+    align-items: start;
     background: #fbfdfb;
     border: 1px solid #d3ded7;
     border-radius: 6px;
     padding: 8px 10px;
     min-height: 22px;
+}
+
+.sample-text {
+    min-width: 0;
+}
+
+.sample-search-button {
+    border: 1px solid #b9c8bf;
+    background: #fff;
+    color: #28533f;
+    border-radius: 6px;
+    padding: 5px 8px;
+    white-space: nowrap;
 }
 
 .document-list {
@@ -275,6 +299,10 @@ button, input {
     }
 
     .status-grid, .heatmap-groups, .samples, .document-list {
+        grid-template-columns: 1fr;
+    }
+
+    .search-row, .sample {
         grid-template-columns: 1fr;
     }
 

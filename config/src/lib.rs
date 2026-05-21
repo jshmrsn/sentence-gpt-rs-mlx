@@ -33,13 +33,14 @@ pub const TRAINING_FRAME_BUDGET: Duration = Duration::from_millis(500);
 pub const VALIDATION_STEP_INTERVAL: usize = 25;
 pub const TRAINING_DOCUMENT_BATCH_SIZE: usize = 32;
 pub const MAX_DOCUMENT_COUNT: usize = 5000000;
-pub const MAX_TRAINING_STEP_COUNT: usize = 100_000;
-pub const VALIDATION_SET_DIVISOR: usize = 20;
+pub const MAX_TRAINING_STEP_COUNT: usize = 1_000_000;
+pub const VALIDATION_SET_DIVISOR: usize = 50;
 pub const VALIDATION_EVALUATION_DOCUMENT_COUNT: usize = 12;
 pub const CONTEXT_WINDOW_SIZE: usize = 128;
 pub const LAYER_COUNT: usize = 6;
 pub const ATTENTION_HEADS: usize = 8;
 pub const EMBEDDING_SIZE: usize = 128;
+pub const RUNNING_MEAN_LOSS_RECENT_WEIGHT: f64 = 0.35;
 
 pub fn get_optimizer_config() -> AdamOptimizerConfig {
     AdamOptimizerConfig {
@@ -410,16 +411,26 @@ pub fn next_validation_step_after(completed_step_count: usize) -> usize {
 }
 
 pub fn running_mean_loss(progress_history: &[MicrogptTrainingProgress]) -> Option<f64> {
-    let mut total = 0.0;
-    let mut count = 0_usize;
+    running_mean_loss_values(progress_history).last().copied()
+}
+
+pub fn running_mean_loss_values(progress_history: &[MicrogptTrainingProgress]) -> Vec<f64> {
+    let mut smoothed_losses = Vec::new();
+    let mut smoothed_loss = None;
     for progress in progress_history {
         if progress.completed_step_count == 0 && progress_history.len() > 1 {
             continue;
         }
-        total += progress.loss;
-        count += 1;
+        smoothed_loss = Some(match smoothed_loss {
+            Some(previous_loss) => {
+                previous_loss * (1.0 - RUNNING_MEAN_LOSS_RECENT_WEIGHT)
+                    + progress.loss * RUNNING_MEAN_LOSS_RECENT_WEIGHT
+            }
+            None => progress.loss,
+        });
+        smoothed_losses.push(smoothed_loss.expect("smoothed loss was just initialized"));
     }
-    (count > 0).then_some(total / count as f64)
+    smoothed_losses
 }
 
 pub fn format_loss(loss: f64) -> String {
@@ -501,20 +512,13 @@ fn stories_to_sentences(stories: Vec<Story>) -> Vec<String> {
 
     let all_sentences = gpt_stories
         .into_iter()
-        .flat_map(|story| {
-            story
-                .story
-                .replace(['!', '?'], ".")
-                .split('.')
-                .map(|sentence| sentence.to_string())
-                .collect::<Vec<_>>()
-        })
+        .flat_map(|story| split_sentences_keep_punctuation(&story.story))
         .filter(|sentence| {
             !EXCLUDE_CHARACTERS
                 .iter()
                 .any(|excluded| sentence.contains(*excluded))
         })
-        .map(|sentence| sentence.replace(['\n', ','], "").trim().to_lowercase())
+        .map(|sentence| sentence.replace(['\n'], " ").trim().to_string())
         .filter(|sentence| {
             sentence.len() > 10
                 && sentence.contains(' ')
@@ -534,6 +538,22 @@ fn stories_to_sentences(stories: Vec<Story>) -> Vec<String> {
     capped_sentences
 }
 
+fn split_sentences_keep_punctuation(story: &str) -> Vec<String> {
+    let mut sentences = Vec::new();
+    let mut sentence_start = 0;
+    for (index, character) in story.char_indices() {
+        if matches!(character, '.' | '?' | '!') {
+            let sentence_end = index + character.len_utf8();
+            sentences.push(story[sentence_start..sentence_end].to_string());
+            sentence_start = sentence_end;
+        }
+    }
+    if sentence_start < story.len() {
+        sentences.push(story[sentence_start..].to_string());
+    }
+    sentences
+}
+
 fn cap_filtered_documents(mut documents: Vec<String>) -> Vec<String> {
     // `MAX_DOCUMENT_COUNT` is only a cap, not a promise that this many examples
     // survived source filtering. Collect first so the cap is applied against the
@@ -541,4 +561,17 @@ fn cap_filtered_documents(mut documents: Vec<String>) -> Vec<String> {
     // dataset size.
     documents.truncate(documents.len().min(MAX_DOCUMENT_COUNT));
     documents
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_sentences_keep_punctuation;
+
+    #[test]
+    fn sentence_splitter_keeps_boundary_punctuation() {
+        assert_eq!(
+            split_sentences_keep_punctuation("Are you there? Yes! I am."),
+            vec!["Are you there?", " Yes!", " I am."]
+        );
+    }
 }

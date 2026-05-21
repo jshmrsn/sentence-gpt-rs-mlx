@@ -10,7 +10,7 @@ use dioxus::prelude::*;
 use microgpt_config::{
     create_training_session, format_compact, format_count, format_learning_rate, format_loss,
     format_percent, format_percent_style, get_optimizer_config, load_input_documents,
-    next_validation_step_after, running_mean_loss,
+    next_validation_step_after, running_mean_loss, running_mean_loss_values,
     train_session_until_budget as train_shared_session_until_budget, Backend, TrainedSnapshot,
     TrainingSession, ATTENTION_HEADS, CONTEXT_WINDOW_SIZE, EMBEDDING_SIZE, LAYER_COUNT,
     TRAINING_DOCUMENT_BATCH_SIZE, VALIDATION_STEP_INTERVAL,
@@ -98,6 +98,7 @@ struct AppState {
     prefix: String,
     document_browser_dataset: DocumentBrowserDataset,
     training_document_search: String,
+    cached_browser_search_matches: Vec<(usize, String)>,
     training_document_page: usize,
     temperature: f64,
     samples: Vec<String>,
@@ -248,7 +249,7 @@ fn App() -> Element {
         .session
         .as_ref()
         .is_some_and(TrainingSession::is_complete);
-    let visible_documents = selected_browser_documents(&snapshot);
+    let visible_documents = snapshot.visible_browser_documents();
     let is_document_search_empty = snapshot.training_document_search.trim().is_empty();
     let browser_document_count = snapshot.browser_document_count();
     let browser_dataset_label = snapshot.document_browser_dataset.label();
@@ -413,15 +414,23 @@ fn App() -> Element {
                     }
                     div { class: "field",
                         label { "Search {browser_dataset_label_lowercase} examples" }
-                        input {
-                            class: "text-input",
-                            value: "{snapshot.training_document_search}",
-                            placeholder: "Use pages below, or type to rank matches",
-                            oninput: move |event| state.write().set_training_document_search(event.value()),
-                            autocapitalize: false,
-                            autocomplete: false,
-                            autocorrect: false,
-                            spellcheck: false
+                        div { class: "search-row",
+                            input {
+                                class: "text-input",
+                                value: "{snapshot.training_document_search}",
+                                placeholder: "Use pages below, or type to rank matches",
+                                oninput: move |event| state.write().set_training_document_search(event.value()),
+                                autocapitalize: false,
+                                autocomplete: false,
+                                autocorrect: false,
+                                spellcheck: false
+                            }
+                            button {
+                                class: "button secondary",
+                                disabled: is_document_search_empty,
+                                onclick: move |_| state.write().clear_training_document_search(),
+                                "Clear"
+                            }
                         }
                     }
                     if is_document_search_empty && document_page_count > 1 {
@@ -507,8 +516,18 @@ fn App() -> Element {
                         }
                     }
                     div { class: "samples",
-                        for sample in snapshot.samples.iter() {
-                            div { class: "sample", "{sample}" }
+                        for sample in snapshot.samples.iter().cloned() {
+                            div { class: "sample",
+                                div { class: "sample-text", "{sample}" }
+                                button {
+                                    class: "sample-search-button",
+                                    onclick: {
+                                        let sample = sample.clone();
+                                        move |_| state.write().search_training_documents_for_sample(sample.clone())
+                                    },
+                                    "Find matches"
+                                }
+                            }
                         }
                     }
                 }
@@ -581,6 +600,7 @@ impl AppState {
                             prefix: String::new(),
                             document_browser_dataset: DocumentBrowserDataset::Training,
                             training_document_search: String::new(),
+                            cached_browser_search_matches: Vec::new(),
                             training_document_page: 0,
                             temperature: 0.5,
                             samples: Vec::new(),
@@ -608,6 +628,7 @@ impl AppState {
                     prefix: String::new(),
                     document_browser_dataset: DocumentBrowserDataset::Training,
                     training_document_search: String::new(),
+                    cached_browser_search_matches: Vec::new(),
                     training_document_page: 0,
                     temperature: 0.5,
                     samples: Vec::new(),
@@ -634,6 +655,7 @@ impl AppState {
                 prefix: String::new(),
                 document_browser_dataset: DocumentBrowserDataset::Training,
                 training_document_search: String::new(),
+                cached_browser_search_matches: Vec::new(),
                 training_document_page: 0,
                 temperature: 0.5,
                 samples: Vec::new(),
@@ -649,11 +671,22 @@ impl AppState {
     fn set_training_document_search(&mut self, search: String) {
         self.training_document_search = search;
         self.training_document_page = 0;
+        self.refresh_cached_browser_search_matches();
+    }
+
+    fn clear_training_document_search(&mut self) {
+        self.set_training_document_search(String::new());
+    }
+
+    fn search_training_documents_for_sample(&mut self, sample: String) {
+        self.document_browser_dataset = DocumentBrowserDataset::Training;
+        self.set_training_document_search(sample);
     }
 
     fn toggle_document_browser_dataset(&mut self) {
         self.document_browser_dataset = self.document_browser_dataset.toggled();
         self.training_document_page = 0;
+        self.refresh_cached_browser_search_matches();
     }
 
     fn random_training_document_page(&mut self) {
@@ -695,6 +728,56 @@ impl AppState {
             .as_ref()
             .map(|session| self.document_browser_dataset.documents_from(session))
             .unwrap_or(&[])
+    }
+
+    fn visible_browser_documents(&self) -> Vec<(usize, String)> {
+        if !self.training_document_search.trim().is_empty() {
+            return self.cached_browser_search_matches.clone();
+        }
+
+        let page_start = self
+            .training_document_page
+            .min(self.document_page_count().saturating_sub(1))
+            * 10;
+        self.browser_documents()
+            .iter()
+            .enumerate()
+            .skip(page_start)
+            .take(10)
+            .map(|(index, document)| (index, document.clone()))
+            .collect()
+    }
+
+    fn refresh_cached_browser_search_matches(&mut self) {
+        let query = self.training_document_search.trim().to_lowercase();
+        if query.is_empty() {
+            self.cached_browser_search_matches.clear();
+            return;
+        }
+
+        let terms = query
+            .split_whitespace()
+            .filter(|term| !term.is_empty())
+            .collect::<Vec<_>>();
+        let mut scored_documents = self
+            .browser_documents()
+            .iter()
+            .enumerate()
+            .map(|(index, document)| {
+                (
+                    document_match_score(&document.to_lowercase(), &query, &terms),
+                    index,
+                    document.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        scored_documents
+            .sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+        self.cached_browser_search_matches = scored_documents
+            .into_iter()
+            .take(10)
+            .map(|(_, index, document)| (index, document))
+            .collect();
     }
 
     fn toggle_backend(&mut self) {
@@ -756,6 +839,7 @@ impl AppState {
                     Vec::new()
                 };
                 self.session = Some(session);
+                self.refresh_cached_browser_search_matches();
             }
             Err(error) => {
                 self.initialization_error = Some(format!("Import failed: {error}"));
@@ -1042,46 +1126,6 @@ fn metric(label: &str, value: String) -> Element {
     }
 }
 
-fn selected_browser_documents(state: &AppState) -> Vec<(usize, String)> {
-    let documents = state.browser_documents();
-    let query = state.training_document_search.trim().to_lowercase();
-    if query.is_empty() {
-        let page_start = state
-            .training_document_page
-            .min(state.document_page_count().saturating_sub(1))
-            * 10;
-        return documents
-            .iter()
-            .enumerate()
-            .skip(page_start)
-            .take(10)
-            .map(|(index, document)| (index, document.clone()))
-            .collect();
-    }
-
-    let terms = query
-        .split_whitespace()
-        .filter(|term| !term.is_empty())
-        .collect::<Vec<_>>();
-    let mut scored_documents = documents
-        .iter()
-        .enumerate()
-        .map(|(index, document)| {
-            (
-                document_match_score(&document.to_lowercase(), &query, &terms),
-                index,
-                document.clone(),
-            )
-        })
-        .collect::<Vec<_>>();
-    scored_documents.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
-    scored_documents
-        .into_iter()
-        .take(10)
-        .map(|(_, index, document)| (index, document))
-        .collect()
-}
-
 fn document_match_score(document: &str, query: &str, terms: &[&str]) -> usize {
     let mut score = if document.contains(query) {
         1_000 + query.len() * 4
@@ -1208,23 +1252,16 @@ fn running_mean_loss_points(
     min_loss: f64,
     loss_range: f64,
 ) -> String {
-    let last_index = progress_history.len().saturating_sub(1).max(1);
-    let mut total = 0.0;
-    let mut count = 0_usize;
-    progress_history
+    let smoothed_losses = running_mean_loss_values(progress_history);
+    let last_index = smoothed_losses.len().saturating_sub(1).max(1);
+    smoothed_losses
         .iter()
         .enumerate()
-        .filter_map(|(index, progress)| {
-            if progress.completed_step_count == 0 && progress_history.len() > 1 {
-                return None;
-            }
-            total += progress.loss;
-            count += 1;
-            let mean_loss = total / count as f64;
+        .map(|(index, mean_loss)| {
             let x = 30.0 + 950.0 * index as f64 / last_index as f64;
             let normalized_loss = (mean_loss - min_loss) / loss_range;
             let y = 190.0 - 170.0 * normalized_loss;
-            Some(format!("{x:.2},{y:.2}"))
+            format!("{x:.2},{y:.2}")
         })
         .collect::<Vec<_>>()
         .join(" ")
