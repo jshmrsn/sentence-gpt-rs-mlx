@@ -11,6 +11,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -36,6 +37,7 @@ import org.jshmrsn.microgpt.lib.TrainedMicrogpt
 import org.jshmrsn.microgpt.lib.TransformerConfig
 import org.jshmrsn.microgpt.lib.calculateDocumentLoss
 import org.jshmrsn.microgpt.lib.createMicrogptTrainingSession
+import org.jshmrsn.microgpt.lib.generateSamples
 import org.jshmrsn.microgpt.lib.shuffledBy
 import org.jshmrsn.microgpt.lib.trainMicrogptStepParallel
 import kotlin.math.ln
@@ -185,6 +187,7 @@ fun App() {
         var validationExampleCount by remember { mutableStateOf(0) }
         var validationEvaluationExampleCount by remember { mutableStateOf(0) }
         var prefix by remember { mutableStateOf("") }
+        var temperature by remember { mutableStateOf(0.5f) }
         var samples by remember { mutableStateOf(emptyList<String>()) }
         var visibleMicrogpt by remember { mutableStateOf<TrainedMicrogpt?>(null) }
         var trainingSessionState by remember { mutableStateOf<MicrogptTrainingSession?>(null) }
@@ -195,6 +198,8 @@ fun App() {
         var resetGeneration by remember { mutableStateOf(0) }
         val coroutineScope = rememberCoroutineScope()
         val sampleRandomNumberGenerator = remember { Random(1) }
+
+        val contextWindowSize = 44
 
         LaunchedEffect(resetGeneration) {
             isTrainingActive = false
@@ -268,13 +273,13 @@ fun App() {
                                 .split(".")
                                 .filter { sentence -> excludeCharacters.none { it in sentence } }
                                 .map { sentence ->
-                                    sentence
+                                   sentence
                                         .replace("\n", "")
                                         .replace(",", "")
                                         .trim()
                                         .lowercase()
                                 }
-                                .filter { sentence -> sentence.length > 10 && sentence.contains(" ") }
+                                .filter { sentence -> sentence.length > 10 && sentence.contains(" ") && sentence.length < contextWindowSize }
                         }
 
                     // Keep the interactive demo in a toy-data regime so the scalar
@@ -289,10 +294,10 @@ fun App() {
                     validationSetDivisor = 20,
                     validationEvaluationDocumentCount = 8,
                     transformerConfig = TransformerConfig(
-                        layerCount = 2,
-                        embeddingSize = 24,
-                        contextWindowSize = 48,
-                        attentionHeadCount = 4
+                        layerCount = 4,
+                        embeddingSize = 32,
+                        contextWindowSize = contextWindowSize,
+                        attentionHeadCount = 8
                     ),
                     optimizerConfig = AdamOptimizerConfig(
                         learningRate = 0.01,
@@ -494,20 +499,31 @@ fun App() {
                 label = { Text("Prefix") },
                 singleLine = true,
             )
+            Text(
+                text = "Temperature ${formatRate(temperature.toDouble())}",
+                style = MaterialTheme.typography.labelMedium
+            )
+            Slider(
+                value = temperature,
+                onValueChange = { temperature = it },
+                valueRange = 0.1f..2.0f,
+                modifier = Modifier.fillMaxWidth()
+            )
             Button(
                 enabled = trainedMicrogpt != null && !isGeneratingSamples,
                 onClick = {
                     val model = trainedMicrogpt ?: return@Button
+                    val selectedTemperature = temperature.toDouble()
                     isGeneratingSamples = true
                     coroutineScope.launch {
                         try {
                             val generatedSamples = withContext(Dispatchers.Default) {
-                                generateMicrogptSamples(
+                                generateSamples(
                                     trainedMicrogpt = model,
                                     prefix = prefix,
                                     randomNumberGenerator = sampleRandomNumberGenerator,
                                     sampleCount = 10,
-                                    temperature = 0.5
+                                    temperature = selectedTemperature
                                 )
                             }
                             samples = generatedSamples

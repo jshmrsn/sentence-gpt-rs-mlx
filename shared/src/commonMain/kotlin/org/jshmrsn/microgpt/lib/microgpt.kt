@@ -889,6 +889,23 @@ fun applyAdamUpdate(
 }
 
 fun generateSamples(
+    trainedMicrogpt: TrainedMicrogpt,
+    prefix: String,
+    sampleCount: Int,
+    temperature: Double,
+    randomNumberGenerator: Random
+): List<String> =
+    generateSamples(
+        model = trainedMicrogpt.model,
+        config = trainedMicrogpt.config,
+        tokenizer = trainedMicrogpt.tokenizer,
+        prefix = prefix,
+        sampleCount = sampleCount,
+        temperature = temperature,
+        randomNumberGenerator = randomNumberGenerator
+    )
+
+fun generateSamples(
     model: TransformerModelParameters,
     config: TransformerConfig,
     tokenizer: CharacterTokenizer,
@@ -941,23 +958,6 @@ fun generateSample(
 
     return sample.toString()
 }
-
-fun generateSamples(
-    trainedMicrogpt: TrainedMicrogpt,
-    prefix: String,
-    sampleCount: Int,
-    temperature: Double,
-    randomNumberGenerator: Random
-): List<String> =
-    generateSamples(
-        model = trainedMicrogpt.model,
-        config = trainedMicrogpt.config,
-        tokenizer = trainedMicrogpt.tokenizer,
-        prefix = prefix,
-        sampleCount = sampleCount,
-        temperature = temperature,
-        randomNumberGenerator = randomNumberGenerator
-    )
 
 fun createMicrogptTrainingSession(
     inputDocuments: List<String>,
