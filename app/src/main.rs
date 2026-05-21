@@ -579,6 +579,7 @@ struct AppState {
     samples: Vec<String>,
     initialization_error: Option<String>,
     checkpoint_message: Option<String>,
+    snapshot_export_directory: Option<PathBuf>,
     sample_rng: ChaCha8Rng,
     training_document_page_rng: ChaCha8Rng,
 }
@@ -738,6 +739,11 @@ fn App() -> Element {
     let current_document_page = snapshot
         .training_document_page
         .min(document_page_count.saturating_sub(1));
+    let snapshot_export_directory_label = snapshot
+        .snapshot_export_directory
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "not selected".into());
 
     rsx! {
         style { "{CSS}" }
@@ -781,6 +787,22 @@ fn App() -> Element {
                         }
                         button {
                             class: "button secondary",
+                            disabled: snapshot.is_training_busy || snapshot.is_generating_samples,
+                            onclick: move |_| {
+                                // The native macOS dialog runs a nested event loop. Do not hold
+                                // a Dioxus signal borrow while it is open, or the background
+                                // `use_future` task can wake up and hit `AlreadyBorrowed`.
+                                if let Some(directory) = FileDialog::new()
+                                    .set_title("Select snapshot export directory")
+                                    .pick_folder()
+                                {
+                                    state.write().set_snapshot_export_directory(directory);
+                                }
+                            },
+                            "Snapshot dir"
+                        }
+                        button {
+                            class: "button secondary",
                             disabled: snapshot.session.is_none(),
                             onclick: move |_| state.write().toggle_network_value_visualization(),
                             if snapshot.visualize_network_values { "Values: On" } else { "Values: Off" }
@@ -820,6 +842,9 @@ fn App() -> Element {
                     }
                     div { class: "model-summary",
                         "Train examples {training_example_count} | validation examples {validation_example_count} | validation batch {validation_batch_count} | train batch {TRAINING_DOCUMENT_BATCH_SIZE}"
+                    }
+                    div { class: "model-summary",
+                        "Snapshot export: {snapshot_export_directory_label}"
                     }
                     if let Some(loss) = latest_loss {
                         {loss_metric_text("Train loss", loss, vocabulary_size)}
@@ -1018,6 +1043,7 @@ impl AppState {
                             samples: Vec::new(),
                             initialization_error: Some(error),
                             checkpoint_message: None,
+                            snapshot_export_directory: None,
                             sample_rng: ChaCha8Rng::seed_from_u64(1),
                             training_document_page_rng: ChaCha8Rng::seed_from_u64(2),
                         };
@@ -1043,6 +1069,7 @@ impl AppState {
                     samples: Vec::new(),
                     initialization_error: None,
                     checkpoint_message: None,
+                    snapshot_export_directory: None,
                     sample_rng: ChaCha8Rng::seed_from_u64(1),
                     training_document_page_rng: ChaCha8Rng::seed_from_u64(2),
                 }
@@ -1067,6 +1094,7 @@ impl AppState {
                 samples: Vec::new(),
                 initialization_error: Some(error),
                 checkpoint_message: None,
+                snapshot_export_directory: None,
                 sample_rng: ChaCha8Rng::seed_from_u64(1),
                 training_document_page_rng: ChaCha8Rng::seed_from_u64(2),
             },
@@ -1194,6 +1222,15 @@ impl AppState {
         }
     }
 
+    fn set_snapshot_export_directory(&mut self, directory: PathBuf) {
+        self.snapshot_export_directory = Some(directory.clone());
+        self.initialization_error = None;
+        self.checkpoint_message = Some(format!(
+            "Automatic validation snapshots will export to {}",
+            directory.display()
+        ));
+    }
+
     fn toggle_network_value_visualization(&mut self) {
         // Turning visualization on builds one snapshot immediately. Future
         // training chunks will refresh it only while the toggle stays on.
@@ -1255,6 +1292,8 @@ impl AppState {
         // latest UI state. That avoids drawing stale heatmaps after values were
         // hidden, and can build a fresh snapshot if values were just enabled.
         let is_complete = chunk_result.session.is_complete();
+        let completed_validation_step =
+            chunk_result.next_validation_step != self.next_validation_step;
         self.accumulated_training_millis += chunk_result.elapsed_millis;
         self.next_validation_step = chunk_result.next_validation_step;
         self.is_training_active = !is_complete && self.is_training_active;
@@ -1268,7 +1307,33 @@ impl AppState {
         } else {
             self.model_heatmaps.clear();
         }
+        if completed_validation_step {
+            self.export_validation_snapshot(&chunk_result.session);
+        }
         self.session = Some(chunk_result.session);
+    }
+
+    fn export_validation_snapshot(&mut self, session: &TrainingSession) {
+        let Some(directory) = self.snapshot_export_directory.clone() else {
+            return;
+        };
+        let path = directory.join(snapshot_checkpoint_file_name(session));
+        match session
+            .export_checkpoint()
+            .and_then(|checkpoint| save_checkpoint_to_path(&checkpoint, &path))
+        {
+            Ok(()) => {
+                self.initialization_error = None;
+                self.checkpoint_message = Some(format!(
+                    "Exported validation snapshot to {}",
+                    path.display()
+                ));
+            }
+            Err(error) => {
+                self.initialization_error = Some(format!("Snapshot export failed: {error}"));
+                self.checkpoint_message = None;
+            }
+        }
     }
 
     fn generate(&mut self) {
@@ -1449,6 +1514,7 @@ fn train_mlx_until_budget(
             .map_err(|error| error.to_string())?
             .expect("incomplete MLX session should produce a training step");
 
+        let mut validation_was_attached = false;
         if result.session.completed_step_count >= *next_validation_step {
             let validation_loss = calculate_mlx_validation_loss(
                 &result.session,
@@ -1458,9 +1524,11 @@ fn train_mlx_until_budget(
             .map_err(|error| error.to_string())?;
             result = attach_mlx_validation_loss(result, validation_loss);
             *next_validation_step += VALIDATION_STEP_INTERVAL;
+            validation_was_attached = true;
         }
 
         let should_stop = result.session.is_complete()
+            || validation_was_attached
             || result.session.completed_step_count >= *next_validation_step
             || frame_start.elapsed() >= TRAINING_FRAME_BUDGET;
         session = result.session;
@@ -1486,6 +1554,7 @@ fn train_cpu_until_budget(
         let mut result = train_microgpt_step(session, TRAINING_DOCUMENT_BATCH_SIZE)
             .expect("incomplete CPU session should produce a training step");
 
+        let mut validation_was_attached = false;
         if result.session.completed_step_count >= *next_validation_step {
             let validation_loss = calculate_cpu_validation_loss(
                 &result.session,
@@ -1494,9 +1563,11 @@ fn train_cpu_until_budget(
             );
             result = attach_cpu_validation_loss(result, validation_loss);
             *next_validation_step += VALIDATION_STEP_INTERVAL;
+            validation_was_attached = true;
         }
 
         let should_stop = result.session.is_complete()
+            || validation_was_attached
             || result.session.completed_step_count >= *next_validation_step
             || frame_start.elapsed() >= TRAINING_FRAME_BUDGET;
         session = result.session;
@@ -1540,9 +1611,8 @@ fn generate_samples_from_work(mut work: GenerationWork) -> Result<GenerationResu
 
 fn load_input_documents() -> Result<Vec<String>, String> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
-    let stories_path =
-        root.join("shared/src/commonMain/composeResources/files/input-stories-00.json");
-    let names_path = root.join("shared/src/commonMain/composeResources/files/input-names.txt");
+    let stories_path = root.join("data/input-stories-00.json");
+    let names_path = root.join("data/input-names.txt");
 
     if stories_path.exists() {
         let stories_json = std::fs::read_to_string(&stories_path)
@@ -1608,6 +1678,17 @@ fn checkpoint_file_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("microgpt-checkpoint.bin")
+}
+
+fn snapshot_checkpoint_file_name(session: &TrainingSession) -> String {
+    let timestamp = Local::now().format("%Y%m%d-%H%M%S");
+    let backend = session.backend().label().to_ascii_lowercase();
+    let step = session.completed_step_count();
+    let loss = session
+        .latest_loss()
+        .map(|loss| format!("{loss:.4}"))
+        .unwrap_or_else(|| "pending".into());
+    format!("microgpt-{backend}-{timestamp}-step-{step:06}-train-loss-{loss}.bin")
 }
 
 fn next_validation_step_after(completed_step_count: usize) -> usize {
