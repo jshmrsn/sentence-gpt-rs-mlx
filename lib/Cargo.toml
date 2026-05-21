@@ -1,0 +1,12 @@
+[package]
+name = "microgpt-lib"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rand.workspace = true
+rayon.workspace = true
+
+[dev-dependencies]
+rand_chacha.workspace = true

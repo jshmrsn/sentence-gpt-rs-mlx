@@ -1,48 +1,40 @@
-This is a Kotlin Multiplatform project targeting Android, iOS, Web, Desktop (JVM).
+# microgpt Rust Visualized
 
-* [/iosApp](./iosApp/iosApp) contains an iOS application. Even if you’re sharing your UI with Compose Multiplatform,
-  you need this entry point for your iOS app. This is also where you should add SwiftUI code for your project.
+This repository now contains a Rust port of the original Kotlin Multiplatform Compose microgpt demo.
 
-* [/shared](./shared/src) is for code that will be shared across your Compose Multiplatform applications.
-  It contains several subfolders:
-    - [commonMain](./shared/src/commonMain/kotlin) is for code that’s common for all targets.
-    - Other folders are for Kotlin code that will be compiled for only the platform indicated in the folder name.
-      For example, if you want to use Apple’s CoreCrypto for the iOS part of your Kotlin app,
-      the [iosMain](./shared/src/iosMain/kotlin) folder would be the right place for such calls.
-      Similarly, if you want to edit the Desktop (JVM) specific part, the [jvmMain](./shared/src/jvmMain/kotlin)
-      folder is the appropriate location.
+- `lib/` contains the CPU-only LLM training library.
+- `app/` contains the Dioxus desktop UI.
+- `shared/src/commonMain/composeResources/files/` is still used as the source for the bundled training data.
 
-### Running the apps
+The training implementation is deliberately dry Rust: scalar reverse-mode autograd, character tokenization, a small Transformer, cross-entropy loss, Adam updates, validation loss, and autoregressive sampling. It does not use tensor libraries or GPU acceleration.
 
-Use the run configurations provided by the run widget in your IDE's toolbar. You can also use these commands and
-options:
+## Run
 
-- Android app: `./gradlew :androidApp:assembleDebug`
-- Desktop app:
-    - Hot reload: `./gradlew :desktopApp:hotRun --auto`
-    - Standard run: `./gradlew :desktopApp:run`
-- Web app:
-    - Wasm target (faster, modern browsers): `./gradlew :webApp:wasmJsBrowserDevelopmentRun`
-    - JS target (slower, supports older browsers): `./gradlew :webApp:jsBrowserDevelopmentRun`
-- iOS app: open the [/iosApp](./iosApp) directory in Xcode and run it from there.
+```sh
+cargo run -p microgpt-app
+```
 
-### Running tests
+## Check And Test
 
-Use the run button in your IDE's editor gutter, or run tests using Gradle tasks:
+```sh
+cargo fmt --all -- --check
+cargo check -p microgpt-app
+cargo test --workspace
+```
 
-- Android tests: `./gradlew :shared:testAndroidHostTest`
-- Desktop tests: `./gradlew :shared:jvmTest`
-- Web tests:
-    - Wasm target: `./gradlew :shared:wasmJsTest`
-    - JS target: `./gradlew :shared:jsTest`
-- iOS tests: `./gradlew :shared:iosSimulatorArm64Test`
+## Project Shape
 
----
+The library mirrors the original Kotlin `shared/src/commonMain/kotlin/org/jshmrsn/microgpt/lib` logic:
 
-Learn more about [Kotlin Multiplatform](https://www.jetbrains.com/help/kotlin-multiplatform-dev/get-started.html),
-[Compose Multiplatform](https://github.com/JetBrains/compose-multiplatform/#compose-multiplatform),
-[Kotlin/Wasm](https://kotl.in/wasm/)…
+- `Value` is the scalar autograd node.
+- `TransformerModelParameters` owns token embeddings, position embeddings, attention weights, feed-forward weights, and the language-model head.
+- `train_microgpt_step` batches documents, accumulates gradients, and applies Adam on CPU.
+- `generate_sample` and `generate_samples` run autoregressive character sampling.
 
-We would appreciate your feedback on Compose/Web and Kotlin/Wasm in the public Slack
-channel [#compose-web](https://slack-chats.kotlinlang.org/c/compose-web).
-If you face any issues, please report them on [YouTrack](https://youtrack.jetbrains.com/newIssue?project=CMP).
+The Dioxus app mirrors the Compose UI flow:
+
+- Start, pause, reset, and chunk training controls.
+- Training and validation loss metrics.
+- Loss history chart.
+- Prefix and temperature sample generation.
+- Weight heatmaps for embeddings, language head, and each Transformer layer.

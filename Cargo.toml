@@ -1,0 +1,15 @@
+[workspace]
+members = ["lib", "app"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.1.0"
+
+[workspace.dependencies]
+rand = "0.8"
+rand_chacha = "0.3"
+rayon = "1.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
