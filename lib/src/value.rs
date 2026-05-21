@@ -2,13 +2,28 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
+// A `Value` is one number plus the information needed to differentiate it.
+// During the forward pass we build a graph of Nodes. For example, `a.mul(&b)`
+// creates a new node whose data is `a * b`, whose children are `a` and `b`, and
+// whose local gradients are `b` and `a`. Those local gradients are just the
+// high-school-calculus slopes of the operation with respect to each input:
+// d(a*b)/da = b and d(a*b)/db = a.
 #[derive(Debug)]
 struct Node {
+    // The actual numeric value computed during the forward pass.
     data: f64,
+    // Inputs that produced this value. Traversing these backward gives the
+    // computation graph.
     children: Vec<Value>,
+    // One slope per child. Multiplying these by the downstream gradient is the
+    // chain rule.
     local_gradients: Vec<f64>,
 }
 
+// Values are reference-counted so many later computations can point back to the
+// same earlier number without copying the whole graph. Equality and hashing use
+// pointer identity because two nodes with the same numeric data can represent
+// different parameters or different intermediate computations.
 #[derive(Clone, Debug)]
 pub struct Value(Arc<Node>);
 
@@ -27,6 +42,7 @@ impl Hash for Value {
 }
 
 impl Value {
+    // A leaf value has no children. Model parameters and constants start here.
     pub fn new(data: f64) -> Self {
         Self(Arc::new(Node {
             data,
@@ -35,6 +51,8 @@ impl Value {
         }))
     }
 
+    // Internal constructor for operations. `local_gradients[i]` must correspond
+    // to `children[i]`.
     fn with_children(data: f64, children: Vec<Value>, local_gradients: Vec<f64>) -> Self {
         Self(Arc::new(Node {
             data,
@@ -51,6 +69,8 @@ impl Value {
         Arc::as_ptr(&self.0) as usize
     }
 
+    // Addition sends the same downstream gradient to both inputs because
+    // d(a+b)/da = 1 and d(a+b)/db = 1.
     pub fn add(&self, other: &Value) -> Value {
         Value::with_children(
             self.data() + other.data(),
@@ -63,6 +83,8 @@ impl Value {
         self.add(&Value::new(other))
     }
 
+    // Multiplication is where the chain rule becomes visible: the slope with
+    // respect to the left input is the right input, and vice versa.
     pub fn mul(&self, other: &Value) -> Value {
         Value::with_children(
             self.data() * other.data(),
@@ -75,6 +97,8 @@ impl Value {
         self.mul(&Value::new(other))
     }
 
+    // Power, log, and exp provide enough calculus to build softmax,
+    // cross-entropy, normalization, and optimizer math.
     pub fn powf(&self, exponent: f64) -> Value {
         Value::with_children(
             self.data().powf(exponent),
@@ -120,6 +144,9 @@ impl Value {
         self.div(&Value::new(other))
     }
 
+    // Reverse-mode autodiff needs children to be visited before parents when
+    // preparing the backward pass. This topological order is like listing all
+    // recipe ingredients before the final dish.
     fn topological_order(&self) -> Vec<Value> {
         fn visit(node: &Value, visited: &mut HashSet<usize>, order: &mut Vec<Value>) {
             if !visited.insert(node.id()) {
@@ -137,6 +164,13 @@ impl Value {
         order
     }
 
+    // Compute d(self)/d(each node). Start with d(self)/d(self) = 1, then walk
+    // backward through the graph. Each edge applies:
+    //
+    // child_gradient += parent_gradient * local_gradient
+    //
+    // That is the chain rule in code. If a node influences the loss through
+    // multiple paths, the `+=` adds those paths together.
     pub fn backward(&self) -> HashMap<usize, f64> {
         let order = self.topological_order();
         let mut gradients = HashMap::from([(self.id(), 1.0)]);
@@ -152,6 +186,9 @@ impl Value {
         gradients
     }
 
+    // Training only needs gradients for model parameters, not every temporary
+    // value in the graph. The caller gives us the parameter node ids and we
+    // return a dense vector aligned with the model's flattened parameter order.
     pub fn backward_for(
         &self,
         parameter_index_by_value: &HashMap<usize, usize>,

@@ -1,3 +1,10 @@
+// Ratatui terminal app for the same training loop as the Dioxus UI.
+//
+// This is intentionally useful over SSH or in a plain terminal: it shows loss,
+// samples, backend choice, and optional parameter summaries without needing a
+// desktop renderer. The same production rule applies here: training runs on a
+// worker thread so input handling and rendering remain responsive.
+
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
@@ -181,6 +188,9 @@ struct TrainingChunkResult {
 
 struct App {
     session: TrainingSession,
+    // Matrix summaries are hidden by default because collecting them requires
+    // reading parameter tensors back for display. Press `v` when you want to
+    // inspect value ranges.
     matrix_summaries: Vec<MatrixSummary>,
     visualize_network_values: bool,
     is_training_active: bool,
@@ -352,6 +362,8 @@ impl App {
     }
 
     fn toggle_network_value_visualization(&mut self) {
+        // Build summaries immediately when toggled on; future training chunks
+        // will refresh them only while visualization remains enabled.
         self.visualize_network_values = !self.visualize_network_values;
         if self.visualize_network_values {
             self.matrix_summaries = build_matrix_summaries(&self.session);
@@ -383,6 +395,8 @@ impl App {
     }
 
     fn start_training_worker_if_needed(&mut self) {
+        // Generation waits until the current training worker finishes. This
+        // avoids concurrent MLX access to the same logical model state.
         if self.generation_requested && !self.is_training_busy {
             self.generation_requested = false;
             self.generate_now();
@@ -395,6 +409,9 @@ impl App {
     }
 
     fn spawn_training_worker(&mut self) {
+        // The worker owns a clone of the current session and returns a complete
+        // replacement session. The UI thread never mutates model parameters while
+        // training math is running.
         let session = self.session.clone();
         let next_validation_step = self.next_validation_step;
         let visualize_network_values = self.visualize_network_values;
@@ -621,6 +638,8 @@ fn render_loss(frame: &mut Frame<'_>, app: &App, area: Rect) {
 }
 
 fn render_model(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    // Keeping this panel mounted but empty-by-default makes the cost model
+    // obvious to the user: values are available, but not free.
     if !app.visualize_network_values {
         frame.render_widget(
             Paragraph::new("Hidden. Press v to show model value summaries.")
@@ -722,6 +741,9 @@ fn train_session_until_budget(
     mut next_validation_step: usize,
     visualize_network_values: bool,
 ) -> Result<TrainingChunkResult, String> {
+    // A chunk is deliberately bounded by wall-clock time. Continuous training is
+    // implemented as many small chunks, which lets the terminal process input
+    // and redraw metrics between updates.
     let chunk_start = Instant::now();
     let frame_start = Instant::now();
     let session = match session {

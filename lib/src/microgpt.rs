@@ -1,28 +1,60 @@
+//! Plain Rust reference implementation of a tiny character-level Transformer.
+//!
+//! This file intentionally keeps the math direct instead of hiding it behind a
+//! neural-network framework. A training step is:
+//!
+//! 1. Convert each sentence into token ids.
+//! 2. Run the Transformer forward one character at a time.
+//! 3. Measure how surprised the model was with cross-entropy loss.
+//! 4. Use reverse-mode autodiff to get one gradient per parameter.
+//! 5. Use AdamW to move parameters in the direction that lowers loss.
+//!
+//! The model is small enough to read end-to-end, but it uses real production
+//! ideas: embeddings, residual connections, RMSNorm, multi-head attention,
+//! rotary position embeddings, SwiGLU feed-forward blocks, gradient clipping,
+//! weight decay, warmup, cosine learning-rate decay, validation loss, and
+//! constrained sampling.
+
 use crate::value::Value;
 use rand::Rng;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use std::collections::HashMap;
 use std::f64::consts::PI;
 
+// A matrix is stored as rows of scalar autodiff Values. The shape convention in
+// this file is `[output_size][input_size]`, so `linear(input, weights)` computes
+// one dot product per row.
 pub type Matrix = Vec<Vec<Value>>;
+// During autoregressive generation/training, each layer remembers all previous
+// keys and values. This is the same idea as a KV cache in production LLM
+// inference, just stored in plain Rust vectors.
 pub type KeyValueCache = Vec<Vec<Vec<Value>>>;
 
+// Gradient clipping limits one bad batch from producing a huge update. Top-k
+// sampling and the minimum length rule make short demo samples easier to read.
 const MAX_GRADIENT_NORM: f64 = 1.0;
 const SAMPLING_TOP_K: usize = 8;
 const MIN_GENERATED_CHARACTER_COUNT: usize = 8;
 
 #[derive(Clone, Debug)]
 pub struct AttentionParameters {
+    // Query, key, and value are three learned projections of the same hidden
+    // state. Attention compares query to keys, then mixes values.
     pub query_weights: Matrix,
     pub key_weights: Matrix,
     pub value_weights: Matrix,
+    // After all heads are concatenated, this projects the result back into the
+    // normal embedding size so the residual stream shape stays constant.
     pub output_projection_weights: Matrix,
 }
 
 #[derive(Clone, Debug)]
 pub struct FeedForwardParameters {
+    // SwiGLU uses two parallel projections. `expansion_weights` creates candidate
+    // features; `gate_weights` decides which candidate features should pass.
     pub expansion_weights: Matrix,
     pub gate_weights: Matrix,
+    // Projection returns the wider feed-forward vector to the embedding size.
     pub projection_weights: Matrix,
 }
 
@@ -34,8 +66,13 @@ pub struct TransformerLayerParameters {
 
 #[derive(Clone, Debug)]
 pub struct TransformerModelParameters {
+    // Token embeddings answer: "what character is this?"
     pub token_embedding: Matrix,
+    // Learned absolute position embeddings answer: "where are we in the
+    // sequence?" RoPE below also injects position into attention comparisons.
     pub position_embedding: Matrix,
+    // The language-model head maps the final hidden state to one score per next
+    // character. Those scores are logits, not probabilities yet.
     pub language_model_head: Matrix,
     pub layers: Vec<TransformerLayerParameters>,
 }
@@ -48,6 +85,10 @@ impl TransformerModelParameters {
         layer_count: usize,
         random_number_generator: &mut impl Rng,
     ) -> Self {
+        // Good initialization keeps early activations from exploding or
+        // collapsing. Small embeddings keep early token vectors gentle; projection
+        // std scales with hidden size; residual projections shrink as layers grow
+        // so many residual additions do not swamp the signal.
         let embedding_std = 0.02;
         let feed_forward_size = 3 * embedding_size;
         let projection_std = (1.0 / embedding_size as f64).sqrt();
@@ -125,6 +166,9 @@ impl TransformerModelParameters {
         }
     }
 
+    // Flatten every trainable scalar into a stable order. Optimizers and
+    // autodiff gradients operate on flat lists; `with_values` below rebuilds the
+    // structured model afterward.
     pub fn values(&self) -> Vec<Value> {
         let mut values = Vec::new();
         push_matrix_values(&mut values, &self.token_embedding);
@@ -142,6 +186,8 @@ impl TransformerModelParameters {
         values
     }
 
+    // Rebuild the nested model with replacement parameter Values in the exact
+    // same order produced by `values`.
     fn with_values(&self, values: Vec<Value>) -> Self {
         let mut value_index = 0;
         let mut next_matrix = |matrix: &Matrix| {
@@ -192,9 +238,16 @@ impl TransformerModelParameters {
 
 #[derive(Clone, Debug)]
 pub struct TransformerConfig {
+    // Number of repeated Transformer blocks.
     pub layer_count: usize,
+    // Width of every token/hidden vector. Larger width increases capacity and
+    // compute.
     pub embedding_size: usize,
+    // Maximum number of characters the model can condition on in one pass.
     pub context_window_size: usize,
+    // Attention splits the embedding into heads. Each head can learn a different
+    // kind of relationship, such as "previous word starts here" or "copy this
+    // vowel pattern".
     pub attention_head_count: usize,
     pub attention_head_size: usize,
 }
@@ -233,7 +286,11 @@ impl TransformerConfig {
 
 #[derive(Clone, Debug)]
 pub struct CharacterTokenizer {
+    // This toy model deliberately uses characters, not subwords. That makes the
+    // vocabulary tiny and easy to inspect, but it makes long-range language
+    // harder because words span many time steps.
     pub unique_characters: Vec<char>,
+    // A single special token marks both start-of-sequence and end-of-sequence.
     pub sequence_boundary_token_id: usize,
     pub character_to_token_id: HashMap<char, usize>,
 }
@@ -258,6 +315,8 @@ impl CharacterTokenizer {
     }
 
     pub fn encode_document(&self, document: &str) -> Vec<usize> {
+        // The boundary token at the start teaches the model how sentences begin.
+        // The boundary token at the end teaches it when to stop generating.
         let mut encoded = Vec::with_capacity(document.chars().count() + 2);
         encoded.push(self.sequence_boundary_token_id);
         encoded.extend(
@@ -272,18 +331,31 @@ impl CharacterTokenizer {
 
 #[derive(Clone, Debug)]
 pub struct AdamOptimizerState {
+    // Adam keeps an exponential moving average of gradients. This is momentum:
+    // repeated pushes in the same direction reinforce each other.
     pub first_moment_estimates: Vec<f64>,
+    // Adam also tracks squared gradients, so parameters with consistently large
+    // gradients get smaller effective steps.
     pub second_moment_estimates: Vec<f64>,
 }
 
 #[derive(Clone, Debug)]
 pub struct AdamOptimizerConfig {
+    // The base step size before warmup/cosine scheduling.
     pub learning_rate: f64,
+    // Usually called beta1.
     pub first_moment_decay: f64,
+    // Usually called beta2.
     pub second_moment_decay: f64,
+    // Prevents division by zero when squared-gradient estimates are tiny.
     pub epsilon: f64,
+    // AdamW-style decoupled weight decay gently pulls parameters toward zero.
+    // This can improve generalization and reduce runaway weights.
     pub weight_decay: f64,
+    // Warmup starts with smaller updates, useful while optimizer moments are
+    // still uncalibrated.
     pub warmup_step_count: usize,
+    // Cosine decay never drops below this fraction of the base learning rate.
     pub minimum_learning_rate_ratio: f64,
 }
 
@@ -359,6 +431,7 @@ pub struct AdamUpdateResult {
 
 #[derive(Clone, Debug)]
 pub struct TransformerRun {
+    // One raw score per vocabulary item for "the next token is ...".
     pub logits: Vec<Value>,
     pub keys: KeyValueCache,
     pub values: KeyValueCache,
@@ -393,6 +466,9 @@ pub fn random_gaussian(
     mean: f64,
     standard_deviation: f64,
 ) -> f64 {
+    // Box-Muller turns two uniform random numbers in [0, 1) into one bell-curve
+    // random number. Neural weights usually start with a zero-centered normal
+    // distribution so positive and negative signals are balanced.
     let mut first_uniform_sample = 0.0;
     while first_uniform_sample == 0.0 {
         first_uniform_sample = random_number_generator.gen::<f64>();
@@ -434,6 +510,12 @@ pub fn matrix(
 }
 
 pub fn linear(input_vector: &[Value], weights: &[Vec<Value>]) -> Vec<Value> {
+    // A linear layer is just many weighted sums. If the input has values
+    // [x1, x2, x3], one output row computes:
+    //
+    // y = w1*x1 + w2*x2 + w3*x3
+    //
+    // No activation happens here; this is pure matrix-vector multiplication.
     weights
         .iter()
         .map(|row| {
@@ -447,6 +529,10 @@ pub fn linear(input_vector: &[Value], weights: &[Vec<Value>]) -> Vec<Value> {
 }
 
 pub fn softmax(logits: &[Value]) -> Vec<Value> {
+    // Logits are arbitrary scores. Softmax converts them into probabilities:
+    // exp(score_i) / sum(exp(all scores)). Subtracting the max score first keeps
+    // `exp` from overflowing; it does not change the final probabilities because
+    // the same constant is subtracted from every score.
     let max_logit_value = logits
         .iter()
         .map(Value::data)
@@ -465,6 +551,10 @@ pub fn softmax(logits: &[Value]) -> Vec<Value> {
 }
 
 pub fn cross_entropy_loss(logits: &[Value], target_token_id: usize) -> Value {
+    // Cross-entropy is "how surprised was the model by the correct answer?"
+    // If the model assigned probability 1.0 to the target, loss is 0. If it
+    // assigned probability near 0, loss is large. This log-sum-exp form is the
+    // numerically stable equivalent of `-log(softmax(logits)[target])`.
     let max_logit_value = logits
         .iter()
         .map(Value::data)
@@ -479,6 +569,10 @@ pub fn cross_entropy_loss(logits: &[Value], target_token_id: usize) -> Value {
 }
 
 pub fn rmsnorm(input_vector: &[Value]) -> Vec<Value> {
+    // RMSNorm rescales a vector so its root-mean-square magnitude is near 1.
+    // It does not change direction much; it mainly keeps layer inputs in a
+    // predictable numeric range, which makes deep residual networks easier to
+    // train.
     let mean_square = input_vector
         .iter()
         .fold(Value::new(0.0), |sum, value| sum.add(&value.mul(value)))
@@ -488,6 +582,9 @@ pub fn rmsnorm(input_vector: &[Value]) -> Vec<Value> {
 }
 
 pub fn weighted_choice(weights: &[f64], random_number_generator: &mut impl Rng) -> usize {
+    // Sampling chooses an index with probability proportional to its weight.
+    // Example: weights [0.1, 0.7, 0.2] will choose index 1 most often, but not
+    // always. That controlled randomness is why generated text varies.
     let total: f64 = weights.iter().sum();
     let mut random_threshold = random_number_generator.gen::<f64>() * total;
     for (weight_index, weight) in weights.iter().enumerate() {
@@ -511,6 +608,9 @@ pub fn run_transformer_model(
     keys: KeyValueCache,
     values: KeyValueCache,
 ) -> TransformerRun {
+    // Forward pass for one time step. The model sees the current token and the
+    // current position, updates the KV cache, then returns logits for the next
+    // token. Training calls this repeatedly over a sentence.
     let token_embedding = &model.token_embedding[token_id];
     let position_embedding = &model.position_embedding[position_id];
     let mut hidden_state: Vec<_> = token_embedding
@@ -554,6 +654,13 @@ pub fn run_transformer_layer(
     mut keys: KeyValueCache,
     mut values: KeyValueCache,
 ) -> TransformerLayerRun {
+    // A pre-norm Transformer block:
+    //
+    // residual -> RMSNorm -> attention -> add residual
+    //          -> RMSNorm -> feed-forward -> add residual
+    //
+    // Residual additions let each block make an incremental edit instead of
+    // relearning the whole representation from scratch.
     let residual_state = hidden_state.to_vec();
     let normalized_state = rmsnorm(hidden_state);
 
@@ -569,6 +676,7 @@ pub fn run_transformer_layer(
     );
     let value = linear(&normalized_state, &layer.attention.value_weights);
 
+    // Store this step's key/value so future positions can attend to it.
     keys[layer_index].push(key);
     values[layer_index].push(value);
 
@@ -588,6 +696,9 @@ pub fn run_transformer_layer(
     let normalized_state = rmsnorm(&updated_hidden_state);
     let expanded_output = linear(&normalized_state, &layer.feed_forward.expansion_weights);
     let gated_output = linear(&normalized_state, &layer.feed_forward.gate_weights);
+    // SwiGLU: silu(candidate) * gate. The multiplication lets the model suppress
+    // or emphasize features depending on context, which is more expressive than
+    // a plain ReLU MLP at similar compute.
     let block_output = expanded_output
         .iter()
         .zip(gated_output.iter())
@@ -614,6 +725,9 @@ pub fn run_multi_head_attention(
     values: &[Vec<Value>],
     config: &TransformerConfig,
 ) -> Vec<Value> {
+    // Multi-head attention is the same attention operation repeated over slices
+    // of the vector. With embedding 64 and 16 heads, each head sees 4 numbers.
+    // Concatenating the head outputs restores the full embedding width.
     (0..config.attention_head_count)
         .flat_map(|head_index| {
             let head_start_index = head_index * config.attention_head_size;
@@ -651,6 +765,10 @@ pub fn attention_logits(
     head_keys: &[Vec<Value>],
     attention_head_size: usize,
 ) -> Vec<Value> {
+    // A dot product is large when two vectors point in similar directions. Here
+    // query dot key asks: "how relevant is that previous position to this one?"
+    // Dividing by sqrt(head_size) keeps logits from growing just because vectors
+    // have more dimensions.
     head_keys
         .iter()
         .map(|previous_key| {
@@ -668,6 +786,9 @@ pub fn weighted_head_value_sum(
     head_values: &[Vec<Value>],
     head_value_index: usize,
 ) -> Value {
+    // Attention weights are probabilities over previous time steps. The output
+    // is the weighted average of value vectors, so the model can copy or blend
+    // information from earlier characters.
     head_values.iter().enumerate().fold(
         Value::new(0.0),
         |weighted_value_sum, (time_index, head_value)| {
@@ -682,6 +803,10 @@ pub fn apply_rotary_position_embedding(
     position_id: usize,
     config: &TransformerConfig,
 ) -> Vec<Value> {
+    // RoPE encodes position by rotating pairs of numbers in each attention head.
+    // Nearby positions get similar rotations; farther positions get different
+    // rotations. Because the same rotation rule is applied to queries and keys,
+    // their dot product can express relative distance between characters.
     let mut rotated = vector.to_vec();
     let pair_count = config.attention_head_size / 2;
     for head_index in 0..config.attention_head_count {
@@ -706,6 +831,9 @@ pub fn apply_rotary_position_embedding(
 }
 
 pub fn silu(value: &Value) -> Value {
+    // SiLU(x) = x * sigmoid(x). It is a smooth activation: negative values are
+    // damped, positive values mostly pass through, and gradients do not abruptly
+    // jump at zero like ReLU.
     let sigmoid = value.neg().exp().add_f64(1.0).powf(-1.0);
     value.mul(&sigmoid)
 }
@@ -715,6 +843,9 @@ fn training_batch_documents(
     step: usize,
     batch_document_count: usize,
 ) -> Vec<String> {
+    // This deterministic batching scheme cycles through the shuffled document
+    // list. It avoids extra randomness during a run, which makes learning curves
+    // easier to reproduce while still exposing all documents over time.
     let batch_start_index = (step * batch_document_count) % documents.len();
     (0..batch_document_count)
         .map(|batch_offset| documents[(batch_start_index + batch_offset) % documents.len()].clone())
@@ -729,6 +860,8 @@ fn train_on_document_with_gradients(
     parameter_index_by_value: &HashMap<usize, usize>,
     parameter_count: usize,
 ) -> DocumentTrainingResult {
+    // One document produces one scalar loss. Calling backward on that loss tells
+    // us how every parameter should change to reduce surprise on this document.
     let loss = train_on_document(model, config, tokenizer, document);
     DocumentTrainingResult {
         loss: loss.data(),
@@ -740,6 +873,15 @@ pub fn train_microgpt_step(
     session: MicrogptTrainingSession,
     batch_document_count: usize,
 ) -> Option<MicrogptTrainingStepResult> {
+    // A training step is mini-batch gradient descent:
+    //
+    // - pick several documents,
+    // - compute each document's gradients,
+    // - average those gradients,
+    // - update the model once.
+    //
+    // Averaging makes the update less noisy than learning from one example at a
+    // time, while still being much cheaper than using the whole dataset.
     if session.is_complete() {
         return None;
     }
@@ -750,6 +892,9 @@ pub fn train_microgpt_step(
 
     let step = session.completed_step_count;
     let parameters = session.trained_microgpt.model.values();
+    // `Value::backward_for` returns gradients by node id. This map tells it which
+    // graph nodes are trainable parameters and where they live in the flat
+    // parameter vector.
     let parameter_index_by_value: HashMap<_, _> = parameters
         .iter()
         .enumerate()
@@ -758,6 +903,8 @@ pub fn train_microgpt_step(
     let batch_documents = training_batch_documents(&session.documents, step, batch_document_count);
     let parameter_count = parameters.len();
 
+    // Each document builds an independent scalar computation graph, so CPU
+    // training can parallelize documents safely with Rayon.
     let document_results: Vec<_> = batch_documents
         .par_iter()
         .map(|document| {
@@ -779,6 +926,8 @@ pub fn train_microgpt_step(
         / document_results.len() as f64;
     let mut accumulated_parameter_gradients = vec![0.0; parameter_count];
 
+    // Sum gradients for matching parameters across documents, then divide by
+    // batch size to get the mean gradient.
     for document_result in &document_results {
         for (parameter_index, gradient) in document_result.parameter_gradients.iter().enumerate() {
             accumulated_parameter_gradients[parameter_index] += gradient;
@@ -835,6 +984,9 @@ pub fn train_on_document(
     tokenizer: &CharacterTokenizer,
     document: &str,
 ) -> Value {
+    // Teacher forcing: at position t, feed the true token from the document and
+    // ask the model to predict token t+1. This is how language models learn from
+    // plain text without hand-written labels.
     let tokens = tokenizer.encode_document(document);
     let prediction_step_count = config
         .context_window_size
@@ -850,6 +1002,7 @@ pub fn train_on_document(
         keys = model_run.keys;
         values = model_run.values;
         let position_loss = cross_entropy_loss(&model_run.logits, target_token_id);
+        // Total document loss is the average surprise across positions.
         loss = loss.add(&position_loss);
     }
 
@@ -870,6 +1023,9 @@ pub fn calculate_validation_loss(
     completed_step_count: usize,
     validation_step_interval: usize,
 ) -> Option<f64> {
+    // Validation documents are held out from training. If training loss improves
+    // but validation loss worsens, the model may be memorizing the training set
+    // instead of learning general patterns.
     if session.validation_documents.is_empty() {
         return None;
     }
@@ -909,6 +1065,8 @@ pub fn attach_validation_loss(
     mut result: MicrogptTrainingStepResult,
     validation_loss: Option<f64>,
 ) -> MicrogptTrainingStepResult {
+    // Training workers can compute validation less often than every step. This
+    // helper attaches a validation result to the most recent progress entry.
     let Some(validation_loss) = validation_loss else {
         return result;
     };
@@ -930,6 +1088,15 @@ pub fn apply_adam_update(
     step: usize,
     training_step_count: usize,
 ) -> AdamUpdateResult {
+    // AdamW update, in words:
+    //
+    // 1. Clip the whole gradient vector if it is too large.
+    // 2. Update moving averages of gradient and squared gradient.
+    // 3. Bias-correct those averages because they start at zero.
+    // 4. Divide by the square-root squared-gradient average so noisy parameters
+    //    get smaller steps.
+    // 5. Add decoupled weight decay.
+    // 6. Subtract the update from each parameter.
     let parameters = model.values();
     let clipped_gradients = clipped_gradients(gradients, MAX_GRADIENT_NORM);
     let step_learning_rate = scheduled_learning_rate(optimizer_config, step, training_step_count);
@@ -939,6 +1106,7 @@ pub fn apply_adam_update(
         .enumerate()
         .map(|(parameter_index, parameter)| {
             let gradient = clipped_gradients[parameter_index];
+            // Exponential moving average: new_average = mostly_old + little_new.
             let first_moment_estimate = optimizer_config.first_moment_decay
                 * optimizer_state.first_moment_estimates[parameter_index]
                 + (1.0 - optimizer_config.first_moment_decay) * gradient;
@@ -946,6 +1114,8 @@ pub fn apply_adam_update(
                 * optimizer_state.second_moment_estimates[parameter_index]
                 + (1.0 - optimizer_config.second_moment_decay) * gradient.powi(2);
 
+            // Bias correction matters early in training because both moving
+            // averages start at zero, which would otherwise make them too small.
             let bias_corrected_first_moment = first_moment_estimate
                 / (1.0 - optimizer_config.first_moment_decay.powf(step as f64 + 1.0));
             let bias_corrected_second_moment = second_moment_estimate
@@ -988,6 +1158,9 @@ pub fn scheduled_learning_rate(
     step: usize,
     training_step_count: usize,
 ) -> f64 {
+    // Warmup ramps linearly from small steps to the base learning rate. After
+    // warmup, cosine decay smoothly lowers the rate. This gives fast early
+    // learning and gentler late fine-tuning.
     let warmup_step_count = optimizer_config.warmup_step_count.min(training_step_count);
     if warmup_step_count > 0 && step < warmup_step_count {
         return optimizer_config.learning_rate * (step + 1) as f64 / warmup_step_count as f64;
@@ -1003,6 +1176,10 @@ pub fn scheduled_learning_rate(
 }
 
 fn clipped_gradients(gradients: &[f64], max_norm: f64) -> Vec<f64> {
+    // Treat all parameter gradients as one long vector and measure its length.
+    // If the length is above `max_norm`, scale the entire vector down while
+    // preserving direction. This is like saying "take the same step direction,
+    // just not that far."
     let norm = gradients
         .iter()
         .map(|gradient| gradient * gradient)
@@ -1046,6 +1223,10 @@ pub fn generate_sample(
     temperature: f64,
     random_number_generator: &mut impl Rng,
 ) -> String {
+    // Generation is autoregressive: start from a boundary token, repeatedly ask
+    // for next-token probabilities, sample one token, append it, and feed it
+    // back in. The same KV cache idea used during training avoids recomputing
+    // all previous keys and values at each position.
     let mut keys = create_key_value_cache(config.layer_count);
     let mut values = create_key_value_cache(config.layer_count);
     let mut token_id = tokenizer.sequence_boundary_token_id;
@@ -1064,10 +1245,15 @@ pub fn generate_sample(
         values = model_run.values;
 
         if let Some(prefix_character) = normalized_prefix.chars().nth(position_id) {
+            // A prefix is forced into the context. The model consumes those
+            // characters before it is allowed to sample freely.
             token_id = tokenizer.character_to_token_id[&prefix_character];
             continue;
         }
 
+        // Temperature changes confidence. Lower than 1 sharpens probabilities
+        // and makes output more predictable; higher than 1 flattens them and
+        // makes output more random.
         let scaled_logits: Vec<_> = model_run
             .logits
             .iter()
@@ -1099,6 +1285,9 @@ pub fn apply_sampling_constraints(
     sample: &str,
     prefix_character_count: usize,
 ) {
+    // These constraints are not learned by the model; they are demo-time guard
+    // rails. Production systems often use similar decoding rules for format,
+    // safety, or style requirements.
     if probabilities.is_empty() {
         return;
     }
@@ -1128,6 +1317,9 @@ pub fn apply_sampling_constraints(
 }
 
 fn keep_top_k(probabilities: &mut [f64], top_k: usize) {
+    // Top-k sampling discards every token except the k most likely. It is a
+    // simple way to prevent very unlikely characters from creating unreadable
+    // samples while keeping some randomness.
     if top_k == 0 || probabilities.len() <= top_k {
         return;
     }
@@ -1143,6 +1335,9 @@ fn keep_top_k(probabilities: &mut [f64], top_k: usize) {
 }
 
 pub fn normalize_training_document(document: &str) -> String {
+    // Keep this dataset intentionally simple: lowercase a-z plus spaces. A
+    // production tokenizer would preserve far more information, but this tiny
+    // character vocabulary makes every token and probability easy to inspect.
     let mut normalized = String::with_capacity(document.len());
     let mut previous_was_space = true;
 
@@ -1168,6 +1363,9 @@ pub fn create_microgpt_training_session(
     transformer_config: TransformerConfig,
     optimizer_config: AdamOptimizerConfig,
 ) -> MicrogptTrainingSession {
+    // Session creation owns data preparation: normalize text, shuffle once,
+    // split held-out validation examples, build the character vocabulary, then
+    // initialize model parameters and optimizer state.
     let trimmed_documents: Vec<_> = input_documents
         .into_iter()
         .map(|document| normalize_training_document(&document))

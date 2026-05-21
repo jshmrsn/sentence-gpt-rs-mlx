@@ -1,3 +1,10 @@
+// Dioxus desktop app for watching the tiny Transformer train.
+//
+// The ML concepts live in `microgpt-lib`; this file is mainly about turning
+// training into an interactive learning tool. The important production lesson
+// here is scheduling: training and sample generation are CPU/GPU-heavy work, so
+// they run in blocking worker tasks while the UI stays responsive.
+
 use dioxus::prelude::*;
 use microgpt_lib::microgpt::{
     attach_validation_loss as attach_cpu_validation_loss,
@@ -483,11 +490,16 @@ struct ModelHeatmap {
 struct AppState {
     backend: Backend,
     session: Option<TrainingSession>,
+    // Full parameter heatmaps require copying model values to the UI and drawing
+    // many small cells. That is excellent for inspection but expensive during
+    // training, so it is opt-in.
     model_heatmaps: Vec<ModelHeatmap>,
     visualize_network_values: bool,
     is_training_active: bool,
     is_training_busy: bool,
     manual_training_chunk_requested: bool,
+    // Generation is queued behind training so MLX is not asked to train and
+    // sample from the same model concurrently.
     generation_requested: bool,
     is_generating_samples: bool,
     next_validation_step: usize,
@@ -510,6 +522,7 @@ struct Story {
 
 struct TrainingChunkResult {
     session: TrainingSession,
+    // Empty unless `visualize_network_values` was enabled when the worker began.
     model_heatmaps: Vec<ModelHeatmap>,
     visualized_network_values: bool,
     next_validation_step: usize,
@@ -538,6 +551,9 @@ fn App() -> Element {
 
     use_future(move || async move {
         loop {
+            // Generation has priority once the current training chunk finishes.
+            // This gives the user fast feedback without interrupting an in-flight
+            // optimizer update.
             let generation_work = {
                 let mut current = state.write();
                 current.take_generation_work()
@@ -573,6 +589,8 @@ fn App() -> Element {
             };
 
             if let Some((session, next_validation_step, visualize_network_values)) = training_work {
+                // `spawn_blocking` keeps the Dioxus/Tokio UI runtime from being
+                // monopolized by MLX or CPU matrix math.
                 match tokio::task::spawn_blocking(move || {
                     train_session_until_budget(
                         session,
@@ -996,6 +1014,8 @@ impl AppState {
     }
 
     fn toggle_network_value_visualization(&mut self) {
+        // Turning visualization on builds one snapshot immediately. Future
+        // training chunks will refresh it only while the toggle stays on.
         self.visualize_network_values = !self.visualize_network_values;
         if self.visualize_network_values {
             self.model_heatmaps = self
@@ -1025,6 +1045,8 @@ impl AppState {
     }
 
     fn take_training_work(&mut self) -> Option<(TrainingSession, usize, bool)> {
+        // Clone the session for the worker. The UI keeps ownership of state and
+        // replaces it only when the worker returns a complete updated session.
         if self.is_training_busy {
             return None;
         }
@@ -1048,6 +1070,9 @@ impl AppState {
     }
 
     fn apply_training_chunk(&mut self, chunk_result: TrainingChunkResult) {
+        // If the user toggled visualization while a worker was running, honor the
+        // latest UI state. That avoids drawing stale heatmaps after values were
+        // hidden, and can build a fresh snapshot if values were just enabled.
         let is_complete = chunk_result.session.is_complete();
         self.accumulated_training_millis += chunk_result.elapsed_millis;
         self.next_validation_step = chunk_result.next_validation_step;
@@ -1197,6 +1222,9 @@ fn train_session_until_budget(
     mut next_validation_step: usize,
     visualize_network_values: bool,
 ) -> Result<TrainingChunkResult, String> {
+    // One background chunk trains until the frame budget expires. The app then
+    // yields back to the UI, updates metrics, and queues another chunk if
+    // continuous training is active.
     let chunk_start = Instant::now();
     let frame_start = Instant::now();
     let session = match session {
@@ -1591,6 +1619,8 @@ fn model_visualization(
     heatmaps: &[ModelHeatmap],
     completed_step_count: usize,
 ) -> Element {
+    // Even when heatmaps are hidden, keep the compact architecture summary
+    // visible so learners can relate loss curves to model size.
     let Some(session) = session else {
         return rsx! { div { class: "model-summary", "Initializing model" } };
     };
