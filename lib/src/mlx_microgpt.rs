@@ -815,6 +815,7 @@ pub fn calculate_document_loss(
         input_tokens: vec![tokenizer.sequence_boundary_token_id; config.context_window_size],
         target_tokens: vec![tokenizer.sequence_boundary_token_id; config.context_window_size],
         loss_mask: vec![0.0; config.context_window_size],
+        batch_offset: 0,
     });
     let model_values = model.values();
     let rotary_position_matrices = rotary_position_matrices(config);

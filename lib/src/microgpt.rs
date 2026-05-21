@@ -40,6 +40,7 @@ pub type KeyValueCache = Vec<Vec<Vec<Value>>>;
 const MAX_GRADIENT_NORM: f64 = 1.0;
 const SAMPLING_TOP_K: usize = 8;
 const MIN_GENERATED_CHARACTER_COUNT: usize = 8;
+const RESIDUAL_DROPOUT_PROBABILITY: f64 = 0.05;
 
 #[derive(Clone, Debug)]
 pub struct AttentionParameters {
@@ -788,11 +789,25 @@ struct DocumentTrainingResult {
     parameter_gradients: Vec<f64>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct CpuDropoutContext {
+    step: usize,
+    batch_offset: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LayerForwardContext {
+    layer_index: usize,
+    position_id: usize,
+    dropout_context: Option<CpuDropoutContext>,
+}
+
 #[derive(Clone, Debug)]
 pub struct TrainingTokenWindow {
     pub input_tokens: Vec<usize>,
     pub target_tokens: Vec<usize>,
     pub loss_mask: Vec<f64>,
+    pub(crate) batch_offset: usize,
 }
 
 pub struct ParameterUpdate {
@@ -1111,6 +1126,18 @@ pub fn run_transformer_model(
     keys: KeyValueCache,
     values: KeyValueCache,
 ) -> TransformerRun {
+    run_transformer_model_with_dropout(model, config, token_id, position_id, keys, values, None)
+}
+
+fn run_transformer_model_with_dropout(
+    model: &TransformerModelParameters,
+    config: &TransformerConfig,
+    token_id: usize,
+    position_id: usize,
+    keys: KeyValueCache,
+    values: KeyValueCache,
+    dropout_context: Option<CpuDropoutContext>,
+) -> TransformerRun {
     // Forward pass for one time step. The model sees the current token and the
     // current position, updates the KV cache, then returns logits for the next
     // token. Training calls this repeatedly over a sentence.
@@ -1122,8 +1149,11 @@ pub fn run_transformer_model(
         let layer_run = run_transformer_layer(
             &hidden_state,
             &model.layers[layer_index],
-            layer_index,
-            position_id,
+            LayerForwardContext {
+                layer_index,
+                position_id,
+                dropout_context,
+            },
             config,
             current_keys,
             current_values,
@@ -1145,11 +1175,10 @@ pub fn run_transformer_model(
     }
 }
 
-pub fn run_transformer_layer(
+fn run_transformer_layer(
     hidden_state: &[Value],
     layer: &TransformerLayerParameters,
-    layer_index: usize,
-    position_id: usize,
+    layer_context: LayerForwardContext,
     config: &TransformerConfig,
     mut keys: KeyValueCache,
     mut values: KeyValueCache,
@@ -1170,7 +1199,7 @@ pub fn run_transformer_layer(
             &layer.attention.query_weights,
             &layer.attention.query_biases,
         ),
-        position_id,
+        layer_context.position_id,
         config,
     );
     let key = apply_rotary_position_embedding(
@@ -1179,7 +1208,7 @@ pub fn run_transformer_layer(
             &layer.attention.key_weights,
             &layer.attention.key_biases,
         ),
-        position_id,
+        layer_context.position_id,
         config,
     );
     let value = linear(
@@ -1189,15 +1218,26 @@ pub fn run_transformer_layer(
     );
 
     // Store this step's key/value so future positions can attend to it.
-    keys[layer_index].push(key);
-    values[layer_index].push(value);
+    keys[layer_context.layer_index].push(key);
+    values[layer_context.layer_index].push(value);
 
-    let attention_output =
-        run_multi_head_attention(&query, &keys[layer_index], &values[layer_index], config);
-    let block_output = linear(
+    let attention_output = run_multi_head_attention(
+        &query,
+        &keys[layer_context.layer_index],
+        &values[layer_context.layer_index],
+        config,
+    );
+    let mut block_output = linear(
         &attention_output,
         &layer.attention.output_projection_weights,
         &layer.attention.output_projection_biases,
+    );
+    apply_cpu_residual_dropout(
+        &mut block_output,
+        layer_context.dropout_context,
+        layer_context.layer_index,
+        layer_context.position_id,
+        0,
     );
     let mut updated_hidden_state: Vec<_> = block_output
         .iter()
@@ -1225,10 +1265,17 @@ pub fn run_transformer_layer(
         .zip(gated_output.iter())
         .map(|(expanded_value, gate_value)| silu(expanded_value).mul(gate_value))
         .collect::<Vec<_>>();
-    let block_output = linear(
+    let mut block_output = linear(
         &block_output,
         &layer.feed_forward.projection_weights,
         &layer.feed_forward.projection_biases,
+    );
+    apply_cpu_residual_dropout(
+        &mut block_output,
+        layer_context.dropout_context,
+        layer_context.layer_index,
+        layer_context.position_id,
+        1,
     );
 
     updated_hidden_state = block_output
@@ -1363,6 +1410,55 @@ pub fn silu(value: &Value) -> Value {
     value.mul(&sigmoid)
 }
 
+fn apply_cpu_residual_dropout(
+    values: &mut [Value],
+    dropout_context: Option<CpuDropoutContext>,
+    layer_index: usize,
+    position_id: usize,
+    stream: usize,
+) {
+    let Some(dropout_context) = dropout_context else {
+        return;
+    };
+    let keep_probability = 1.0 - RESIDUAL_DROPOUT_PROBABILITY;
+    for (channel_index, value) in values.iter_mut().enumerate() {
+        let random = deterministic_unit_float(
+            dropout_context.step,
+            dropout_context.batch_offset,
+            layer_index,
+            position_id,
+            stream,
+            channel_index,
+        );
+        let multiplier = if random < keep_probability {
+            1.0 / keep_probability
+        } else {
+            0.0
+        };
+        *value = value.mul_f64(multiplier);
+    }
+}
+
+fn deterministic_unit_float(
+    step: usize,
+    batch_offset: usize,
+    layer_index: usize,
+    position_id: usize,
+    stream: usize,
+    channel_index: usize,
+) -> f64 {
+    let mixed = splitmix64(
+        (step as u64)
+            .wrapping_mul(0xa076_1d64_78bd_642f)
+            .wrapping_add((batch_offset as u64).wrapping_mul(0xe703_7ed1_a0b4_28db))
+            .wrapping_add((layer_index as u64).wrapping_mul(0x8ebc_6af0_9c88_c6e3))
+            .wrapping_add((position_id as u64).wrapping_mul(0x5899_65cc_7537_4cc3))
+            .wrapping_add((stream as u64).wrapping_mul(0x1d8e_4e27_c47d_124f))
+            .wrapping_add(channel_index as u64),
+    );
+    ((mixed >> 11) as f64) / ((1_u64 << 53) as f64)
+}
+
 pub fn training_batch_token_windows(
     documents: &[String],
     tokenizer: &CharacterTokenizer,
@@ -1417,6 +1513,7 @@ fn token_window_from_tokens(
         input_tokens,
         target_tokens,
         loss_mask,
+        batch_offset,
     }
 }
 
@@ -1444,13 +1541,22 @@ fn splitmix64(mut value: u64) -> u64 {
 fn train_on_document_with_gradients(
     model: &TransformerModelParameters,
     config: &TransformerConfig,
+    step: usize,
     token_window: &TrainingTokenWindow,
     parameter_index_by_value: &HashMap<usize, usize>,
     parameter_count: usize,
 ) -> DocumentTrainingResult {
     // One document produces one scalar loss. Calling backward on that loss tells
     // us how every parameter should change to reduce surprise on this document.
-    let loss = train_on_token_window(model, config, token_window);
+    let loss = train_on_token_window_with_dropout(
+        model,
+        config,
+        token_window,
+        Some(CpuDropoutContext {
+            step,
+            batch_offset: token_window.batch_offset,
+        }),
+    );
     DocumentTrainingResult {
         loss: loss.data(),
         parameter_gradients: loss.backward_for(parameter_index_by_value, parameter_count),
@@ -1505,6 +1611,7 @@ pub fn train_microgpt_step(
             train_on_document_with_gradients(
                 &session.trained_microgpt.model,
                 &session.trained_microgpt.config,
+                step,
                 token_window,
                 &parameter_index_by_value,
                 parameter_count,
@@ -1596,6 +1703,15 @@ pub fn train_on_token_window(
     config: &TransformerConfig,
     token_window: &TrainingTokenWindow,
 ) -> Value {
+    train_on_token_window_with_dropout(model, config, token_window, None)
+}
+
+fn train_on_token_window_with_dropout(
+    model: &TransformerModelParameters,
+    config: &TransformerConfig,
+    token_window: &TrainingTokenWindow,
+    dropout_context: Option<CpuDropoutContext>,
+) -> Value {
     let mut keys = create_key_value_cache(config.layer_count);
     let mut values = create_key_value_cache(config.layer_count);
     let mut loss = Value::new(0.0);
@@ -1605,7 +1721,15 @@ pub fn train_on_token_window(
         let mask = token_window.loss_mask[position_id];
         let token_id = token_window.input_tokens[position_id];
         let target_token_id = token_window.target_tokens[position_id];
-        let model_run = run_transformer_model(model, config, token_id, position_id, keys, values);
+        let model_run = run_transformer_model_with_dropout(
+            model,
+            config,
+            token_id,
+            position_id,
+            keys,
+            values,
+            dropout_context,
+        );
         keys = model_run.keys;
         values = model_run.values;
         let position_loss = cross_entropy_loss(&model_run.logits, target_token_id);
