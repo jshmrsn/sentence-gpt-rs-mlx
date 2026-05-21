@@ -14,11 +14,14 @@ use std::time::{Duration, Instant};
 const TRAINING_FRAME_BUDGET: Duration = Duration::from_millis(500);
 const VALIDATION_STEP_INTERVAL: usize = 50;
 const TRAINING_DOCUMENT_BATCH_SIZE: usize = 16;
-const MAX_DOCUMENT_COUNT: usize = 2_000;
+const MAX_DOCUMENT_COUNT: usize = 3000;
 const MAX_TRAINING_STEP_COUNT: usize = 8_000;
 const VALIDATION_SET_DIVISOR: usize = 20;
 const VALIDATION_EVALUATION_DOCUMENT_COUNT: usize = 8;
 const CONTEXT_WINDOW_SIZE: usize = 64;
+const LAYER_COUNT: usize = 3;
+const ATTENTION_HEADS: usize = 8;
+const EMBEDDING_SIZE: usize = 64;
 
 const CSS: &str = r#"
 :root {
@@ -257,6 +260,8 @@ button, input {
 struct AppState {
     session: Option<MicrogptTrainingSession>,
     is_training_active: bool,
+    is_training_busy: bool,
+    manual_training_chunk_requested: bool,
     is_generating_samples: bool,
     next_validation_step: usize,
     accumulated_training_millis: u128,
@@ -273,6 +278,12 @@ struct Story {
     source: String,
 }
 
+struct TrainingChunkResult {
+    session: MicrogptTrainingSession,
+    next_validation_step: usize,
+    elapsed_millis: u128,
+}
+
 fn main() {
     dioxus::launch(App);
 }
@@ -283,17 +294,26 @@ fn App() -> Element {
 
     use_future(move || async move {
         loop {
-            let should_train = {
-                let current = state.read();
-                current.is_training_active
-                    && current
-                        .session
-                        .as_ref()
-                        .is_some_and(|session| !session.is_complete())
+            let training_work = {
+                let mut current = state.write();
+                current.take_training_work()
             };
 
-            if should_train {
-                state.write().train_until_budget();
+            if let Some((session, next_validation_step)) = training_work {
+                match tokio::task::spawn_blocking(move || {
+                    train_session_until_budget(session, next_validation_step)
+                })
+                .await
+                {
+                    Ok(chunk_result) => state.write().apply_training_chunk(chunk_result),
+                    Err(error) => {
+                        let mut current = state.write();
+                        current.is_training_active = false;
+                        current.is_training_busy = false;
+                        current.initialization_error =
+                            Some(format!("training worker failed: {error}"));
+                    }
+                }
             }
 
             tokio::time::sleep(Duration::from_millis(16)).await;
@@ -365,8 +385,8 @@ fn App() -> Element {
                         }
                         button {
                             class: "button secondary",
-                            disabled: snapshot.session.is_none() || is_complete,
-                            onclick: move |_| state.write().train_until_budget(),
+                            disabled: snapshot.session.is_none() || is_complete || snapshot.is_training_busy,
+                            onclick: move |_| state.write().request_training_chunk(),
                             "Step chunk"
                         }
                         button {
@@ -462,7 +482,7 @@ fn App() -> Element {
 impl AppState {
     fn initialize() -> Self {
         let mut rng = ChaCha8Rng::seed_from_u64(1);
-        let transformer_config = TransformerConfig::new(3, 32, CONTEXT_WINDOW_SIZE, 8)
+        let transformer_config = TransformerConfig::new(LAYER_COUNT, EMBEDDING_SIZE, CONTEXT_WINDOW_SIZE, ATTENTION_HEADS)
             .expect("valid built-in transformer config");
         let optimizer_config = AdamOptimizerConfig {
             learning_rate: 0.006,
@@ -492,6 +512,8 @@ impl AppState {
                 Self {
                     session: Some(session),
                     is_training_active: false,
+                    is_training_busy: false,
+                    manual_training_chunk_requested: false,
                     is_generating_samples: false,
                     next_validation_step: VALIDATION_STEP_INTERVAL,
                     accumulated_training_millis: 0,
@@ -505,6 +527,8 @@ impl AppState {
             Err(error) => Self {
                 session: None,
                 is_training_active: false,
+                is_training_busy: false,
+                manual_training_chunk_requested: false,
                 is_generating_samples: false,
                 next_validation_step: VALIDATION_STEP_INTERVAL,
                 accumulated_training_millis: 0,
@@ -529,52 +553,36 @@ impl AppState {
         self.is_training_active = !self.is_training_active;
     }
 
-    fn train_until_budget(&mut self) {
-        let Some(mut session) = self.session.take() else {
-            return;
-        };
+    fn request_training_chunk(&mut self) {
+        self.manual_training_chunk_requested = true;
+    }
+
+    fn take_training_work(&mut self) -> Option<(MicrogptTrainingSession, usize)> {
+        if self.is_training_busy {
+            return None;
+        }
+        let session = self.session.as_ref()?;
         if session.is_complete() {
             self.is_training_active = false;
-            self.session = Some(session);
-            return;
+            self.manual_training_chunk_requested = false;
+            return None;
+        }
+        if !self.is_training_active && !self.manual_training_chunk_requested {
+            return None;
         }
 
-        let chunk_start = Instant::now();
-        let frame_start = Instant::now();
-        let mut latest_result = None;
+        self.is_training_busy = true;
+        self.manual_training_chunk_requested = false;
+        Some((session.clone(), self.next_validation_step))
+    }
 
-        loop {
-            let Some(result) = train_microgpt_step(session.clone(), TRAINING_DOCUMENT_BATCH_SIZE)
-            else {
-                break;
-            };
-            session = result.session.clone();
-            latest_result = Some(result);
-
-            if session.is_complete()
-                || session.completed_step_count >= self.next_validation_step
-                || frame_start.elapsed() >= TRAINING_FRAME_BUDGET
-            {
-                break;
-            }
-        }
-
-        if let Some(mut result) = latest_result {
-            if session.completed_step_count >= self.next_validation_step {
-                let validation_loss = calculate_validation_loss(
-                    &session,
-                    session.completed_step_count,
-                    VALIDATION_STEP_INTERVAL,
-                );
-                result = attach_validation_loss(result, validation_loss);
-                session = result.session;
-                self.next_validation_step += VALIDATION_STEP_INTERVAL;
-            }
-        }
-
-        self.accumulated_training_millis += chunk_start.elapsed().as_millis();
-        self.is_training_active = !session.is_complete() && self.is_training_active;
-        self.session = Some(session);
+    fn apply_training_chunk(&mut self, chunk_result: TrainingChunkResult) {
+        let is_complete = chunk_result.session.is_complete();
+        self.accumulated_training_millis += chunk_result.elapsed_millis;
+        self.next_validation_step = chunk_result.next_validation_step;
+        self.is_training_active = !is_complete && self.is_training_active;
+        self.is_training_busy = false;
+        self.session = Some(chunk_result.session);
     }
 
     fn generate(&mut self) {
@@ -598,7 +606,8 @@ impl AppState {
         match &self.session {
             None => "Initializing".into(),
             Some(session) if session.is_complete() => "Ready".into(),
-            Some(_) if self.is_training_active => "Training".into(),
+            Some(_) if self.is_training_busy => "Training".into(),
+            Some(_) if self.is_training_active => "Training queued".into(),
             Some(_) => "Paused".into(),
         }
     }
@@ -642,6 +651,50 @@ impl AppState {
             .as_ref()
             .map(|session| session.progress_history.as_slice())
             .unwrap_or(&[])
+    }
+}
+
+fn train_session_until_budget(
+    mut session: MicrogptTrainingSession,
+    mut next_validation_step: usize,
+) -> TrainingChunkResult {
+    let chunk_start = Instant::now();
+    let frame_start = Instant::now();
+    let mut latest_result = None;
+
+    loop {
+        let Some(result) = train_microgpt_step(session.clone(), TRAINING_DOCUMENT_BATCH_SIZE)
+        else {
+            break;
+        };
+        session = result.session.clone();
+        latest_result = Some(result);
+
+        if session.is_complete()
+            || session.completed_step_count >= next_validation_step
+            || frame_start.elapsed() >= TRAINING_FRAME_BUDGET
+        {
+            break;
+        }
+    }
+
+    if let Some(mut result) = latest_result {
+        if session.completed_step_count >= next_validation_step {
+            let validation_loss = calculate_validation_loss(
+                &session,
+                session.completed_step_count,
+                VALIDATION_STEP_INTERVAL,
+            );
+            result = attach_validation_loss(result, validation_loss);
+            session = result.session;
+            next_validation_step += VALIDATION_STEP_INTERVAL;
+        }
+    }
+
+    TrainingChunkResult {
+        session,
+        next_validation_step,
+        elapsed_millis: chunk_start.elapsed().as_millis(),
     }
 }
 
