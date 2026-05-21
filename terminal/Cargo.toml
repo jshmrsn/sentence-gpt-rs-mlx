@@ -11,5 +11,3 @@ microgpt-lib = { path = "../lib" }
 rand.workspace = true
 rand_chacha.workspace = true
 ratatui = "0.30"
-serde.workspace = true
-serde_json.workspace = true

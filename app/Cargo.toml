@@ -12,8 +12,6 @@ microgpt-lib = { path = "../lib" }
 rand.workspace = true
 rand_chacha.workspace = true
 rfd = "0.15"
-serde.workspace = true
-serde_json.workspace = true
 tokio = { version = "1", features = ["time"] }
 
 [features]

@@ -8,354 +8,31 @@
 use chrono::Local;
 use dioxus::prelude::*;
 use microgpt_config::{
-    get_optimizer_config, AdamOptimizerConfig, ATTENTION_HEADS, CONTEXT_WINDOW_SIZE,
-    EMBEDDING_SIZE, LAYER_COUNT, MAX_DOCUMENT_COUNT, MAX_TRAINING_STEP_COUNT,
-    TRAINING_DOCUMENT_BATCH_SIZE, TRAINING_FRAME_BUDGET, VALIDATION_EVALUATION_DOCUMENT_COUNT,
-    VALIDATION_SET_DIVISOR, VALIDATION_STEP_INTERVAL,
+    create_training_session, format_compact, format_count, format_learning_rate, format_loss,
+    format_percent, format_percent_style, get_optimizer_config, load_input_documents,
+    next_validation_step_after, running_mean_loss,
+    train_session_until_budget as train_shared_session_until_budget, Backend, TrainedSnapshot,
+    TrainingSession, ATTENTION_HEADS, CONTEXT_WINDOW_SIZE, EMBEDDING_SIZE, LAYER_COUNT,
+    TRAINING_DOCUMENT_BATCH_SIZE, VALIDATION_STEP_INTERVAL,
 };
-use microgpt_lib::checkpoint::{
-    load_checkpoint_from_path, save_checkpoint_to_path, CheckpointBackend,
-};
+use microgpt_lib::checkpoint::{load_checkpoint_from_path, save_checkpoint_to_path};
 use microgpt_lib::microgpt::{
-    attach_validation_loss as attach_cpu_validation_loss,
-    calculate_training_loss_baseline as calculate_cpu_training_loss_baseline,
-    calculate_validation_loss as calculate_cpu_validation_loss, create_microgpt_training_session,
-    export_training_session_checkpoint as export_cpu_training_session_checkpoint,
-    generate_samples as generate_cpu_samples,
-    import_training_session_checkpoint as import_cpu_training_session_checkpoint,
-    scheduled_learning_rate, train_microgpt_step, CharacterTokenizer, Matrix,
-    MicrogptTrainingProgress, MicrogptTrainingSession, TrainedMicrogpt, TransformerConfig, Vector,
+    generate_samples as generate_cpu_samples, Matrix, MicrogptTrainingProgress, TrainedMicrogpt,
+    TransformerConfig, Vector,
 };
 use microgpt_lib::mlx_microgpt::{
-    attach_validation_loss as attach_mlx_validation_loss,
-    calculate_validation_loss as calculate_mlx_validation_loss,
-    create_mlx_microgpt_training_session,
-    export_training_session_checkpoint as export_mlx_training_session_checkpoint,
-    generate_samples as generate_mlx_samples,
-    import_training_session_checkpoint as import_mlx_training_session_checkpoint,
-    matrix_heatmaps as build_mlx_matrix_heatmaps, train_mlx_microgpt_step, MlxMatrixHeatmap,
-    MlxMicrogptTrainingSession, MlxTrainedMicrogpt,
+    generate_samples as generate_mlx_samples, matrix_heatmaps as build_mlx_matrix_heatmaps,
+    MlxMatrixHeatmap,
 };
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use rfd::FileDialog;
-use serde::Deserialize;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-const CSS: &str = r#"
-:root {
-    font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    color: #17202a;
-    background: #edf4ef;
-}
+mod styles;
 
-body {
-    margin: 0;
-}
-
-button, input {
-    font: inherit;
-}
-
-.app {
-    min-height: 100vh;
-    background: #edf4ef;
-}
-
-.shell {
-    width: min(1180px, calc(100vw - 32px));
-    margin: 0 auto;
-    padding: 20px 0 40px;
-}
-
-.topbar {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 16px;
-    margin-bottom: 16px;
-}
-
-.title {
-    margin: 0;
-    font-size: 24px;
-    line-height: 1.2;
-    font-weight: 760;
-}
-
-.subtitle {
-    margin: 6px 0 0;
-    color: #53645c;
-    font-size: 14px;
-}
-
-.actions {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 8px;
-    justify-content: flex-end;
-}
-
-.button {
-    border: 1px solid #28533f;
-    background: #28533f;
-    color: #fff;
-    border-radius: 6px;
-    padding: 8px 12px;
-    cursor: pointer;
-}
-
-.button.secondary {
-    background: #fff;
-    color: #28533f;
-}
-
-.button:disabled {
-    opacity: 0.55;
-    cursor: default;
-}
-
-.panel {
-    background: rgba(255, 255, 255, 0.78);
-    border: 1px solid #cfdcd3;
-    border-radius: 8px;
-    padding: 14px;
-    margin-bottom: 14px;
-}
-
-.status-grid {
-    display: grid;
-    grid-template-columns: repeat(5, minmax(0, 1fr));
-    gap: 10px;
-}
-
-.metric {
-    border-left: 3px solid #28533f;
-    padding-left: 10px;
-}
-
-.metric-label {
-    color: #53645c;
-    font-size: 12px;
-}
-
-.metric-value {
-    font-size: 18px;
-    font-weight: 720;
-}
-
-.progress-track {
-    height: 10px;
-    border-radius: 999px;
-    background: #d5e2d9;
-    overflow: hidden;
-    margin: 12px 0 8px;
-}
-
-.progress-fill {
-    height: 100%;
-    background: #28533f;
-}
-
-.chart {
-    width: 100%;
-    height: 180px;
-    border: 1px solid #d3ded7;
-    border-radius: 6px;
-    background: #fbfdfb;
-}
-
-.controls {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) 220px auto;
-    gap: 12px;
-    align-items: end;
-}
-
-.model-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: 12px;
-}
-
-.field label {
-    display: block;
-    margin-bottom: 5px;
-    font-size: 12px;
-    color: #53645c;
-}
-
-.text-input {
-    width: 100%;
-    box-sizing: border-box;
-    border: 1px solid #b9c8bf;
-    border-radius: 6px;
-    padding: 8px 10px;
-    background: #fff;
-}
-
-.range {
-    width: 100%;
-}
-
-.samples {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 8px;
-}
-
-.sample {
-    background: #fbfdfb;
-    border: 1px solid #d3ded7;
-    border-radius: 6px;
-    padding: 8px 10px;
-    min-height: 22px;
-}
-
-.document-list {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 8px;
-}
-
-.document-controls {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-    margin: 8px 0 12px;
-}
-
-.page-button {
-    border: 1px solid #b9c8bf;
-    background: #fff;
-    color: #28533f;
-    border-radius: 6px;
-    padding: 5px 8px;
-    cursor: pointer;
-    min-width: 34px;
-}
-
-.document-item {
-    display: grid;
-    grid-template-columns: 46px minmax(0, 1fr);
-    gap: 8px;
-    background: #fbfdfb;
-    border: 1px solid #d3ded7;
-    border-radius: 6px;
-    padding: 8px 10px;
-}
-
-.document-index {
-    color: #53645c;
-    font-size: 12px;
-    font-variant-numeric: tabular-nums;
-}
-
-.document-text {
-    color: #17202a;
-    font-size: 13px;
-    line-height: 1.35;
-    overflow-wrap: anywhere;
-}
-
-.section-title {
-    margin: 0 0 8px;
-    font-size: 16px;
-    font-weight: 720;
-}
-
-.model-summary {
-    color: #53645c;
-    font-size: 13px;
-    margin-bottom: 12px;
-}
-
-.heatmap-groups {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 12px;
-}
-
-.heatmap-card {
-    min-width: 0;
-}
-
-.heatmap-label {
-    display: flex;
-    justify-content: space-between;
-    gap: 8px;
-    color: #314238;
-    font-size: 12px;
-    margin-bottom: 4px;
-}
-
-.heatmap {
-    display: grid;
-    height: 120px;
-    border: 1px solid #d3ded7;
-    border-radius: 6px;
-    overflow: hidden;
-    background: #f7faf8;
-}
-
-.cell {
-    min-width: 1px;
-    min-height: 1px;
-}
-
-.layer {
-    margin-top: 16px;
-}
-
-@media (max-width: 820px) {
-    .topbar, .controls {
-        display: block;
-    }
-
-    .actions {
-        justify-content: flex-start;
-        margin-top: 12px;
-    }
-
-    .status-grid, .heatmap-groups, .samples, .document-list {
-        grid-template-columns: 1fr;
-    }
-
-    .field {
-        margin-bottom: 10px;
-    }
-}
-"#;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Backend {
-    Mlx,
-    Cpu,
-}
-
-impl Backend {
-    fn label(self) -> &'static str {
-        match self {
-            Backend::Mlx => "MLX",
-            Backend::Cpu => "CPU",
-        }
-    }
-
-    fn toggled(self) -> Self {
-        match self {
-            Backend::Mlx => Backend::Cpu,
-            Backend::Cpu => Backend::Mlx,
-        }
-    }
-}
-
-#[derive(Clone)]
-enum TrainingSession {
-    Mlx(MlxMicrogptTrainingSession),
-    Cpu(MicrogptTrainingSession),
-}
+use styles::CSS;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DocumentBrowserDataset {
@@ -379,182 +56,13 @@ impl DocumentBrowserDataset {
     }
 }
 
-impl TrainingSession {
-    fn backend(&self) -> Backend {
+impl DocumentBrowserDataset {
+    fn documents_from(self, session: &TrainingSession) -> &[String] {
         match self {
-            TrainingSession::Mlx(_) => Backend::Mlx,
-            TrainingSession::Cpu(_) => Backend::Cpu,
+            DocumentBrowserDataset::Training => session.training_documents(),
+            DocumentBrowserDataset::Validation => session.validation_documents(),
         }
     }
-
-    fn is_complete(&self) -> bool {
-        match self {
-            TrainingSession::Mlx(session) => session.is_complete(),
-            TrainingSession::Cpu(session) => session.is_complete(),
-        }
-    }
-
-    fn completed_step_count(&self) -> usize {
-        match self {
-            TrainingSession::Mlx(session) => session.completed_step_count,
-            TrainingSession::Cpu(session) => session.completed_step_count,
-        }
-    }
-
-    fn training_step_count(&self) -> usize {
-        match self {
-            TrainingSession::Mlx(session) => session.training_step_count,
-            TrainingSession::Cpu(session) => session.training_step_count,
-        }
-    }
-
-    fn latest_loss(&self) -> Option<f64> {
-        match self {
-            TrainingSession::Mlx(session) => session.latest_loss,
-            TrainingSession::Cpu(session) => session.latest_loss,
-        }
-    }
-
-    fn latest_validation_loss(&self) -> Option<f64> {
-        match self {
-            TrainingSession::Mlx(session) => session.latest_validation_loss,
-            TrainingSession::Cpu(session) => session.latest_validation_loss,
-        }
-    }
-
-    fn training_document_count(&self) -> usize {
-        match self {
-            TrainingSession::Mlx(session) => session.documents.len(),
-            TrainingSession::Cpu(session) => session.documents.len(),
-        }
-    }
-
-    fn training_documents(&self) -> &[String] {
-        match self {
-            TrainingSession::Mlx(session) => session.documents.as_slice(),
-            TrainingSession::Cpu(session) => session.documents.as_slice(),
-        }
-    }
-
-    fn validation_documents(&self) -> &[String] {
-        match self {
-            TrainingSession::Mlx(session) => session.validation_documents.as_slice(),
-            TrainingSession::Cpu(session) => session.validation_documents.as_slice(),
-        }
-    }
-
-    fn documents_for_browser(&self, dataset: DocumentBrowserDataset) -> &[String] {
-        match dataset {
-            DocumentBrowserDataset::Training => self.training_documents(),
-            DocumentBrowserDataset::Validation => self.validation_documents(),
-        }
-    }
-
-    fn validation_document_count(&self) -> usize {
-        match self {
-            TrainingSession::Mlx(session) => session.validation_documents.len(),
-            TrainingSession::Cpu(session) => session.validation_documents.len(),
-        }
-    }
-
-    fn validation_evaluation_document_count(&self) -> usize {
-        match self {
-            TrainingSession::Mlx(session) => session
-                .validation_evaluation_document_count
-                .min(session.validation_documents.len()),
-            TrainingSession::Cpu(session) => session
-                .validation_evaluation_document_count
-                .min(session.validation_documents.len()),
-        }
-    }
-
-    fn tokenizer(&self) -> &CharacterTokenizer {
-        match self {
-            TrainingSession::Mlx(session) => &session.trained_microgpt.tokenizer,
-            TrainingSession::Cpu(session) => &session.trained_microgpt.tokenizer,
-        }
-    }
-
-    fn config(&self) -> &TransformerConfig {
-        match self {
-            TrainingSession::Mlx(session) => &session.trained_microgpt.config,
-            TrainingSession::Cpu(session) => &session.trained_microgpt.config,
-        }
-    }
-
-    fn parameter_count(&self) -> usize {
-        match self {
-            TrainingSession::Mlx(session) => session
-                .trained_microgpt
-                .model
-                .values()
-                .iter()
-                .map(|array| {
-                    array
-                        .shape()
-                        .iter()
-                        .map(|dimension| *dimension as usize)
-                        .product::<usize>()
-                })
-                .sum(),
-            TrainingSession::Cpu(session) => session.trained_microgpt.model.parameter_count(),
-        }
-    }
-
-    fn current_learning_rate(&self) -> f64 {
-        match self {
-            TrainingSession::Mlx(session) => scheduled_learning_rate(
-                &session.optimizer_config,
-                session.completed_step_count,
-                session.training_step_count,
-            ),
-            TrainingSession::Cpu(session) => scheduled_learning_rate(
-                &session.optimizer_config,
-                session.completed_step_count,
-                session.training_step_count,
-            ),
-        }
-    }
-
-    fn progress_history(&self) -> &[MicrogptTrainingProgress] {
-        match self {
-            TrainingSession::Mlx(session) => session.progress_history.as_slice(),
-            TrainingSession::Cpu(session) => session.progress_history.as_slice(),
-        }
-    }
-
-    fn trained_snapshot(&self) -> TrainedSnapshot {
-        match self {
-            TrainingSession::Mlx(session) => TrainedSnapshot::Mlx(session.trained_microgpt.clone()),
-            TrainingSession::Cpu(session) => TrainedSnapshot::Cpu(session.trained_microgpt.clone()),
-        }
-    }
-
-    fn export_checkpoint(&self) -> Result<microgpt_lib::checkpoint::MicrogptCheckpoint, String> {
-        match self {
-            TrainingSession::Mlx(session) => export_mlx_training_session_checkpoint(session),
-            TrainingSession::Cpu(session) => Ok(export_cpu_training_session_checkpoint(session)),
-        }
-    }
-
-    fn import_checkpoint(
-        checkpoint: &microgpt_lib::checkpoint::MicrogptCheckpoint,
-    ) -> Result<Self, String> {
-        match checkpoint.backend {
-            CheckpointBackend::Mlx => {
-                import_mlx_training_session_checkpoint(checkpoint).map(TrainingSession::Mlx)
-            }
-            CheckpointBackend::Cpu => Ok(TrainingSession::Cpu(
-                import_cpu_training_session_checkpoint(checkpoint)?,
-            )),
-        }
-    }
-}
-
-#[derive(Clone)]
-enum TrainedSnapshot {
-    Mlx(MlxTrainedMicrogpt),
-    Cpu(TrainedMicrogpt),
 }
 
 #[derive(Clone)]
@@ -598,12 +106,6 @@ struct AppState {
     snapshot_export_directory: Option<PathBuf>,
     sample_rng: ChaCha8Rng,
     training_document_page_rng: ChaCha8Rng,
-}
-
-#[derive(Deserialize)]
-struct Story {
-    story: String,
-    source: String,
 }
 
 struct TrainingChunkResult {
@@ -1180,11 +682,7 @@ impl AppState {
     fn browser_document_count(&self) -> usize {
         self.session
             .as_ref()
-            .map(|session| {
-                session
-                    .documents_for_browser(self.document_browser_dataset)
-                    .len()
-            })
+            .map(|session| self.document_browser_dataset.documents_from(session).len())
             .unwrap_or(0)
     }
 
@@ -1195,7 +693,7 @@ impl AppState {
     fn browser_documents(&self) -> &[String] {
         self.session
             .as_ref()
-            .map(|session| session.documents_for_browser(self.document_browser_dataset))
+            .map(|session| self.document_browser_dataset.documents_from(session))
             .unwrap_or(&[])
     }
 
@@ -1471,160 +969,28 @@ impl AppState {
     }
 }
 
-fn create_training_session(
-    input_documents: Vec<String>,
-    rng: &mut ChaCha8Rng,
-    backend: Backend,
-    transformer_config: TransformerConfig,
-    optimizer_config: AdamOptimizerConfig,
-) -> Result<TrainingSession, String> {
-    match backend {
-        Backend::Mlx => create_mlx_microgpt_training_session(
-            input_documents,
-            rng,
-            MAX_TRAINING_STEP_COUNT,
-            VALIDATION_SET_DIVISOR,
-            VALIDATION_EVALUATION_DOCUMENT_COUNT,
-            transformer_config,
-            optimizer_config,
-        )
-        .with_initial_progress()
-        .map(TrainingSession::Mlx)
-        .map_err(|error| error.to_string()),
-        Backend::Cpu => {
-            let mut session = create_microgpt_training_session(
-                input_documents,
-                rng,
-                MAX_TRAINING_STEP_COUNT,
-                VALIDATION_SET_DIVISOR,
-                VALIDATION_EVALUATION_DOCUMENT_COUNT,
-                transformer_config,
-                optimizer_config,
-            );
-            let train_loss = calculate_cpu_training_loss_baseline(&session);
-            let validation_loss =
-                calculate_cpu_validation_loss(&session, 0, VALIDATION_STEP_INTERVAL);
-            session = session.with_initial_progress(train_loss, validation_loss);
-            Ok(TrainingSession::Cpu(session))
-        }
-    }
-}
-
 fn train_session_until_budget(
     session: TrainingSession,
-    mut next_validation_step: usize,
+    next_validation_step: usize,
     visualize_network_values: bool,
 ) -> Result<TrainingChunkResult, String> {
     // One background chunk trains until the frame budget expires. The app then
     // yields back to the UI, updates metrics, and queues another chunk if
     // continuous training is active.
-    let chunk_start = Instant::now();
-    let frame_start = Instant::now();
-    let session = match session {
-        TrainingSession::Mlx(session) => TrainingSession::Mlx(train_mlx_until_budget(
-            session,
-            &mut next_validation_step,
-            frame_start,
-        )?),
-        TrainingSession::Cpu(session) => TrainingSession::Cpu(train_cpu_until_budget(
-            session,
-            &mut next_validation_step,
-            frame_start,
-        )),
-    };
+    let training_result = train_shared_session_until_budget(session, next_validation_step)?;
 
     let model_heatmaps = if visualize_network_values {
-        build_model_heatmaps(&session)
+        build_model_heatmaps(&training_result.session)
     } else {
         Vec::new()
     };
     Ok(TrainingChunkResult {
-        session,
+        session: training_result.session,
         model_heatmaps,
         visualized_network_values: visualize_network_values,
-        next_validation_step,
-        elapsed_millis: chunk_start.elapsed().as_millis(),
+        next_validation_step: training_result.next_validation_step,
+        elapsed_millis: training_result.elapsed_millis,
     })
-}
-
-fn train_mlx_until_budget(
-    mut session: MlxMicrogptTrainingSession,
-    next_validation_step: &mut usize,
-    frame_start: Instant,
-) -> Result<MlxMicrogptTrainingSession, String> {
-    loop {
-        if session.is_complete() {
-            break;
-        }
-
-        let mut result = train_mlx_microgpt_step(session, TRAINING_DOCUMENT_BATCH_SIZE)
-            .map_err(|error| error.to_string())?
-            .expect("incomplete MLX session should produce a training step");
-
-        let mut validation_was_attached = false;
-        if result.session.completed_step_count >= *next_validation_step {
-            let validation_loss = calculate_mlx_validation_loss(
-                &result.session,
-                result.session.completed_step_count,
-                VALIDATION_STEP_INTERVAL,
-            )
-            .map_err(|error| error.to_string())?;
-            result = attach_mlx_validation_loss(result, validation_loss);
-            *next_validation_step += VALIDATION_STEP_INTERVAL;
-            validation_was_attached = true;
-        }
-
-        let should_stop = result.session.is_complete()
-            || validation_was_attached
-            || result.session.completed_step_count >= *next_validation_step
-            || frame_start.elapsed() >= TRAINING_FRAME_BUDGET;
-        session = result.session;
-
-        if should_stop {
-            break;
-        }
-    }
-
-    Ok(session)
-}
-
-fn train_cpu_until_budget(
-    mut session: MicrogptTrainingSession,
-    next_validation_step: &mut usize,
-    frame_start: Instant,
-) -> MicrogptTrainingSession {
-    loop {
-        if session.is_complete() {
-            break;
-        }
-
-        let mut result = train_microgpt_step(session, TRAINING_DOCUMENT_BATCH_SIZE)
-            .expect("incomplete CPU session should produce a training step");
-
-        let mut validation_was_attached = false;
-        if result.session.completed_step_count >= *next_validation_step {
-            let validation_loss = calculate_cpu_validation_loss(
-                &result.session,
-                result.session.completed_step_count,
-                VALIDATION_STEP_INTERVAL,
-            );
-            result = attach_cpu_validation_loss(result, validation_loss);
-            *next_validation_step += VALIDATION_STEP_INTERVAL;
-            validation_was_attached = true;
-        }
-
-        let should_stop = result.session.is_complete()
-            || validation_was_attached
-            || result.session.completed_step_count >= *next_validation_step
-            || frame_start.elapsed() >= TRAINING_FRAME_BUDGET;
-        session = result.session;
-
-        if should_stop {
-            break;
-        }
-    }
-
-    session
 }
 
 fn generate_samples_from_work(mut work: GenerationWork) -> Result<GenerationResult, String> {
@@ -1656,86 +1022,6 @@ fn generate_samples_from_work(mut work: GenerationWork) -> Result<GenerationResu
     })
 }
 
-fn load_input_documents() -> Result<Vec<String>, String> {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
-    let stories_path = root.join("data/input-stories-00.json");
-    let stories_json = std::fs::read_to_string(&stories_path).map_err(|error| {
-        format!(
-            "could not read required {}: {error}",
-            stories_path.display()
-        )
-    })?;
-    let stories: Vec<Story> = serde_json::from_str(&stories_json)
-        .map_err(|error| format!("could not parse {}: {error}", stories_path.display()))?;
-    let documents = stories_to_sentences(stories);
-    if documents.is_empty() {
-        Err(format!(
-            "no training documents survived filtering in required {}",
-            stories_path.display()
-        ))
-    } else {
-        Ok(documents)
-    }
-}
-
-fn stories_to_sentences(stories: Vec<Story>) -> Vec<String> {
-    const EXCLUDE_CHARACTERS: &[char] = &[
-        '$', '&', '"', '“', '”', '(', ')', '*', '\'', '_', '-', '–', '…', '%', '~', '`', '[', ']',
-        '{', '}', '\\', ';', '|', '—', 'é', '/', '’', '‘', ':', '0', '1', '2', '3', '4', '5', '6',
-        '7', '8', '9',
-    ];
-
-    eprintln!("stories_to_sentences: stories len = {}", stories.len());
-
-    let gpt_stories = stories.into_iter()
-        .filter(|story| story.source == "GPT-4").collect::<Vec<_>>();
-
-    eprintln!("stories_to_sentences: gpt_stories len = {}", gpt_stories.len());
-
-    let all_sentences = gpt_stories
-        .into_iter()
-        .flat_map(|story| {
-            story
-                .story
-                .replace(['!', '?'], ".")
-                .split('.')
-                .map(|sentence| sentence.to_string())
-                .collect::<Vec<_>>()
-        })
-        .filter(|sentence| {
-            !EXCLUDE_CHARACTERS
-                .iter()
-                .any(|excluded| sentence.contains(*excluded))
-        })
-        .map(|sentence| sentence.replace(['\n', ','], "").trim().to_lowercase())
-        .filter(|sentence| {
-            sentence.len() > 10
-                && sentence.contains(' ')
-                && sentence.chars().count() < CONTEXT_WINDOW_SIZE
-        })
-        .collect::<Vec<_>>();
-
-    eprintln!(
-        "stories_to_sentences: all filtered sentences before cap = {}",
-        all_sentences.len()
-    );
-    let capped_sentences = cap_filtered_documents(all_sentences);
-    eprintln!(
-        "stories_to_sentences: capped sentences after MAX_DOCUMENT_COUNT = {}",
-        capped_sentences.len()
-    );
-    capped_sentences
-}
-
-fn cap_filtered_documents(mut documents: Vec<String>) -> Vec<String> {
-    // `MAX_DOCUMENT_COUNT` is only a cap, not a promise that this many examples
-    // survived source filtering. Collect first so the cap is applied against the
-    // actual filtered size instead of treating the configured maximum as the
-    // dataset size.
-    documents.truncate(documents.len().min(MAX_DOCUMENT_COUNT));
-    documents
-}
-
 fn snapshot_checkpoint_file_name(session: &TrainingSession) -> String {
     let timestamp = Local::now().format("%Y%m%d-%H%M%S");
     let backend = session.backend().label().to_ascii_lowercase();
@@ -1745,10 +1031,6 @@ fn snapshot_checkpoint_file_name(session: &TrainingSession) -> String {
         .map(|loss| format!("{loss:.4}"))
         .unwrap_or_else(|| "pending".into());
     format!("microgpt-{backend}-{timestamp}-step-{step:06}-train-loss-{loss}.bin")
-}
-
-fn next_validation_step_after(completed_step_count: usize) -> usize {
-    ((completed_step_count / VALIDATION_STEP_INTERVAL) + 1) * VALIDATION_STEP_INTERVAL
 }
 
 fn metric(label: &str, value: String) -> Element {
@@ -1874,7 +1156,7 @@ fn loss_history_chart(progress_history: &[MicrogptTrainingProgress]) -> Element 
         loss_range,
     );
     let running_mean_points = running_mean_loss_points(progress_history, min_loss, loss_range);
-    let latest_running_mean = running_mean_loss(progress_history);
+    let latest_running_mean = running_mean_loss(progress_history).unwrap_or(0.0);
     let latest = progress_history.last().expect("non-empty progress history");
 
     rsx! {
@@ -1918,23 +1200,6 @@ fn loss_history_chart(progress_history: &[MicrogptTrainingProgress]) -> Element 
                 "Train {format_loss(latest.loss)} | Mean {format_loss(latest_running_mean)} | Step {latest.completed_step_count} / {latest.training_step_count}"
             }
         }
-    }
-}
-
-fn running_mean_loss(progress_history: &[MicrogptTrainingProgress]) -> f64 {
-    let (total, count) = progress_history
-        .iter()
-        .filter(|progress| progress.completed_step_count > 0 || progress_history.len() == 1)
-        .fold((0.0, 0_usize), |(total, count), progress| {
-            (total + progress.loss, count + 1)
-        });
-    if count == 0 {
-        progress_history
-            .last()
-            .map(|progress| progress.loss)
-            .unwrap_or(0.0)
-    } else {
-        total / count as f64
     }
 }
 
@@ -2224,34 +1489,8 @@ fn weight_style(value: f32, scale: f64) -> String {
     format!("background: {color};")
 }
 
-fn format_loss(loss: f64) -> String {
-    format!("{loss:.4}")
-}
-
-fn format_learning_rate(learning_rate: f64) -> String {
-    format!("{learning_rate:.6}")
-}
-
-fn format_percent(value: f64) -> String {
-    format!("{:.1}%", value * 100.0)
-}
-
-fn format_percent_style(value: f64) -> String {
-    format!("{:.3}%", (value * 100.0).clamp(0.0, 100.0))
-}
-
 fn format_rate(value: f64) -> String {
     format!("{value:.1}")
-}
-
-fn format_count(value: usize) -> String {
-    if value >= 1_000_000 {
-        format!("{:.2}M", value as f64 / 1_000_000.0)
-    } else if value >= 1_000 {
-        format!("{:.1}k", value as f64 / 1_000.0)
-    } else {
-        value.to_string()
-    }
 }
 
 fn format_elapsed_training_time(milliseconds: u128) -> String {
@@ -2272,8 +1511,4 @@ fn estimated_accuracy_from_loss(loss: f64, vocabulary_size: usize) -> f64 {
         return 1.0;
     }
     (1.0 - loss / random_loss).clamp(0.0, 1.0)
-}
-
-fn format_compact(value: f64) -> String {
-    format!("{value:.3}")
 }

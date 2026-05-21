@@ -11,33 +11,20 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use microgpt_config::{
-    get_optimizer_config, AdamOptimizerConfig, ATTENTION_HEADS, CONTEXT_WINDOW_SIZE,
-    EMBEDDING_SIZE, LAYER_COUNT, MAX_DOCUMENT_COUNT, MAX_TRAINING_STEP_COUNT,
-    TRAINING_DOCUMENT_BATCH_SIZE, TRAINING_FRAME_BUDGET, VALIDATION_EVALUATION_DOCUMENT_COUNT,
-    VALIDATION_SET_DIVISOR, VALIDATION_STEP_INTERVAL,
+    create_training_session, format_compact, format_count, format_learning_rate, format_loss,
+    get_optimizer_config, load_input_documents, next_validation_step_after, running_mean_loss,
+    train_session_until_budget as train_shared_session_until_budget, Backend, TrainingSession,
+    ATTENTION_HEADS, CONTEXT_WINDOW_SIZE, EMBEDDING_SIZE, LAYER_COUNT,
+    TRAINING_DOCUMENT_BATCH_SIZE, VALIDATION_STEP_INTERVAL,
 };
-use microgpt_lib::checkpoint::{
-    load_checkpoint_from_path, save_checkpoint_to_path, CheckpointBackend,
-};
+use microgpt_lib::checkpoint::{load_checkpoint_from_path, save_checkpoint_to_path};
 use microgpt_lib::microgpt::{
-    attach_validation_loss as attach_cpu_validation_loss,
-    calculate_training_loss_baseline as calculate_cpu_training_loss_baseline,
-    calculate_validation_loss as calculate_cpu_validation_loss, create_microgpt_training_session,
-    export_training_session_checkpoint as export_cpu_training_session_checkpoint,
-    generate_samples as generate_cpu_samples,
-    import_training_session_checkpoint as import_cpu_training_session_checkpoint,
-    scheduled_learning_rate, train_microgpt_step, Matrix, MicrogptTrainingProgress,
-    MicrogptTrainingSession, TrainedMicrogpt, TransformerConfig, Vector,
+    generate_samples as generate_cpu_samples, Matrix, MicrogptTrainingProgress, TrainedMicrogpt,
+    TransformerConfig, Vector,
 };
 use microgpt_lib::mlx_microgpt::{
-    attach_validation_loss as attach_mlx_validation_loss,
-    calculate_validation_loss as calculate_mlx_validation_loss,
-    create_mlx_microgpt_training_session,
-    export_training_session_checkpoint as export_mlx_training_session_checkpoint,
-    generate_samples as generate_mlx_samples,
-    import_training_session_checkpoint as import_mlx_training_session_checkpoint,
-    matrix_summaries as build_mlx_matrix_summaries, train_mlx_microgpt_step, MlxMatrixSummary,
-    MlxMicrogptTrainingSession,
+    generate_samples as generate_mlx_samples, matrix_summaries as build_mlx_matrix_summaries,
+    MlxMatrixSummary,
 };
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
@@ -49,175 +36,13 @@ use ratatui::{
     widgets::{Block, Borders, Gauge, List, ListItem, Paragraph, Sparkline, Wrap},
     Frame, Terminal,
 };
-use serde::Deserialize;
 use std::{
     io::{self, Stdout},
     path::PathBuf,
     sync::mpsc::{self, Receiver},
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Backend {
-    Mlx,
-    Cpu,
-}
-
-impl Backend {
-    fn label(self) -> &'static str {
-        match self {
-            Backend::Mlx => "MLX",
-            Backend::Cpu => "CPU",
-        }
-    }
-
-    fn toggled(self) -> Self {
-        match self {
-            Backend::Mlx => Backend::Cpu,
-            Backend::Cpu => Backend::Mlx,
-        }
-    }
-}
-
-#[derive(Clone)]
-enum TrainingSession {
-    Mlx(MlxMicrogptTrainingSession),
-    Cpu(MicrogptTrainingSession),
-}
-
-impl TrainingSession {
-    fn backend(&self) -> Backend {
-        match self {
-            TrainingSession::Mlx(_) => Backend::Mlx,
-            TrainingSession::Cpu(_) => Backend::Cpu,
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        match self {
-            TrainingSession::Mlx(session) => session.is_complete(),
-            TrainingSession::Cpu(session) => session.is_complete(),
-        }
-    }
-
-    fn completed_step_count(&self) -> usize {
-        match self {
-            TrainingSession::Mlx(session) => session.completed_step_count,
-            TrainingSession::Cpu(session) => session.completed_step_count,
-        }
-    }
-
-    fn training_step_count(&self) -> usize {
-        match self {
-            TrainingSession::Mlx(session) => session.training_step_count,
-            TrainingSession::Cpu(session) => session.training_step_count,
-        }
-    }
-
-    fn latest_loss(&self) -> Option<f64> {
-        match self {
-            TrainingSession::Mlx(session) => session.latest_loss,
-            TrainingSession::Cpu(session) => session.latest_loss,
-        }
-    }
-
-    fn latest_validation_loss(&self) -> Option<f64> {
-        match self {
-            TrainingSession::Mlx(session) => session.latest_validation_loss,
-            TrainingSession::Cpu(session) => session.latest_validation_loss,
-        }
-    }
-
-    fn training_document_count(&self) -> usize {
-        match self {
-            TrainingSession::Mlx(session) => session.documents.len(),
-            TrainingSession::Cpu(session) => session.documents.len(),
-        }
-    }
-
-    fn validation_document_count(&self) -> usize {
-        match self {
-            TrainingSession::Mlx(session) => session.validation_documents.len(),
-            TrainingSession::Cpu(session) => session.validation_documents.len(),
-        }
-    }
-
-    fn progress_history(&self) -> &[MicrogptTrainingProgress] {
-        match self {
-            TrainingSession::Mlx(session) => session.progress_history.as_slice(),
-            TrainingSession::Cpu(session) => session.progress_history.as_slice(),
-        }
-    }
-
-    fn config(&self) -> &TransformerConfig {
-        match self {
-            TrainingSession::Mlx(session) => &session.trained_microgpt.config,
-            TrainingSession::Cpu(session) => &session.trained_microgpt.config,
-        }
-    }
-
-    fn tokenizer_vocabulary_size(&self) -> usize {
-        match self {
-            TrainingSession::Mlx(session) => session.trained_microgpt.tokenizer.vocabulary_size(),
-            TrainingSession::Cpu(session) => session.trained_microgpt.tokenizer.vocabulary_size(),
-        }
-    }
-
-    fn parameter_count(&self) -> usize {
-        match self {
-            TrainingSession::Mlx(session) => session
-                .trained_microgpt
-                .model
-                .values()
-                .iter()
-                .map(|array| {
-                    array
-                        .shape()
-                        .iter()
-                        .map(|dimension| *dimension as usize)
-                        .product::<usize>()
-                })
-                .sum(),
-            TrainingSession::Cpu(session) => session.trained_microgpt.model.parameter_count(),
-        }
-    }
-
-    fn current_learning_rate(&self) -> f64 {
-        match self {
-            TrainingSession::Mlx(session) => scheduled_learning_rate(
-                &session.optimizer_config,
-                session.completed_step_count,
-                session.training_step_count,
-            ),
-            TrainingSession::Cpu(session) => scheduled_learning_rate(
-                &session.optimizer_config,
-                session.completed_step_count,
-                session.training_step_count,
-            ),
-        }
-    }
-
-    fn export_checkpoint(&self) -> Result<microgpt_lib::checkpoint::MicrogptCheckpoint, String> {
-        match self {
-            TrainingSession::Mlx(session) => export_mlx_training_session_checkpoint(session),
-            TrainingSession::Cpu(session) => Ok(export_cpu_training_session_checkpoint(session)),
-        }
-    }
-
-    fn import_checkpoint(
-        checkpoint: &microgpt_lib::checkpoint::MicrogptCheckpoint,
-    ) -> Result<Self, String> {
-        match checkpoint.backend {
-            CheckpointBackend::Mlx => {
-                import_mlx_training_session_checkpoint(checkpoint).map(TrainingSession::Mlx)
-            }
-            CheckpointBackend::Cpu => Ok(TrainingSession::Cpu(
-                import_cpu_training_session_checkpoint(checkpoint)?,
-            )),
-        }
-    }
-}
 
 #[derive(Clone)]
 struct MatrixSummary {
@@ -227,12 +52,6 @@ struct MatrixSummary {
     min: f32,
     max: f32,
     mean_abs: f32,
-}
-
-#[derive(Deserialize)]
-struct Story {
-    story: String,
-    source: String,
 }
 
 struct TrainingChunkResult {
@@ -749,19 +568,6 @@ fn render_loss(frame: &mut Frame<'_>, app: &App, area: Rect) {
     );
 }
 
-fn running_mean_loss(progress_history: &[MicrogptTrainingProgress]) -> Option<f64> {
-    let mut total = 0.0;
-    let mut count = 0_usize;
-    for progress in progress_history {
-        if progress.completed_step_count == 0 && progress_history.len() > 1 {
-            continue;
-        }
-        total += progress.loss;
-        count += 1;
-    }
-    (count > 0).then_some(total / count as f64)
-}
-
 fn render_model(frame: &mut Frame<'_>, app: &App, area: Rect) {
     // Keeping this panel mounted but empty-by-default makes the cost model
     // obvious to the user: values are available, but not free.
@@ -822,154 +628,28 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
     );
 }
 
-fn create_training_session(
-    input_documents: Vec<String>,
-    rng: &mut ChaCha8Rng,
-    backend: Backend,
-    transformer_config: TransformerConfig,
-    optimizer_config: AdamOptimizerConfig,
-) -> Result<TrainingSession, String> {
-    match backend {
-        Backend::Mlx => create_mlx_microgpt_training_session(
-            input_documents,
-            rng,
-            MAX_TRAINING_STEP_COUNT,
-            VALIDATION_SET_DIVISOR,
-            VALIDATION_EVALUATION_DOCUMENT_COUNT,
-            transformer_config,
-            optimizer_config,
-        )
-        .with_initial_progress()
-        .map(TrainingSession::Mlx)
-        .map_err(|error| error.to_string()),
-        Backend::Cpu => {
-            let mut session = create_microgpt_training_session(
-                input_documents,
-                rng,
-                MAX_TRAINING_STEP_COUNT,
-                VALIDATION_SET_DIVISOR,
-                VALIDATION_EVALUATION_DOCUMENT_COUNT,
-                transformer_config,
-                optimizer_config,
-            );
-            let train_loss = calculate_cpu_training_loss_baseline(&session);
-            let validation_loss =
-                calculate_cpu_validation_loss(&session, 0, VALIDATION_STEP_INTERVAL);
-            session = session.with_initial_progress(train_loss, validation_loss);
-            Ok(TrainingSession::Cpu(session))
-        }
-    }
-}
-
 fn train_session_until_budget(
     session: TrainingSession,
-    mut next_validation_step: usize,
+    next_validation_step: usize,
     visualize_network_values: bool,
 ) -> Result<TrainingChunkResult, String> {
     // A chunk is deliberately bounded by wall-clock time. Continuous training is
     // implemented as many small chunks, which lets the terminal process input
     // and redraw metrics between updates.
-    let chunk_start = Instant::now();
-    let frame_start = Instant::now();
-    let session = match session {
-        TrainingSession::Mlx(session) => TrainingSession::Mlx(train_mlx_until_budget(
-            session,
-            &mut next_validation_step,
-            frame_start,
-        )?),
-        TrainingSession::Cpu(session) => TrainingSession::Cpu(train_cpu_until_budget(
-            session,
-            &mut next_validation_step,
-            frame_start,
-        )),
-    };
+    let training_result = train_shared_session_until_budget(session, next_validation_step)?;
 
     let matrix_summaries = if visualize_network_values {
-        build_matrix_summaries(&session)
+        build_matrix_summaries(&training_result.session)
     } else {
         Vec::new()
     };
     Ok(TrainingChunkResult {
-        session,
+        session: training_result.session,
         matrix_summaries,
         visualized_network_values: visualize_network_values,
-        next_validation_step,
-        elapsed_millis: chunk_start.elapsed().as_millis(),
+        next_validation_step: training_result.next_validation_step,
+        elapsed_millis: training_result.elapsed_millis,
     })
-}
-
-fn train_mlx_until_budget(
-    mut session: MlxMicrogptTrainingSession,
-    next_validation_step: &mut usize,
-    frame_start: Instant,
-) -> Result<MlxMicrogptTrainingSession, String> {
-    loop {
-        if session.is_complete() {
-            break;
-        }
-
-        let mut result = train_mlx_microgpt_step(session, TRAINING_DOCUMENT_BATCH_SIZE)
-            .map_err(|error| error.to_string())?
-            .expect("incomplete MLX session should produce a training step");
-
-        if result.session.completed_step_count >= *next_validation_step {
-            let validation_loss = calculate_mlx_validation_loss(
-                &result.session,
-                result.session.completed_step_count,
-                VALIDATION_STEP_INTERVAL,
-            )
-            .map_err(|error| error.to_string())?;
-            result = attach_mlx_validation_loss(result, validation_loss);
-            *next_validation_step += VALIDATION_STEP_INTERVAL;
-        }
-
-        let should_stop = result.session.is_complete()
-            || result.session.completed_step_count >= *next_validation_step
-            || frame_start.elapsed() >= TRAINING_FRAME_BUDGET;
-        session = result.session;
-
-        if should_stop {
-            break;
-        }
-    }
-
-    Ok(session)
-}
-
-fn train_cpu_until_budget(
-    mut session: MicrogptTrainingSession,
-    next_validation_step: &mut usize,
-    frame_start: Instant,
-) -> MicrogptTrainingSession {
-    loop {
-        if session.is_complete() {
-            break;
-        }
-
-        let mut result = train_microgpt_step(session, TRAINING_DOCUMENT_BATCH_SIZE)
-            .expect("incomplete CPU session should produce a training step");
-
-        if result.session.completed_step_count >= *next_validation_step {
-            let validation_loss = calculate_cpu_validation_loss(
-                &result.session,
-                result.session.completed_step_count,
-                VALIDATION_STEP_INTERVAL,
-            );
-            result = attach_cpu_validation_loss(result, validation_loss);
-            *next_validation_step += VALIDATION_STEP_INTERVAL;
-        }
-
-        let should_stop = result.session.is_complete()
-            || result.session.completed_step_count >= *next_validation_step
-            || frame_start.elapsed() >= TRAINING_FRAME_BUDGET;
-        session = result.session;
-
-        if should_stop {
-            break;
-        }
-    }
-
-    session
 }
 
 fn build_matrix_summaries(session: &TrainingSession) -> Vec<MatrixSummary> {
@@ -1114,87 +794,10 @@ impl From<MlxMatrixSummary> for MatrixSummary {
     }
 }
 
-fn load_input_documents() -> Result<Vec<String>, String> {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
-    let stories_path = root.join("data/input-stories-00.json");
-    let stories_json = std::fs::read_to_string(&stories_path).map_err(|error| {
-        format!(
-            "could not read required {}: {error}",
-            stories_path.display()
-        )
-    })?;
-    let stories: Vec<Story> = serde_json::from_str(&stories_json)
-        .map_err(|error| format!("could not parse {}: {error}", stories_path.display()))?;
-    let documents = stories_to_sentences(stories);
-    if documents.is_empty() {
-        Err(format!(
-            "no training documents survived filtering in required {}",
-            stories_path.display()
-        ))
-    } else {
-        Ok(documents)
-    }
-}
-
 fn checkpoint_file_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("microgpt-checkpoint.bin")
-}
-
-fn next_validation_step_after(completed_step_count: usize) -> usize {
-    ((completed_step_count / VALIDATION_STEP_INTERVAL) + 1) * VALIDATION_STEP_INTERVAL
-}
-
-fn stories_to_sentences(stories: Vec<Story>) -> Vec<String> {
-    const EXCLUDE_CHARACTERS: &[char] = &[
-        '$', '&', '"', '“', '”', '(', ')', '*', '\'', '_', '-', '–', '…', '%', '~', '`', '[', ']',
-        '{', '}', '\\', ';', '|', '—', 'é', '/', '’', '‘', ':', '0', '1', '2', '3', '4', '5', '6',
-        '7', '8', '9',
-    ];
-
-    let documents = stories
-        .into_iter()
-        .filter(|story| story.source == "GPT-4")
-        .flat_map(|story| {
-            story
-                .story
-                .replace(['!', '?'], ".")
-                .split('.')
-                .map(|sentence| sentence.to_string())
-                .collect::<Vec<_>>()
-        })
-        .filter(|sentence| {
-            !EXCLUDE_CHARACTERS
-                .iter()
-                .any(|excluded| sentence.contains(*excluded))
-        })
-        .map(|sentence| sentence.replace(['\n', ','], "").trim().to_lowercase())
-        .filter(|sentence| {
-            sentence.len() > 10
-                && sentence.contains(' ')
-                && sentence.chars().count() < CONTEXT_WINDOW_SIZE
-        })
-        .collect::<Vec<_>>();
-    eprintln!(
-        "stories_to_sentences: all filtered sentences before cap = {}",
-        documents.len()
-    );
-    let capped_sentences = cap_filtered_documents(documents);
-    eprintln!(
-        "stories_to_sentences: capped sentences after MAX_DOCUMENT_COUNT = {}",
-        capped_sentences.len()
-    );
-    capped_sentences
-}
-
-fn cap_filtered_documents(mut documents: Vec<String>) -> Vec<String> {
-    // `MAX_DOCUMENT_COUNT` is only a cap, not a promise that this many examples
-    // survived source filtering. Collect first so the cap is applied against the
-    // actual filtered size instead of treating the configured maximum as the
-    // dataset size.
-    documents.truncate(documents.len().min(MAX_DOCUMENT_COUNT));
-    documents
 }
 
 fn sparkline_losses(progress_history: &[MicrogptTrainingProgress]) -> Vec<u64> {
@@ -1212,26 +815,4 @@ fn sparkline_losses(progress_history: &[MicrogptTrainingProgress]) -> Vec<u64> {
         .iter()
         .map(|loss| (((loss - min) / range) * 100.0) as u64)
         .collect()
-}
-
-fn format_loss(loss: f64) -> String {
-    format!("{loss:.4}")
-}
-
-fn format_learning_rate(learning_rate: f64) -> String {
-    format!("{learning_rate:.6}")
-}
-
-fn format_count(value: usize) -> String {
-    if value >= 1_000_000 {
-        format!("{:.2}M", value as f64 / 1_000_000.0)
-    } else if value >= 1_000 {
-        format!("{:.1}k", value as f64 / 1_000.0)
-    } else {
-        value.to_string()
-    }
-}
-
-fn format_compact(value: f64) -> String {
-    format!("{value:.3}")
 }

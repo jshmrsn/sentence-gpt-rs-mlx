@@ -3265,8 +3265,6 @@ dependencies = [
  "rand 0.8.6",
  "rand_chacha 0.3.1",
  "rfd 0.15.4",
- "serde",
- "serde_json",
  "tokio",
 ]
 
@@ -3275,6 +3273,9 @@ name = "microgpt-config"
 version = "0.1.0"
 dependencies = [
  "microgpt-lib",
+ "rand_chacha 0.3.1",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -3299,8 +3300,6 @@ dependencies = [
  "rand 0.8.6",
  "rand_chacha 0.3.1",
  "ratatui",
- "serde",
- "serde_json",
 ]
 
 [[package]]
