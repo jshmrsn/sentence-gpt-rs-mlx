@@ -10,11 +10,17 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use microgpt_config::{
+    get_optimizer_config, AdamOptimizerConfig, ATTENTION_HEADS, CONTEXT_WINDOW_SIZE,
+    EMBEDDING_SIZE, LAYER_COUNT, MAX_DOCUMENT_COUNT, MAX_TRAINING_STEP_COUNT,
+    TRAINING_DOCUMENT_BATCH_SIZE, TRAINING_FRAME_BUDGET, VALIDATION_EVALUATION_DOCUMENT_COUNT,
+    VALIDATION_SET_DIVISOR, VALIDATION_STEP_INTERVAL,
+};
 use microgpt_lib::microgpt::{
     attach_validation_loss as attach_cpu_validation_loss,
     calculate_training_loss_baseline as calculate_cpu_training_loss_baseline,
     calculate_validation_loss as calculate_cpu_validation_loss, create_microgpt_training_session,
-    generate_samples as generate_cpu_samples, train_microgpt_step, AdamOptimizerConfig, Matrix,
+    generate_samples as generate_cpu_samples, train_microgpt_step, Matrix,
     MicrogptTrainingProgress, MicrogptTrainingSession, TrainedMicrogpt, TransformerConfig,
 };
 use microgpt_lib::mlx_microgpt::{
@@ -42,18 +48,6 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-
-const TRAINING_FRAME_BUDGET: Duration = Duration::from_millis(500);
-const VALIDATION_STEP_INTERVAL: usize = 50;
-const TRAINING_DOCUMENT_BATCH_SIZE: usize = 16;
-const MAX_DOCUMENT_COUNT: usize = 3000;
-const MAX_TRAINING_STEP_COUNT: usize = 8_000;
-const VALIDATION_SET_DIVISOR: usize = 20;
-const VALIDATION_EVALUATION_DOCUMENT_COUNT: usize = 8;
-const CONTEXT_WINDOW_SIZE: usize = 64;
-const LAYER_COUNT: usize = 3;
-const ATTENTION_HEADS: usize = 8;
-const EMBEDDING_SIZE: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Backend {
@@ -258,15 +252,7 @@ impl App {
             ATTENTION_HEADS,
         )
         .expect("valid built-in transformer config");
-        let optimizer_config = AdamOptimizerConfig {
-            learning_rate: 0.006,
-            first_moment_decay: 0.9,
-            second_moment_decay: 0.999,
-            epsilon: 1e-8,
-            weight_decay: 0.01,
-            warmup_step_count: 100,
-            minimum_learning_rate_ratio: 0.1,
-        };
+        let optimizer_config = get_optimizer_config();
         let input_documents = load_input_documents()?;
         let session = create_training_session(
             input_documents,
@@ -778,36 +764,33 @@ fn train_mlx_until_budget(
     next_validation_step: &mut usize,
     frame_start: Instant,
 ) -> Result<MlxMicrogptTrainingSession, String> {
-    let mut latest_result = None;
-
     loop {
-        let Some(result) = train_mlx_microgpt_step(session.clone(), TRAINING_DOCUMENT_BATCH_SIZE)
-            .map_err(|error| error.to_string())?
-        else {
-            break;
-        };
-        session = result.session.clone();
-        latest_result = Some(result);
-
-        if session.is_complete()
-            || session.completed_step_count >= *next_validation_step
-            || frame_start.elapsed() >= TRAINING_FRAME_BUDGET
-        {
+        if session.is_complete() {
             break;
         }
-    }
 
-    if let Some(mut result) = latest_result {
-        if session.completed_step_count >= *next_validation_step {
+        let mut result = train_mlx_microgpt_step(session, TRAINING_DOCUMENT_BATCH_SIZE)
+            .map_err(|error| error.to_string())?
+            .expect("incomplete MLX session should produce a training step");
+
+        if result.session.completed_step_count >= *next_validation_step {
             let validation_loss = calculate_mlx_validation_loss(
-                &session,
-                session.completed_step_count,
+                &result.session,
+                result.session.completed_step_count,
                 VALIDATION_STEP_INTERVAL,
             )
             .map_err(|error| error.to_string())?;
             result = attach_mlx_validation_loss(result, validation_loss);
-            session = result.session;
             *next_validation_step += VALIDATION_STEP_INTERVAL;
+        }
+
+        let should_stop = result.session.is_complete()
+            || result.session.completed_step_count >= *next_validation_step
+            || frame_start.elapsed() >= TRAINING_FRAME_BUDGET;
+        session = result.session;
+
+        if should_stop {
+            break;
         }
     }
 
@@ -819,34 +802,31 @@ fn train_cpu_until_budget(
     next_validation_step: &mut usize,
     frame_start: Instant,
 ) -> MicrogptTrainingSession {
-    let mut latest_result = None;
-
     loop {
-        let Some(result) = train_microgpt_step(session.clone(), TRAINING_DOCUMENT_BATCH_SIZE)
-        else {
-            break;
-        };
-        session = result.session.clone();
-        latest_result = Some(result);
-
-        if session.is_complete()
-            || session.completed_step_count >= *next_validation_step
-            || frame_start.elapsed() >= TRAINING_FRAME_BUDGET
-        {
+        if session.is_complete() {
             break;
         }
-    }
 
-    if let Some(mut result) = latest_result {
-        if session.completed_step_count >= *next_validation_step {
+        let mut result = train_microgpt_step(session, TRAINING_DOCUMENT_BATCH_SIZE)
+            .expect("incomplete CPU session should produce a training step");
+
+        if result.session.completed_step_count >= *next_validation_step {
             let validation_loss = calculate_cpu_validation_loss(
-                &session,
-                session.completed_step_count,
+                &result.session,
+                result.session.completed_step_count,
                 VALIDATION_STEP_INTERVAL,
             );
             result = attach_cpu_validation_loss(result, validation_loss);
-            session = result.session;
             *next_validation_step += VALIDATION_STEP_INTERVAL;
+        }
+
+        let should_stop = result.session.is_complete()
+            || result.session.completed_step_count >= *next_validation_step
+            || frame_start.elapsed() >= TRAINING_FRAME_BUDGET;
+        session = result.session;
+
+        if should_stop {
+            break;
         }
     }
 

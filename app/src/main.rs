@@ -6,13 +6,18 @@
 // they run in blocking worker tasks while the UI stays responsive.
 
 use dioxus::prelude::*;
+use microgpt_config::{
+    get_optimizer_config, AdamOptimizerConfig, ATTENTION_HEADS, CONTEXT_WINDOW_SIZE,
+    EMBEDDING_SIZE, LAYER_COUNT, MAX_DOCUMENT_COUNT, MAX_TRAINING_STEP_COUNT,
+    TRAINING_DOCUMENT_BATCH_SIZE, TRAINING_FRAME_BUDGET, VALIDATION_EVALUATION_DOCUMENT_COUNT,
+    VALIDATION_SET_DIVISOR, VALIDATION_STEP_INTERVAL,
+};
 use microgpt_lib::microgpt::{
     attach_validation_loss as attach_cpu_validation_loss,
     calculate_training_loss_baseline as calculate_cpu_training_loss_baseline,
     calculate_validation_loss as calculate_cpu_validation_loss, create_microgpt_training_session,
-    generate_samples as generate_cpu_samples, train_microgpt_step, AdamOptimizerConfig,
-    CharacterTokenizer, Matrix, MicrogptTrainingProgress, MicrogptTrainingSession, TrainedMicrogpt,
-    TransformerConfig,
+    generate_samples as generate_cpu_samples, train_microgpt_step, CharacterTokenizer, Matrix,
+    MicrogptTrainingProgress, MicrogptTrainingSession, TrainedMicrogpt, TransformerConfig,
 };
 use microgpt_lib::mlx_microgpt::{
     attach_validation_loss as attach_mlx_validation_loss,
@@ -26,30 +31,6 @@ use rand_chacha::ChaCha8Rng;
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
-
-const TRAINING_FRAME_BUDGET: Duration = Duration::from_millis(500);
-const VALIDATION_STEP_INTERVAL: usize = 50;
-const TRAINING_DOCUMENT_BATCH_SIZE: usize = 20;
-const MAX_DOCUMENT_COUNT: usize = 20000;
-const MAX_TRAINING_STEP_COUNT: usize = 8_000;
-const VALIDATION_SET_DIVISOR: usize = 20;
-const VALIDATION_EVALUATION_DOCUMENT_COUNT: usize = 8;
-const CONTEXT_WINDOW_SIZE: usize = 50;
-const LAYER_COUNT: usize = 4;
-const ATTENTION_HEADS: usize = 8;
-const EMBEDDING_SIZE: usize = 64;
-
-fn get_optimizer_config() -> AdamOptimizerConfig {
-    AdamOptimizerConfig {
-        learning_rate: 0.01,
-        first_moment_decay: 0.85,
-        second_moment_decay: 0.99,
-        epsilon: 1e-8,
-        weight_decay: 0.01,
-        warmup_step_count: 100,
-        minimum_learning_rate_ratio: 0.1,
-    }
-}
 
 const CSS: &str = r#"
 :root {
@@ -365,6 +346,28 @@ enum TrainingSession {
     Cpu(MicrogptTrainingSession),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DocumentBrowserDataset {
+    Training,
+    Validation,
+}
+
+impl DocumentBrowserDataset {
+    fn label(self) -> &'static str {
+        match self {
+            DocumentBrowserDataset::Training => "Training",
+            DocumentBrowserDataset::Validation => "Validation",
+        }
+    }
+
+    fn toggled(self) -> Self {
+        match self {
+            DocumentBrowserDataset::Training => DocumentBrowserDataset::Validation,
+            DocumentBrowserDataset::Validation => DocumentBrowserDataset::Training,
+        }
+    }
+}
+
 impl TrainingSession {
     fn backend(&self) -> Backend {
         match self {
@@ -419,6 +422,20 @@ impl TrainingSession {
         match self {
             TrainingSession::Mlx(session) => session.documents.as_slice(),
             TrainingSession::Cpu(session) => session.documents.as_slice(),
+        }
+    }
+
+    fn validation_documents(&self) -> &[String] {
+        match self {
+            TrainingSession::Mlx(session) => session.validation_documents.as_slice(),
+            TrainingSession::Cpu(session) => session.validation_documents.as_slice(),
+        }
+    }
+
+    fn documents_for_browser(&self, dataset: DocumentBrowserDataset) -> &[String] {
+        match dataset {
+            DocumentBrowserDataset::Training => self.training_documents(),
+            DocumentBrowserDataset::Validation => self.validation_documents(),
         }
     }
 
@@ -505,6 +522,7 @@ struct AppState {
     next_validation_step: usize,
     accumulated_training_millis: u128,
     prefix: String,
+    document_browser_dataset: DocumentBrowserDataset,
     training_document_search: String,
     training_document_page: usize,
     temperature: f64,
@@ -660,12 +678,15 @@ fn App() -> Element {
         .session
         .as_ref()
         .is_some_and(TrainingSession::is_complete);
-    let visible_training_documents = selected_training_documents(&snapshot);
-    let is_training_document_search_empty = snapshot.training_document_search.trim().is_empty();
-    let training_document_page_count = snapshot.training_document_page_count();
-    let current_training_document_page = snapshot
+    let visible_documents = selected_browser_documents(&snapshot);
+    let is_document_search_empty = snapshot.training_document_search.trim().is_empty();
+    let browser_document_count = snapshot.browser_document_count();
+    let browser_dataset_label = snapshot.document_browser_dataset.label();
+    let browser_dataset_label_lowercase = browser_dataset_label.to_lowercase();
+    let document_page_count = snapshot.document_page_count();
+    let current_document_page = snapshot
         .training_document_page
-        .min(training_document_page_count.saturating_sub(1));
+        .min(document_page_count.saturating_sub(1));
 
     rsx! {
         style { "{CSS}" }
@@ -747,9 +768,17 @@ fn App() -> Element {
                 }
 
                 section { class: "panel",
-                    h2 { class: "section-title", "Training documents" }
+                    div { class: "model-header",
+                        h2 { class: "section-title", "{browser_dataset_label} documents" }
+                        button {
+                            class: "button secondary",
+                            disabled: snapshot.session.is_none(),
+                            onclick: move |_| state.write().toggle_document_browser_dataset(),
+                            "Showing: {browser_dataset_label}"
+                        }
+                    }
                     div { class: "field",
-                        label { "Search training examples" }
+                        label { "Search {browser_dataset_label_lowercase} examples" }
                         input {
                             class: "text-input",
                             value: "{snapshot.training_document_search}",
@@ -761,23 +790,23 @@ fn App() -> Element {
                             spellcheck: false
                         }
                     }
-                    if is_training_document_search_empty && training_document_page_count > 1 {
+                    if is_document_search_empty && document_page_count > 1 {
                         div { class: "document-controls",
                             button {
                                 class: "page-button",
-                                disabled: current_training_document_page == 0,
+                                disabled: current_document_page == 0,
                                 onclick: move |_| state.write().first_training_document_page(),
                                 "First"
                             }
                             button {
                                 class: "page-button",
-                                disabled: current_training_document_page == 0,
+                                disabled: current_document_page == 0,
                                 onclick: move |_| state.write().previous_training_document_page(),
                                 "Prev"
                             }
                             button {
                                 class: "page-button",
-                                disabled: current_training_document_page + 1 >= training_document_page_count,
+                                disabled: current_document_page + 1 >= document_page_count,
                                 onclick: move |_| state.write().next_training_document_page(),
                                 "Next"
                             }
@@ -789,14 +818,14 @@ fn App() -> Element {
                         }
                     }
                     div { class: "model-summary",
-                        if is_training_document_search_empty {
-                            "Showing page {current_training_document_page + 1} of {training_document_page_count.max(1)} | {training_example_count} training examples"
+                        if is_document_search_empty {
+                            "Showing page {current_document_page + 1} of {document_page_count.max(1)} | {browser_document_count} {browser_dataset_label_lowercase} examples"
                         } else {
-                            "Showing {visible_training_documents.len()} best matches from {training_example_count} training examples"
+                            "Showing {visible_documents.len()} best matches from {browser_document_count} {browser_dataset_label_lowercase} examples"
                         }
                     }
                     div { class: "document-list",
-                        for (document_index, document) in visible_training_documents.iter() {
+                        for (document_index, document) in visible_documents.iter() {
                             div { class: "document-item",
                                 div { class: "document-index", "#{document_index + 1}" }
                                 div { class: "document-text", "{document}" }
@@ -915,6 +944,7 @@ impl AppState {
                             next_validation_step: VALIDATION_STEP_INTERVAL,
                             accumulated_training_millis: 0,
                             prefix: String::new(),
+                            document_browser_dataset: DocumentBrowserDataset::Training,
                             training_document_search: String::new(),
                             training_document_page: 0,
                             temperature: 0.5,
@@ -938,6 +968,7 @@ impl AppState {
                     next_validation_step: VALIDATION_STEP_INTERVAL,
                     accumulated_training_millis: 0,
                     prefix: String::new(),
+                    document_browser_dataset: DocumentBrowserDataset::Training,
                     training_document_search: String::new(),
                     training_document_page: 0,
                     temperature: 0.5,
@@ -960,6 +991,7 @@ impl AppState {
                 next_validation_step: VALIDATION_STEP_INTERVAL,
                 accumulated_training_millis: 0,
                 prefix: String::new(),
+                document_browser_dataset: DocumentBrowserDataset::Training,
                 training_document_search: String::new(),
                 training_document_page: 0,
                 temperature: 0.5,
@@ -976,8 +1008,13 @@ impl AppState {
         self.training_document_page = 0;
     }
 
+    fn toggle_document_browser_dataset(&mut self) {
+        self.document_browser_dataset = self.document_browser_dataset.toggled();
+        self.training_document_page = 0;
+    }
+
     fn random_training_document_page(&mut self) {
-        let page_count = self.training_document_page_count();
+        let page_count = self.document_page_count();
         if page_count > 0 {
             self.training_document_page = self.training_document_page_rng.gen_range(0..page_count);
         }
@@ -992,18 +1029,33 @@ impl AppState {
     }
 
     fn next_training_document_page(&mut self) {
-        let page_count = self.training_document_page_count();
+        let page_count = self.document_page_count();
         if page_count > 0 {
             self.training_document_page =
                 (self.training_document_page + 1).min(page_count.saturating_sub(1));
         }
     }
 
-    fn training_document_page_count(&self) -> usize {
+    fn browser_document_count(&self) -> usize {
         self.session
             .as_ref()
-            .map(|session| session.training_document_count().div_ceil(10))
+            .map(|session| {
+                session
+                    .documents_for_browser(self.document_browser_dataset)
+                    .len()
+            })
             .unwrap_or(0)
+    }
+
+    fn document_page_count(&self) -> usize {
+        self.browser_document_count().div_ceil(10)
+    }
+
+    fn browser_documents(&self) -> &[String] {
+        self.session
+            .as_ref()
+            .map(|session| session.documents_for_browser(self.document_browser_dataset))
+            .unwrap_or(&[])
     }
 
     fn toggle_backend(&mut self) {
@@ -1259,36 +1311,33 @@ fn train_mlx_until_budget(
     next_validation_step: &mut usize,
     frame_start: Instant,
 ) -> Result<MlxMicrogptTrainingSession, String> {
-    let mut latest_result = None;
-
     loop {
-        let Some(result) = train_mlx_microgpt_step(session.clone(), TRAINING_DOCUMENT_BATCH_SIZE)
-            .map_err(|error| error.to_string())?
-        else {
-            break;
-        };
-        session = result.session.clone();
-        latest_result = Some(result);
-
-        if session.is_complete()
-            || session.completed_step_count >= *next_validation_step
-            || frame_start.elapsed() >= TRAINING_FRAME_BUDGET
-        {
+        if session.is_complete() {
             break;
         }
-    }
 
-    if let Some(mut result) = latest_result {
-        if session.completed_step_count >= *next_validation_step {
+        let mut result = train_mlx_microgpt_step(session, TRAINING_DOCUMENT_BATCH_SIZE)
+            .map_err(|error| error.to_string())?
+            .expect("incomplete MLX session should produce a training step");
+
+        if result.session.completed_step_count >= *next_validation_step {
             let validation_loss = calculate_mlx_validation_loss(
-                &session,
-                session.completed_step_count,
+                &result.session,
+                result.session.completed_step_count,
                 VALIDATION_STEP_INTERVAL,
             )
             .map_err(|error| error.to_string())?;
             result = attach_mlx_validation_loss(result, validation_loss);
-            session = result.session;
             *next_validation_step += VALIDATION_STEP_INTERVAL;
+        }
+
+        let should_stop = result.session.is_complete()
+            || result.session.completed_step_count >= *next_validation_step
+            || frame_start.elapsed() >= TRAINING_FRAME_BUDGET;
+        session = result.session;
+
+        if should_stop {
+            break;
         }
     }
 
@@ -1300,34 +1349,31 @@ fn train_cpu_until_budget(
     next_validation_step: &mut usize,
     frame_start: Instant,
 ) -> MicrogptTrainingSession {
-    let mut latest_result = None;
-
     loop {
-        let Some(result) = train_microgpt_step(session.clone(), TRAINING_DOCUMENT_BATCH_SIZE)
-        else {
-            break;
-        };
-        session = result.session.clone();
-        latest_result = Some(result);
-
-        if session.is_complete()
-            || session.completed_step_count >= *next_validation_step
-            || frame_start.elapsed() >= TRAINING_FRAME_BUDGET
-        {
+        if session.is_complete() {
             break;
         }
-    }
 
-    if let Some(mut result) = latest_result {
-        if session.completed_step_count >= *next_validation_step {
+        let mut result = train_microgpt_step(session, TRAINING_DOCUMENT_BATCH_SIZE)
+            .expect("incomplete CPU session should produce a training step");
+
+        if result.session.completed_step_count >= *next_validation_step {
             let validation_loss = calculate_cpu_validation_loss(
-                &session,
-                session.completed_step_count,
+                &result.session,
+                result.session.completed_step_count,
                 VALIDATION_STEP_INTERVAL,
             );
             result = attach_cpu_validation_loss(result, validation_loss);
-            session = result.session;
             *next_validation_step += VALIDATION_STEP_INTERVAL;
+        }
+
+        let should_stop = result.session.is_complete()
+            || result.session.completed_step_count >= *next_validation_step
+            || frame_start.elapsed() >= TRAINING_FRAME_BUDGET;
+        session = result.session;
+
+        if should_stop {
+            break;
         }
     }
 
@@ -1438,16 +1484,13 @@ fn metric(label: &str, value: String) -> Element {
     }
 }
 
-fn selected_training_documents(state: &AppState) -> Vec<(usize, String)> {
-    let Some(session) = &state.session else {
-        return Vec::new();
-    };
-    let documents = session.training_documents();
+fn selected_browser_documents(state: &AppState) -> Vec<(usize, String)> {
+    let documents = state.browser_documents();
     let query = state.training_document_search.trim().to_lowercase();
     if query.is_empty() {
         let page_start = state
             .training_document_page
-            .min(state.training_document_page_count().saturating_sub(1))
+            .min(state.document_page_count().saturating_sub(1))
             * 10;
         return documents
             .iter()

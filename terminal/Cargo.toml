@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 crossterm = "0.29"
+microgpt-config = { path = "../config" }
 microgpt-lib = { path = "../lib" }
 rand.workspace = true
 rand_chacha.workspace = true

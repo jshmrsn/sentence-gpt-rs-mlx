@@ -1237,6 +1237,7 @@ pub fn generate_sample(
         .filter(|character| tokenizer.character_to_token_id.contains_key(character))
         .take(config.context_window_size - 1)
         .collect();
+    let prefix_characters = normalized_prefix.chars().collect::<Vec<_>>();
     let mut sample = normalized_prefix.clone();
 
     for position_id in 0..config.context_window_size {
@@ -1244,10 +1245,10 @@ pub fn generate_sample(
         keys = model_run.keys;
         values = model_run.values;
 
-        if let Some(prefix_character) = normalized_prefix.chars().nth(position_id) {
+        if let Some(prefix_character) = prefix_characters.get(position_id) {
             // A prefix is forced into the context. The model consumes those
             // characters before it is allowed to sample freely.
-            token_id = tokenizer.character_to_token_id[&prefix_character];
+            token_id = tokenizer.character_to_token_id[prefix_character];
             continue;
         }
 
@@ -1265,7 +1266,7 @@ pub fn generate_sample(
             &mut probability_data,
             tokenizer,
             &sample,
-            normalized_prefix.chars().count(),
+            prefix_characters.len(),
         );
 
         token_id = weighted_choice(&probability_data, random_number_generator);

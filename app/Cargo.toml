@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 dioxus = { version = "0.7.9", features = ["desktop"] }
+microgpt-config = { path = "../config" }
 microgpt-lib = { path = "../lib" }
 rand.workspace = true
 rand_chacha.workspace = true

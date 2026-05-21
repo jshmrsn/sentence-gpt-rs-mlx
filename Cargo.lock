@@ -2930,12 +2930,20 @@ name = "microgpt-app"
 version = "0.1.0"
 dependencies = [
  "dioxus",
+ "microgpt-config",
  "microgpt-lib",
  "rand 0.8.6",
  "rand_chacha 0.3.1",
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "microgpt-config"
+version = "0.1.0"
+dependencies = [
+ "microgpt-lib",
 ]
 
 [[package]]
@@ -2953,6 +2961,7 @@ name = "microgpt-tui"
 version = "0.1.0"
 dependencies = [
  "crossterm",
+ "microgpt-config",
  "microgpt-lib",
  "rand 0.8.6",
  "rand_chacha 0.3.1",

@@ -312,6 +312,7 @@ struct MlxParamView<'a> {
     token_embedding: &'a Array,
     position_embedding: &'a Array,
     language_model_head: &'a Array,
+    rotary_position_matrices: &'a [Array],
     layers: Vec<MlxLayerParamView<'a>>,
 }
 
@@ -444,6 +445,7 @@ pub fn train_mlx_microgpt_step(
     // this input slice." The returned gradient list has the same order.
     let argnums = (0..parameters.len() as i32).collect::<Vec<_>>();
     let config = session.trained_microgpt.config.clone();
+    let rotary_position_matrices = rotary_position_matrices(&config);
     // Capturing `layer_count` separately lets `params_from_arrays` reconstruct a
     // borrowed view without needing to capture the whole model inside the MLX
     // autodiff closure.
@@ -453,7 +455,7 @@ pub fn train_mlx_microgpt_step(
         // MLX closures receive a flat parameter list. Convert it back into a
         // named view, compute scalar batch loss, and return it as a one-element
         // vector because the transform API is vector-valued.
-        let params = params_from_arrays(inputs, layer_count);
+        let params = params_from_arrays(inputs, layer_count, &rotary_position_matrices);
         let loss = batch_loss(
             &params,
             &config,
@@ -596,7 +598,8 @@ pub fn calculate_document_loss(
     // training objective.
     let tokens = tokenizer.encode_document(document);
     let model_values = model.values();
-    let params = params_from_arrays(&model_values, model.layers.len());
+    let rotary_position_matrices = rotary_position_matrices(config);
+    let params = params_from_arrays(&model_values, model.layers.len(), &rotary_position_matrices);
     Ok(document_loss(
         &params,
         config,
@@ -641,7 +644,8 @@ pub fn generate_sample(
     // probability vector back to Rust so the CPU-side sampling constraints and
     // RNG behavior stay shared with the reference backend.
     let model_values = model.values();
-    let params = params_from_arrays(&model_values, model.layers.len());
+    let rotary_position_matrices = rotary_position_matrices(config);
+    let params = params_from_arrays(&model_values, model.layers.len(), &rotary_position_matrices);
     let mut keys = create_key_value_cache(config.layer_count);
     let mut values = create_key_value_cache(config.layer_count);
     let mut token_id = tokenizer.sequence_boundary_token_id;
@@ -652,6 +656,7 @@ pub fn generate_sample(
         .filter(|character| tokenizer.character_to_token_id.contains_key(character))
         .take(config.context_window_size - 1)
         .collect::<String>();
+    let prefix_characters = normalized_prefix.chars().collect::<Vec<_>>();
     let mut sample = normalized_prefix.clone();
 
     for position_id in 0..config.context_window_size {
@@ -659,8 +664,8 @@ pub fn generate_sample(
         keys = run.keys;
         values = run.values;
 
-        if let Some(prefix_character) = normalized_prefix.chars().nth(position_id) {
-            token_id = tokenizer.character_to_token_id[&prefix_character];
+        if let Some(prefix_character) = prefix_characters.get(position_id) {
+            token_id = tokenizer.character_to_token_id[prefix_character];
             continue;
         }
 
@@ -675,12 +680,7 @@ pub fn generate_sample(
             .iter()
             .map(|probability| *probability as f64)
             .collect::<Vec<_>>();
-        apply_sampling_constraints(
-            &mut weights,
-            tokenizer,
-            &sample,
-            normalized_prefix.chars().count(),
-        );
+        apply_sampling_constraints(&mut weights, tokenizer, &sample, prefix_characters.len());
         token_id = weighted_choice(&weights, random_number_generator);
         if token_id == tokenizer.sequence_boundary_token_id {
             break;
@@ -788,7 +788,11 @@ struct TransformerLayerRun {
     values: Vec<Vec<Array>>,
 }
 
-fn params_from_arrays(arrays: &[Array], layer_count: usize) -> MlxParamView<'_> {
+fn params_from_arrays<'a>(
+    arrays: &'a [Array],
+    layer_count: usize,
+    rotary_position_matrices: &'a [Array],
+) -> MlxParamView<'a> {
     // This must stay in lockstep with `MlxTransformerModelParameters::values`.
     // A wrong order would train the right shapes under the wrong names, which is
     // the kind of bug that compiles but ruins learning.
@@ -805,6 +809,7 @@ fn params_from_arrays(arrays: &[Array], layer_count: usize) -> MlxParamView<'_> 
         token_embedding: next(),
         position_embedding: next(),
         language_model_head: next(),
+        rotary_position_matrices,
         layers: (0..layer_count)
             .map(|_| MlxLayerParamView {
                 attention: MlxAttentionParamView {
@@ -843,7 +848,7 @@ fn batch_loss(
             sequence_boundary_token_id,
         )?);
     }
-    Ok(ops::mean(&ops::stack_axis(&losses, 0)?, None)?)
+    ops::mean(&ops::stack_axis(&losses, 0)?, None)
 }
 
 fn document_loss(
@@ -874,7 +879,7 @@ fn document_loss(
         losses.push(-log_probabilities.index(target_token_id as i32));
     }
 
-    Ok(ops::mean(&ops::stack_axis(&losses, 0)?, None)?)
+    ops::mean(&ops::stack_axis(&losses, 0)?, None)
 }
 
 fn run_transformer_model(
@@ -908,7 +913,7 @@ fn run_transformer_model(
             &hidden_state,
             &params.layers[layer_index],
             layer_index,
-            position_id,
+            &params.rotary_position_matrices[position_id],
             config,
             current_keys,
             current_values,
@@ -929,7 +934,7 @@ fn run_transformer_layer(
     hidden_state: &Array,
     layer: &MlxLayerParamView<'_>,
     layer_index: usize,
-    position_id: usize,
+    rotary_position_matrix: &Array,
     config: &TransformerConfig,
     mut keys: Vec<Vec<Array>>,
     mut values: Vec<Vec<Array>>,
@@ -939,17 +944,15 @@ fn run_transformer_layer(
     let residual_state = hidden_state.clone();
     let normalized_state = rmsnorm(hidden_state)?;
 
-    // `linear` returns [embedding_size]. RoPE keeps the same shape, only rotating
-    // pairs of values inside each attention head.
+    // `linear` returns [embedding_size]. The precomputed RoPE matrix keeps the
+    // same shape while rotating pairs of values inside each attention head.
     let query = apply_rotary_position_embedding(
         &linear(&normalized_state, layer.attention.query_weights)?,
-        position_id,
-        config,
+        rotary_position_matrix,
     )?;
     let key = apply_rotary_position_embedding(
         &linear(&normalized_state, layer.attention.key_weights)?,
-        position_id,
-        config,
+        rotary_position_matrix,
     )?;
     let value = linear(&normalized_state, layer.attention.value_weights)?;
 
@@ -1034,16 +1037,23 @@ fn linear(input_vector: &Array, weights: &Array) -> MlxResult<Array> {
 
 fn apply_rotary_position_embedding(
     vector: &Array,
-    position_id: usize,
-    config: &TransformerConfig,
+    rotary_position_matrix: &Array,
 ) -> MlxResult<Array> {
     // A previous version built RoPE with scalar MLX indexing. That can panic
     // inside MLX's autodiff path for some shapes. The dense rotation matrix is a
     // little more work but keeps the operation as a plain differentiable matmul.
-    let rotation_matrix = rotary_position_matrix(position_id, config);
     // Matrix shape is [embedding_size, embedding_size]. Multiplying by the
     // [embedding_size] vector returns another [embedding_size] vector.
-    rotation_matrix.matmul(vector)
+    rotary_position_matrix.matmul(vector)
+}
+
+fn rotary_position_matrices(config: &TransformerConfig) -> Vec<Array> {
+    // RoPE matrices depend only on model shape and position, not on trainable
+    // parameters. Build them once per loss/generation call instead of allocating
+    // the same matrix for every layer at every time step.
+    (0..config.context_window_size)
+        .map(|position_id| rotary_position_matrix(position_id, config))
+        .collect()
 }
 
 fn rotary_position_matrix(position_id: usize, config: &TransformerConfig) -> Array {
