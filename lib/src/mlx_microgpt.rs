@@ -1,6 +1,7 @@
 use crate::microgpt::{
-    apply_sampling_constraints, normalize_training_document, random_gaussian, shuffled_by,
-    AdamOptimizerConfig, CharacterTokenizer, MicrogptTrainingProgress, TransformerConfig,
+    apply_sampling_constraints, normalize_training_document, random_gaussian,
+    scheduled_learning_rate, shuffled_by, AdamOptimizerConfig, CharacterTokenizer,
+    MicrogptTrainingProgress, TransformerConfig,
 };
 use mlx_rs::{error::Result as MlxResult, ops, ops::indexing::IndexOp, transforms, Array};
 use rand::Rng;
@@ -18,6 +19,7 @@ pub struct MlxAttentionParameters {
 #[derive(Clone, Debug)]
 pub struct MlxFeedForwardParameters {
     pub expansion_weights: Array,
+    pub gate_weights: Array,
     pub projection_weights: Array,
 }
 
@@ -44,6 +46,7 @@ impl MlxTransformerModelParameters {
         random_number_generator: &mut impl Rng,
     ) -> Self {
         let embedding_std = 0.02;
+        let feed_forward_size = 3 * embedding_size;
         let projection_std = (1.0 / embedding_size as f64).sqrt();
         let residual_projection_std = projection_std / (2.0 * layer_count as f64).sqrt();
 
@@ -96,14 +99,20 @@ impl MlxTransformerModelParameters {
                     },
                     feed_forward: MlxFeedForwardParameters {
                         expansion_weights: mlx_matrix(
-                            4 * embedding_size,
+                            feed_forward_size,
+                            embedding_size,
+                            random_number_generator,
+                            projection_std,
+                        ),
+                        gate_weights: mlx_matrix(
+                            feed_forward_size,
                             embedding_size,
                             random_number_generator,
                             projection_std,
                         ),
                         projection_weights: mlx_matrix(
                             embedding_size,
-                            4 * embedding_size,
+                            feed_forward_size,
                             random_number_generator,
                             residual_projection_std,
                         ),
@@ -125,6 +134,7 @@ impl MlxTransformerModelParameters {
             values.push(layer.attention.value_weights.clone());
             values.push(layer.attention.output_projection_weights.clone());
             values.push(layer.feed_forward.expansion_weights.clone());
+            values.push(layer.feed_forward.gate_weights.clone());
             values.push(layer.feed_forward.projection_weights.clone());
         }
         values
@@ -154,6 +164,7 @@ impl MlxTransformerModelParameters {
                     },
                     feed_forward: MlxFeedForwardParameters {
                         expansion_weights: next(),
+                        gate_weights: next(),
                         projection_weights: next(),
                     },
                 })
@@ -261,6 +272,7 @@ struct MlxAttentionParamView<'a> {
 
 struct MlxFeedForwardParamView<'a> {
     expansion_weights: &'a Array,
+    gate_weights: &'a Array,
     projection_weights: &'a Array,
 }
 
@@ -602,6 +614,10 @@ pub fn matrix_summaries(model: &MlxTransformerModelParameters) -> Vec<MlxMatrixS
             &layer.feed_forward.expansion_weights,
         ));
         summaries.push(matrix_summary(
+            &format!("{prefix} FF gate"),
+            &layer.feed_forward.gate_weights,
+        ));
+        summaries.push(matrix_summary(
             &format!("{prefix} FF project"),
             &layer.feed_forward.projection_weights,
         ));
@@ -636,6 +652,10 @@ pub fn matrix_heatmaps(model: &MlxTransformerModelParameters) -> Vec<MlxMatrixHe
         heatmaps.push(matrix_heatmap(
             &format!("{prefix} FF expand"),
             &layer.feed_forward.expansion_weights,
+        ));
+        heatmaps.push(matrix_heatmap(
+            &format!("{prefix} FF gate"),
+            &layer.feed_forward.gate_weights,
         ));
         heatmaps.push(matrix_heatmap(
             &format!("{prefix} FF project"),
@@ -679,6 +699,7 @@ fn params_from_arrays(arrays: &[Array], layer_count: usize) -> MlxParamView<'_> 
                 },
                 feed_forward: MlxFeedForwardParamView {
                     expansion_weights: next(),
+                    gate_weights: next(),
                     projection_weights: next(),
                 },
             })
@@ -750,6 +771,7 @@ fn run_transformer_model(
             &hidden_state,
             &params.layers[layer_index],
             layer_index,
+            position_id,
             config,
             current_keys,
             current_values,
@@ -770,6 +792,7 @@ fn run_transformer_layer(
     hidden_state: &Array,
     layer: &MlxLayerParamView<'_>,
     layer_index: usize,
+    position_id: usize,
     config: &TransformerConfig,
     mut keys: Vec<Vec<Array>>,
     mut values: Vec<Vec<Array>>,
@@ -777,8 +800,16 @@ fn run_transformer_layer(
     let residual_state = hidden_state.clone();
     let normalized_state = rmsnorm(hidden_state)?;
 
-    let query = linear(&normalized_state, layer.attention.query_weights)?;
-    let key = linear(&normalized_state, layer.attention.key_weights)?;
+    let query = apply_rotary_position_embedding(
+        &linear(&normalized_state, layer.attention.query_weights)?,
+        position_id,
+        config,
+    )?;
+    let key = apply_rotary_position_embedding(
+        &linear(&normalized_state, layer.attention.key_weights)?,
+        position_id,
+        config,
+    )?;
     let value = linear(&normalized_state, layer.attention.value_weights)?;
 
     keys[layer_index].push(key);
@@ -791,8 +822,9 @@ fn run_transformer_layer(
 
     let residual_state = updated_hidden_state.clone();
     let normalized_state = rmsnorm(&updated_hidden_state)?;
-    let block_output = linear(&normalized_state, layer.feed_forward.expansion_weights)?;
-    let block_output = ops::maximum(&block_output, Array::from_f32(0.0))?;
+    let expanded_output = linear(&normalized_state, layer.feed_forward.expansion_weights)?;
+    let gated_output = linear(&normalized_state, layer.feed_forward.gate_weights)?;
+    let block_output = silu(&expanded_output)? * gated_output;
     let block_output = linear(&block_output, layer.feed_forward.projection_weights)?;
     updated_hidden_state = block_output + residual_state;
 
@@ -832,10 +864,52 @@ fn linear(input_vector: &Array, weights: &Array) -> MlxResult<Array> {
     weights.matmul(input_vector)
 }
 
+fn apply_rotary_position_embedding(
+    vector: &Array,
+    position_id: usize,
+    config: &TransformerConfig,
+) -> MlxResult<Array> {
+    let rotation_matrix = rotary_position_matrix(position_id, config);
+    rotation_matrix.matmul(vector)
+}
+
+fn rotary_position_matrix(position_id: usize, config: &TransformerConfig) -> Array {
+    let mut matrix = vec![0.0; config.embedding_size * config.embedding_size];
+    let pair_count = config.attention_head_size / 2;
+    for head_index in 0..config.attention_head_count {
+        let head_start_index = head_index * config.attention_head_size;
+        for pair_index in 0..pair_count {
+            let even_index = head_start_index + 2 * pair_index;
+            let odd_index = even_index + 1;
+            let frequency =
+                10_000.0_f32.powf(-((2 * pair_index) as f32) / config.attention_head_size as f32);
+            let angle = position_id as f32 * frequency;
+            let cosine = angle.cos();
+            let sine = angle.sin();
+            matrix[even_index * config.embedding_size + even_index] = cosine;
+            matrix[even_index * config.embedding_size + odd_index] = -sine;
+            matrix[odd_index * config.embedding_size + even_index] = sine;
+            matrix[odd_index * config.embedding_size + odd_index] = cosine;
+        }
+        if config.attention_head_size % 2 == 1 {
+            let last_index = head_start_index + config.attention_head_size - 1;
+            matrix[last_index * config.embedding_size + last_index] = 1.0;
+        }
+    }
+    Array::from_slice(
+        &matrix,
+        &[config.embedding_size as i32, config.embedding_size as i32],
+    )
+}
+
 fn rmsnorm(input_vector: &Array) -> MlxResult<Array> {
     let mean_square = ops::mean(&ops::square(input_vector)?, None)?;
     let scale = (mean_square + Array::from_f32(1e-5)).sqrt()?;
     Ok(input_vector / scale)
+}
+
+fn silu(input: &Array) -> MlxResult<Array> {
+    Ok(input / (Array::from_f32(1.0) + ops::exp(&(input * Array::from_f32(-1.0)))?))
 }
 
 fn apply_adam_update(
@@ -846,8 +920,7 @@ fn apply_adam_update(
     step: usize,
     training_step_count: usize,
 ) -> MlxResult<(Vec<Array>, MlxAdamOptimizerState)> {
-    let step_learning_rate =
-        optimizer_config.learning_rate * (1.0 - step as f64 / training_step_count as f64);
+    let step_learning_rate = scheduled_learning_rate(optimizer_config, step, training_step_count);
     let beta1 = optimizer_config.first_moment_decay as f32;
     let beta2 = optimizer_config.second_moment_decay as f32;
     let learning_rate = Array::from_f32(step_learning_rate as f32);
@@ -873,8 +946,10 @@ fn apply_adam_update(
             + ops::square(&gradient)? * Array::from_f32(1.0 - beta2);
         let bias_corrected_first_moment = &new_first_moment / &first_bias_correction;
         let bias_corrected_second_moment = &new_second_moment / &second_bias_correction;
-        let update = &learning_rate * bias_corrected_first_moment
-            / (bias_corrected_second_moment.sqrt()? + &epsilon);
+        let adam_update =
+            bias_corrected_first_moment / (bias_corrected_second_moment.sqrt()? + &epsilon);
+        let decay_update = parameter * Array::from_f32(optimizer_config.weight_decay as f32);
+        let update = &learning_rate * (adam_update + decay_update);
 
         updated_parameters.push(parameter - update);
         first_moment_estimates.push(new_first_moment);
@@ -993,6 +1068,9 @@ mod tests {
             first_moment_decay: 0.9,
             second_moment_decay: 0.999,
             epsilon: 1e-8,
+            weight_decay: 0.0,
+            warmup_step_count: 0,
+            minimum_learning_rate_ratio: 0.0,
         };
         let session = create_mlx_microgpt_training_session(
             vec!["anna".into(), "anne".into(), "emma".into(), "ella".into()],
@@ -1020,5 +1098,41 @@ mod tests {
 
         assert_eq!(result.progress.completed_step_count, 1);
         assert!(!sample.is_empty());
+    }
+
+    #[test]
+    fn mlx_rope_handles_app_sized_attention_inside_training() {
+        let mut rng = ChaCha8Rng::seed_from_u64(2);
+        let config = TransformerConfig::new(2, 64, 20, 16).unwrap();
+        let optimizer = AdamOptimizerConfig {
+            learning_rate: 0.001,
+            first_moment_decay: 0.9,
+            second_moment_decay: 0.999,
+            epsilon: 1e-8,
+            weight_decay: 0.0,
+            warmup_step_count: 0,
+            minimum_learning_rate_ratio: 0.0,
+        };
+        let session = create_mlx_microgpt_training_session(
+            vec![
+                "a small cat sat".into(),
+                "a red hen ran".into(),
+                "the sun is up".into(),
+                "we can see it".into(),
+            ],
+            &mut rng,
+            1,
+            4,
+            1,
+            config,
+            optimizer,
+        )
+        .with_initial_progress()
+        .unwrap();
+        let result = train_mlx_microgpt_step(session, 1)
+            .unwrap()
+            .expect("step should run without indexing panic");
+
+        assert_eq!(result.progress.completed_step_count, 1);
     }
 }

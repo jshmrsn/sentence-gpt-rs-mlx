@@ -174,6 +174,7 @@ struct Story {
 struct TrainingChunkResult {
     session: TrainingSession,
     matrix_summaries: Vec<MatrixSummary>,
+    visualized_network_values: bool,
     next_validation_step: usize,
     elapsed_millis: u128,
 }
@@ -181,6 +182,7 @@ struct TrainingChunkResult {
 struct App {
     session: TrainingSession,
     matrix_summaries: Vec<MatrixSummary>,
+    visualize_network_values: bool,
     is_training_active: bool,
     is_training_busy: bool,
     generation_requested: bool,
@@ -251,6 +253,9 @@ impl App {
             first_moment_decay: 0.9,
             second_moment_decay: 0.999,
             epsilon: 1e-8,
+            weight_decay: 0.01,
+            warmup_step_count: 100,
+            minimum_learning_rate_ratio: 0.1,
         };
         let input_documents = load_input_documents()?;
         let session = create_training_session(
@@ -260,11 +265,10 @@ impl App {
             transformer_config,
             optimizer_config,
         )?;
-        let matrix_summaries = build_matrix_summaries(&session);
-
         Ok(Self {
             session,
-            matrix_summaries,
+            matrix_summaries: Vec::new(),
+            visualize_network_values: false,
             is_training_active: false,
             is_training_busy: false,
             generation_requested: false,
@@ -296,6 +300,10 @@ impl App {
             }
             KeyCode::Char('b') => {
                 self.toggle_backend();
+                false
+            }
+            KeyCode::Char('v') => {
+                self.toggle_network_value_visualization();
                 false
             }
             KeyCode::Char('r') => {
@@ -343,6 +351,17 @@ impl App {
         }
     }
 
+    fn toggle_network_value_visualization(&mut self) {
+        self.visualize_network_values = !self.visualize_network_values;
+        if self.visualize_network_values {
+            self.matrix_summaries = build_matrix_summaries(&self.session);
+            self.status_message = "Model values visible".into();
+        } else {
+            self.matrix_summaries.clear();
+            self.status_message = "Model values hidden".into();
+        }
+    }
+
     fn toggle_training(&mut self) {
         if self.session.is_complete() {
             self.is_training_active = false;
@@ -378,13 +397,15 @@ impl App {
     fn spawn_training_worker(&mut self) {
         let session = self.session.clone();
         let next_validation_step = self.next_validation_step;
+        let visualize_network_values = self.visualize_network_values;
         let (sender, receiver) = mpsc::channel();
         self.is_training_busy = true;
         self.training_receiver = Some(receiver);
         self.status_message = "Training".into();
 
         thread::spawn(move || {
-            let result = train_session_until_budget(session, next_validation_step);
+            let result =
+                train_session_until_budget(session, next_validation_step, visualize_network_values);
             let _ = sender.send(result);
         });
     }
@@ -399,7 +420,15 @@ impl App {
                 self.accumulated_training_millis += result.elapsed_millis;
                 self.next_validation_step = result.next_validation_step;
                 self.session = result.session;
-                self.matrix_summaries = result.matrix_summaries;
+                if self.visualize_network_values {
+                    self.matrix_summaries = if result.visualized_network_values {
+                        result.matrix_summaries
+                    } else {
+                        build_matrix_summaries(&self.session)
+                    };
+                } else {
+                    self.matrix_summaries.clear();
+                }
                 self.is_training_busy = false;
 
                 if self.generation_requested {
@@ -523,8 +552,9 @@ fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
             Span::raw(format!("  {}", app.status_message)),
         ]),
         Line::from(format!(
-            "backend {} | layers {} | embedding {} | heads {} x {} | context {} | vocab {} | prefix {:?} | temp {:.1}",
+            "backend {} | values {} | layers {} | embedding {} | heads {} x {} | context {} | vocab {} | prefix {:?} | temp {:.1}",
             backend,
+            if app.visualize_network_values { "on" } else { "off" },
             config.layer_count,
             config.embedding_size,
             config.attention_head_count,
@@ -591,6 +621,16 @@ fn render_loss(frame: &mut Frame<'_>, app: &App, area: Rect) {
 }
 
 fn render_model(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    if !app.visualize_network_values {
+        frame.render_widget(
+            Paragraph::new("Hidden. Press v to show model value summaries.")
+                .block(Block::default().title("Model values").borders(Borders::ALL))
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+        return;
+    }
+
     let lines = app
         .matrix_summaries
         .iter()
@@ -631,7 +671,7 @@ fn render_samples(frame: &mut Frame<'_>, app: &App, area: Rect) {
 }
 
 fn render_help(frame: &mut Frame<'_>, area: Rect) {
-    let help = "s start/pause | c step chunk | g/Enter generate | b backend | type prefix | Backspace edit | +/- temperature | r reset | q/Esc quit";
+    let help = "s start/pause | c step chunk | g/Enter generate | b backend | v values | type prefix | Backspace edit | +/- temperature | r reset | q/Esc quit";
     frame.render_widget(
         Paragraph::new(help).block(Block::default().title("Keys").borders(Borders::ALL)),
         area,
@@ -680,6 +720,7 @@ fn create_training_session(
 fn train_session_until_budget(
     session: TrainingSession,
     mut next_validation_step: usize,
+    visualize_network_values: bool,
 ) -> Result<TrainingChunkResult, String> {
     let chunk_start = Instant::now();
     let frame_start = Instant::now();
@@ -696,10 +737,15 @@ fn train_session_until_budget(
         )),
     };
 
-    let matrix_summaries = build_matrix_summaries(&session);
+    let matrix_summaries = if visualize_network_values {
+        build_matrix_summaries(&session)
+    } else {
+        Vec::new()
+    };
     Ok(TrainingChunkResult {
         session,
         matrix_summaries,
+        visualized_network_values: visualize_network_values,
         next_validation_step,
         elapsed_millis: chunk_start.elapsed().as_millis(),
     })
@@ -825,6 +871,10 @@ fn build_cpu_matrix_summaries(trained_microgpt: &TrainedMicrogpt) -> Vec<MatrixS
         summaries.push(matrix_summary(
             &format!("{prefix} FF expand"),
             &layer.feed_forward.expansion_weights,
+        ));
+        summaries.push(matrix_summary(
+            &format!("{prefix} FF gate"),
+            &layer.feed_forward.gate_weights,
         ));
         summaries.push(matrix_summary(
             &format!("{prefix} FF project"),

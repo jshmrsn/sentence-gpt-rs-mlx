@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 const TRAINING_FRAME_BUDGET: Duration = Duration::from_millis(500);
 const VALIDATION_STEP_INTERVAL: usize = 50;
 const TRAINING_DOCUMENT_BATCH_SIZE: usize = 20;
-const MAX_DOCUMENT_COUNT: usize = 500;
+const MAX_DOCUMENT_COUNT: usize = 20000;
 const MAX_TRAINING_STEP_COUNT: usize = 8_000;
 const VALIDATION_SET_DIVISOR: usize = 20;
 const VALIDATION_EVALUATION_DOCUMENT_COUNT: usize = 8;
@@ -34,10 +34,13 @@ const EMBEDDING_SIZE: usize = 64;
 
 fn get_optimizer_config() -> AdamOptimizerConfig {
     AdamOptimizerConfig {
-        learning_rate: 0.002,
+        learning_rate: 0.01,
         first_moment_decay: 0.85,
         second_moment_decay: 0.99,
         epsilon: 1e-8,
+        weight_decay: 0.01,
+        warmup_step_count: 100,
+        minimum_learning_rate_ratio: 0.1,
     }
 }
 
@@ -169,6 +172,13 @@ button, input {
     grid-template-columns: minmax(0, 1fr) 220px auto;
     gap: 12px;
     align-items: end;
+}
+
+.model-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
 }
 
 .field label {
@@ -474,6 +484,7 @@ struct AppState {
     backend: Backend,
     session: Option<TrainingSession>,
     model_heatmaps: Vec<ModelHeatmap>,
+    visualize_network_values: bool,
     is_training_active: bool,
     is_training_busy: bool,
     manual_training_chunk_requested: bool,
@@ -500,6 +511,7 @@ struct Story {
 struct TrainingChunkResult {
     session: TrainingSession,
     model_heatmaps: Vec<ModelHeatmap>,
+    visualized_network_values: bool,
     next_validation_step: usize,
     elapsed_millis: u128,
 }
@@ -560,9 +572,13 @@ fn App() -> Element {
                 current.take_training_work()
             };
 
-            if let Some((session, next_validation_step)) = training_work {
+            if let Some((session, next_validation_step, visualize_network_values)) = training_work {
                 match tokio::task::spawn_blocking(move || {
-                    train_session_until_budget(session, next_validation_step)
+                    train_session_until_budget(
+                        session,
+                        next_validation_step,
+                        visualize_network_values,
+                    )
                 })
                 .await
                 {
@@ -660,6 +676,12 @@ fn App() -> Element {
                             disabled: snapshot.is_training_busy || snapshot.is_generating_samples,
                             onclick: move |_| state.write().toggle_backend(),
                             "Backend: {backend_label}"
+                        }
+                        button {
+                            class: "button secondary",
+                            disabled: snapshot.session.is_none(),
+                            onclick: move |_| state.write().toggle_network_value_visualization(),
+                            if snapshot.visualize_network_values { "Values: On" } else { "Values: Off" }
                         }
                         button {
                             class: "button secondary",
@@ -811,7 +833,21 @@ fn App() -> Element {
                 }
 
                 section { class: "panel",
-                    {model_visualization(snapshot.session.as_ref(), &snapshot.model_heatmaps, snapshot.completed_step_count())}
+                    div { class: "model-header",
+                        h2 { class: "section-title", "Model values" }
+                        button {
+                            class: "button secondary",
+                            disabled: snapshot.session.is_none(),
+                            onclick: move |_| state.write().toggle_network_value_visualization(),
+                            if snapshot.visualize_network_values { "Hide values" } else { "Show values" }
+                        }
+                    }
+                    {model_visualization(
+                        snapshot.session.as_ref(),
+                        snapshot.visualize_network_values,
+                        &snapshot.model_heatmaps,
+                        snapshot.completed_step_count(),
+                    )}
                 }
             }
         }
@@ -852,6 +888,7 @@ impl AppState {
                             backend,
                             session: None,
                             model_heatmaps: Vec::new(),
+                            visualize_network_values: false,
                             is_training_active: false,
                             is_training_busy: false,
                             manual_training_chunk_requested: false,
@@ -870,12 +907,11 @@ impl AppState {
                         };
                     }
                 };
-                let model_heatmaps = build_model_heatmaps(&session);
-
                 Self {
                     backend,
                     session: Some(session),
-                    model_heatmaps,
+                    model_heatmaps: Vec::new(),
+                    visualize_network_values: false,
                     is_training_active: false,
                     is_training_busy: false,
                     manual_training_chunk_requested: false,
@@ -897,6 +933,7 @@ impl AppState {
                 backend,
                 session: None,
                 model_heatmaps: Vec::new(),
+                visualize_network_values: false,
                 is_training_active: false,
                 is_training_busy: false,
                 manual_training_chunk_requested: false,
@@ -958,6 +995,19 @@ impl AppState {
         *self = Self::initialize_with_backend(self.backend.toggled());
     }
 
+    fn toggle_network_value_visualization(&mut self) {
+        self.visualize_network_values = !self.visualize_network_values;
+        if self.visualize_network_values {
+            self.model_heatmaps = self
+                .session
+                .as_ref()
+                .map(build_model_heatmaps)
+                .unwrap_or_default();
+        } else {
+            self.model_heatmaps.clear();
+        }
+    }
+
     fn toggle_training(&mut self) {
         if self
             .session
@@ -974,7 +1024,7 @@ impl AppState {
         self.manual_training_chunk_requested = true;
     }
 
-    fn take_training_work(&mut self) -> Option<(TrainingSession, usize)> {
+    fn take_training_work(&mut self) -> Option<(TrainingSession, usize, bool)> {
         if self.is_training_busy {
             return None;
         }
@@ -990,7 +1040,11 @@ impl AppState {
 
         self.is_training_busy = true;
         self.manual_training_chunk_requested = false;
-        Some((session.clone(), self.next_validation_step))
+        Some((
+            session.clone(),
+            self.next_validation_step,
+            self.visualize_network_values,
+        ))
     }
 
     fn apply_training_chunk(&mut self, chunk_result: TrainingChunkResult) {
@@ -999,7 +1053,15 @@ impl AppState {
         self.next_validation_step = chunk_result.next_validation_step;
         self.is_training_active = !is_complete && self.is_training_active;
         self.is_training_busy = false;
-        self.model_heatmaps = chunk_result.model_heatmaps;
+        if self.visualize_network_values {
+            self.model_heatmaps = if chunk_result.visualized_network_values {
+                chunk_result.model_heatmaps
+            } else {
+                build_model_heatmaps(&chunk_result.session)
+            };
+        } else {
+            self.model_heatmaps.clear();
+        }
         self.session = Some(chunk_result.session);
     }
 
@@ -1133,6 +1195,7 @@ fn create_training_session(
 fn train_session_until_budget(
     session: TrainingSession,
     mut next_validation_step: usize,
+    visualize_network_values: bool,
 ) -> Result<TrainingChunkResult, String> {
     let chunk_start = Instant::now();
     let frame_start = Instant::now();
@@ -1149,10 +1212,15 @@ fn train_session_until_budget(
         )),
     };
 
-    let model_heatmaps = build_model_heatmaps(&session);
+    let model_heatmaps = if visualize_network_values {
+        build_model_heatmaps(&session)
+    } else {
+        Vec::new()
+    };
     Ok(TrainingChunkResult {
         session,
         model_heatmaps,
+        visualized_network_values: visualize_network_values,
         next_validation_step,
         elapsed_millis: chunk_start.elapsed().as_millis(),
     })
@@ -1519,6 +1587,7 @@ fn polyline_points(
 
 fn model_visualization(
     session: Option<&TrainingSession>,
+    visualize_network_values: bool,
     heatmaps: &[ModelHeatmap],
     completed_step_count: usize,
 ) -> Element {
@@ -1532,15 +1601,18 @@ fn model_visualization(
 
     rsx! {
         div {
-            h2 { class: "section-title", "Model values" }
             div { class: "model-summary",
                 "{backend} | Step {completed_step_count} | layers {config.layer_count} | embedding {config.embedding_size} | heads {config.attention_head_count} x {config.attention_head_size} | context {config.context_window_size} | vocab {tokenizer.vocabulary_size()}"
             }
-            h3 { class: "section-title", "Parameter arrays" }
-            div { class: "heatmap-groups",
-                for heatmap in heatmaps.iter() {
-                    {matrix_heatmap(heatmap, None)}
+            if visualize_network_values {
+                h3 { class: "section-title", "Parameter arrays" }
+                div { class: "heatmap-groups",
+                    for heatmap in heatmaps.iter() {
+                        {matrix_heatmap(heatmap, None)}
+                    }
                 }
+            } else {
+                div { class: "model-summary", "Parameter heatmaps are hidden to reduce drawing and training overhead." }
             }
         }
     }
@@ -1584,6 +1656,10 @@ fn build_cpu_model_heatmaps(trained_microgpt: &TrainedMicrogpt) -> Vec<ModelHeat
         heatmaps.push(matrix_heatmap_data(
             &format!("{prefix} FF expand"),
             &layer.feed_forward.expansion_weights,
+        ));
+        heatmaps.push(matrix_heatmap_data(
+            &format!("{prefix} FF gate"),
+            &layer.feed_forward.gate_weights,
         ));
         heatmaps.push(matrix_heatmap_data(
             &format!("{prefix} FF project"),

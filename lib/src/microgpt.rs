@@ -22,6 +22,7 @@ pub struct AttentionParameters {
 #[derive(Clone, Debug)]
 pub struct FeedForwardParameters {
     pub expansion_weights: Matrix,
+    pub gate_weights: Matrix,
     pub projection_weights: Matrix,
 }
 
@@ -48,6 +49,7 @@ impl TransformerModelParameters {
         random_number_generator: &mut impl Rng,
     ) -> Self {
         let embedding_std = 0.02;
+        let feed_forward_size = 3 * embedding_size;
         let projection_std = (1.0 / embedding_size as f64).sqrt();
         let residual_projection_std = projection_std / (2.0 * layer_count as f64).sqrt();
 
@@ -100,14 +102,20 @@ impl TransformerModelParameters {
                     },
                     feed_forward: FeedForwardParameters {
                         expansion_weights: matrix(
-                            4 * embedding_size,
+                            feed_forward_size,
+                            embedding_size,
+                            random_number_generator,
+                            projection_std,
+                        ),
+                        gate_weights: matrix(
+                            feed_forward_size,
                             embedding_size,
                             random_number_generator,
                             projection_std,
                         ),
                         projection_weights: matrix(
                             embedding_size,
-                            4 * embedding_size,
+                            feed_forward_size,
                             random_number_generator,
                             residual_projection_std,
                         ),
@@ -128,6 +136,7 @@ impl TransformerModelParameters {
             push_matrix_values(&mut values, &layer.attention.value_weights);
             push_matrix_values(&mut values, &layer.attention.output_projection_weights);
             push_matrix_values(&mut values, &layer.feed_forward.expansion_weights);
+            push_matrix_values(&mut values, &layer.feed_forward.gate_weights);
             push_matrix_values(&mut values, &layer.feed_forward.projection_weights);
         }
         values
@@ -168,6 +177,7 @@ impl TransformerModelParameters {
                     },
                     feed_forward: FeedForwardParameters {
                         expansion_weights: next_matrix(&layer.feed_forward.expansion_weights),
+                        gate_weights: next_matrix(&layer.feed_forward.gate_weights),
                         projection_weights: next_matrix(&layer.feed_forward.projection_weights),
                     },
                 })
@@ -272,6 +282,9 @@ pub struct AdamOptimizerConfig {
     pub first_moment_decay: f64,
     pub second_moment_decay: f64,
     pub epsilon: f64,
+    pub weight_decay: f64,
+    pub warmup_step_count: usize,
+    pub minimum_learning_rate_ratio: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -515,6 +528,7 @@ pub fn run_transformer_model(
             &hidden_state,
             &model.layers[layer_index],
             layer_index,
+            position_id,
             config,
             current_keys,
             current_values,
@@ -535,6 +549,7 @@ pub fn run_transformer_layer(
     hidden_state: &[Value],
     layer: &TransformerLayerParameters,
     layer_index: usize,
+    position_id: usize,
     config: &TransformerConfig,
     mut keys: KeyValueCache,
     mut values: KeyValueCache,
@@ -542,8 +557,16 @@ pub fn run_transformer_layer(
     let residual_state = hidden_state.to_vec();
     let normalized_state = rmsnorm(hidden_state);
 
-    let query = linear(&normalized_state, &layer.attention.query_weights);
-    let key = linear(&normalized_state, &layer.attention.key_weights);
+    let query = apply_rotary_position_embedding(
+        &linear(&normalized_state, &layer.attention.query_weights),
+        position_id,
+        config,
+    );
+    let key = apply_rotary_position_embedding(
+        &linear(&normalized_state, &layer.attention.key_weights),
+        position_id,
+        config,
+    );
     let value = linear(&normalized_state, &layer.attention.value_weights);
 
     keys[layer_index].push(key);
@@ -563,9 +586,12 @@ pub fn run_transformer_layer(
 
     let residual_state = updated_hidden_state.clone();
     let normalized_state = rmsnorm(&updated_hidden_state);
-    let block_output = linear(&normalized_state, &layer.feed_forward.expansion_weights)
+    let expanded_output = linear(&normalized_state, &layer.feed_forward.expansion_weights);
+    let gated_output = linear(&normalized_state, &layer.feed_forward.gate_weights);
+    let block_output = expanded_output
         .iter()
-        .map(Value::relu)
+        .zip(gated_output.iter())
+        .map(|(expanded_value, gate_value)| silu(expanded_value).mul(gate_value))
         .collect::<Vec<_>>();
     let block_output = linear(&block_output, &layer.feed_forward.projection_weights);
 
@@ -649,6 +675,39 @@ pub fn weighted_head_value_sum(
                 .add(&attention_weights[time_index].mul(&head_value[head_value_index]))
         },
     )
+}
+
+pub fn apply_rotary_position_embedding(
+    vector: &[Value],
+    position_id: usize,
+    config: &TransformerConfig,
+) -> Vec<Value> {
+    let mut rotated = vector.to_vec();
+    let pair_count = config.attention_head_size / 2;
+    for head_index in 0..config.attention_head_count {
+        let head_start_index = head_index * config.attention_head_size;
+        for pair_index in 0..pair_count {
+            let even_index = head_start_index + 2 * pair_index;
+            let odd_index = even_index + 1;
+            let frequency =
+                10_000.0_f64.powf(-((2 * pair_index) as f64) / config.attention_head_size as f64);
+            let angle = position_id as f64 * frequency;
+            let cosine = angle.cos();
+            let sine = angle.sin();
+            rotated[even_index] = vector[even_index]
+                .mul_f64(cosine)
+                .sub(&vector[odd_index].mul_f64(sine));
+            rotated[odd_index] = vector[even_index]
+                .mul_f64(sine)
+                .add(&vector[odd_index].mul_f64(cosine));
+        }
+    }
+    rotated
+}
+
+pub fn silu(value: &Value) -> Value {
+    let sigmoid = value.neg().exp().add_f64(1.0).powf(-1.0);
+    value.mul(&sigmoid)
 }
 
 fn training_batch_documents(
@@ -873,8 +932,7 @@ pub fn apply_adam_update(
 ) -> AdamUpdateResult {
     let parameters = model.values();
     let clipped_gradients = clipped_gradients(gradients, MAX_GRADIENT_NORM);
-    let step_learning_rate =
-        optimizer_config.learning_rate * (1.0 - step as f64 / training_step_count as f64);
+    let step_learning_rate = scheduled_learning_rate(optimizer_config, step, training_step_count);
 
     let parameter_updates: Vec<_> = parameters
         .iter()
@@ -892,8 +950,10 @@ pub fn apply_adam_update(
                 / (1.0 - optimizer_config.first_moment_decay.powf(step as f64 + 1.0));
             let bias_corrected_second_moment = second_moment_estimate
                 / (1.0 - optimizer_config.second_moment_decay.powf(step as f64 + 1.0));
-            let parameter_update = step_learning_rate * bias_corrected_first_moment
+            let adam_update = bias_corrected_first_moment
                 / (bias_corrected_second_moment.sqrt() + optimizer_config.epsilon);
+            let decay_update = optimizer_config.weight_decay * parameter.data();
+            let parameter_update = step_learning_rate * (adam_update + decay_update);
 
             ParameterUpdate {
                 value: Value::new(parameter.data() - parameter_update),
@@ -921,6 +981,25 @@ pub fn apply_adam_update(
                 .collect(),
         },
     }
+}
+
+pub fn scheduled_learning_rate(
+    optimizer_config: &AdamOptimizerConfig,
+    step: usize,
+    training_step_count: usize,
+) -> f64 {
+    let warmup_step_count = optimizer_config.warmup_step_count.min(training_step_count);
+    if warmup_step_count > 0 && step < warmup_step_count {
+        return optimizer_config.learning_rate * (step + 1) as f64 / warmup_step_count as f64;
+    }
+
+    let scheduled_step = step.saturating_sub(warmup_step_count);
+    let scheduled_step_count = training_step_count.saturating_sub(warmup_step_count).max(1);
+    let progress = (scheduled_step as f64 / scheduled_step_count as f64).clamp(0.0, 1.0);
+    let cosine_decay = 0.5 * (1.0 + (PI * progress).cos());
+    optimizer_config.learning_rate
+        * (optimizer_config.minimum_learning_rate_ratio
+            + (1.0 - optimizer_config.minimum_learning_rate_ratio) * cosine_decay)
 }
 
 fn clipped_gradients(gradients: &[f64], max_norm: f64) -> Vec<f64> {

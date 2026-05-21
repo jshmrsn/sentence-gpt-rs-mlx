@@ -71,7 +71,7 @@ The scalar library mirrors the original Kotlin `shared/src/commonMain/kotlin/org
 - `TransformerModelParameters` owns token embeddings, position embeddings, attention weights, feed-forward weights, and the language-model head.
 - `train_microgpt_step` batches documents, accumulates gradients, and applies Adam on CPU.
 - `generate_sample` and `generate_samples` run autoregressive character sampling.
-- Training uses log-sum-exp cross-entropy, residual-scaled initialization, and global gradient clipping.
+- Training uses log-sum-exp cross-entropy, residual-scaled initialization, RoPE attention, SwiGLU feed-forward blocks, global gradient clipping, AdamW-style decay, and warmup plus cosine learning-rate decay.
 - Sampling uses top-k filtering plus simple sentence constraints to avoid immediate end tokens, leading spaces, and repeated spaces.
 
 The Dioxus app mirrors the Compose UI flow:
