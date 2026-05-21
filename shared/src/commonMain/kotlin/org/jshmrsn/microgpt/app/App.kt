@@ -45,10 +45,10 @@ import kotlin.text.contains
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.TimeSource
 
-private val TrainingFrameBudget = 100.milliseconds
+private val TrainingFrameBudget = 500.milliseconds
 private const val ValidationStepInterval = 50
-private const val TrainingBatchDocumentCount = 12
-private const val DemoDocumentLimit = 250
+private const val TrainingBatchDocumentCount = 16
+private const val DemoDocumentLimit = 500
 
 private data class TrainingChunkResult(
     val session: MicrogptTrainingSession,
@@ -68,6 +68,25 @@ private fun formatPercent(value: Double): String {
     val whole = scaled / 10
     val fraction = (scaled % 10).toString().padStart(1, '0')
     return "$whole.$fraction%"
+}
+
+private fun formatRate(value: Double): String {
+    val scaled = (value * 10.0).roundToLong()
+    val whole = scaled / 10
+    val fraction = (scaled % 10).toString().padStart(1, '0')
+    return "$whole.$fraction"
+}
+
+private fun formatElapsedTrainingTime(milliseconds: Long): String {
+    val totalSeconds = milliseconds / 1_000L
+    val hours = totalSeconds / 3_600L
+    val minutes = (totalSeconds % 3_600L) / 60L
+    val seconds = totalSeconds % 60L
+    return if (hours > 0L) {
+        "${hours}h ${minutes.toString().padStart(2, '0')}m ${seconds.toString().padStart(2, '0')}s"
+    } else {
+        "${minutes}m ${seconds.toString().padStart(2, '0')}s"
+    }
 }
 
 private fun estimatedAccuracyFromLoss(loss: Double, vocabularySize: Int): Double {
@@ -170,6 +189,7 @@ fun App() {
         var visibleMicrogpt by remember { mutableStateOf<TrainedMicrogpt?>(null) }
         var trainingSessionState by remember { mutableStateOf<MicrogptTrainingSession?>(null) }
         var nextValidationStep by remember { mutableStateOf(ValidationStepInterval) }
+        var accumulatedTrainingMillis by remember { mutableStateOf(0L) }
         var isTrainingActive by remember { mutableStateOf(false) }
         var isGeneratingSamples by remember { mutableStateOf(false) }
         var resetGeneration by remember { mutableStateOf(0) }
@@ -190,6 +210,7 @@ fun App() {
             validationEvaluationExampleCount = 0
             visibleMicrogpt = null
             trainingSessionState = null
+            accumulatedTrainingMillis = 0L
             samples = emptyList()
 
             var trainingSession = withContext(Dispatchers.Default) {
@@ -274,7 +295,7 @@ fun App() {
                         attentionHeadCount = 4
                     ),
                     optimizerConfig = AdamOptimizerConfig(
-                        learningRate = 0.003,
+                        learningRate = 0.01,
                         firstMomentDecay = 0.9,
                         secondMomentDecay = 0.999,
                         epsilon = 1e-8
@@ -314,6 +335,7 @@ fun App() {
             var localNextValidationStep = nextValidationStep
 
             while (!trainingSession.isComplete) {
+                val chunkStart = TimeSource.Monotonic.markNow()
                 val chunkResult = withContext(Dispatchers.Default) {
                     val frameStart = TimeSource.Monotonic.markNow()
                     var backgroundSession = trainingSession
@@ -352,6 +374,7 @@ fun App() {
                     )
                 } ?: break
 
+                accumulatedTrainingMillis += chunkStart.elapsedNow().inWholeMilliseconds
                 trainingSession = chunkResult.session
                 localNextValidationStep = chunkResult.nextValidationStep
                 val progress = chunkResult.latestResult.progress
@@ -385,6 +408,13 @@ fun App() {
             val currentTrainingSession = trainingSessionState
             val isTrainingComplete = currentTrainingSession?.isComplete == true
             val progress = completedStepCount.toFloat() / trainingStepCount.toFloat()
+            val completedDocumentTrainCount = completedStepCount * TrainingBatchDocumentCount
+            val totalDocumentTrainCount = trainingStepCount * TrainingBatchDocumentCount
+            val documentTrainsPerMinute = if (accumulatedTrainingMillis > 0L) {
+                completedDocumentTrainCount.toDouble() * 60_000.0 / accumulatedTrainingMillis.toDouble()
+            } else {
+                0.0
+            }
             Text(
                 when {
                     currentTrainingSession == null -> "Initializing"
@@ -415,6 +445,14 @@ fun App() {
                 modifier = Modifier.fillMaxWidth(),
             )
             Text("Step $completedStepCount / $trainingStepCount")
+            Text(
+                text = "Document trains $completedDocumentTrainCount / $totalDocumentTrainCount | running avg ${formatRate(documentTrainsPerMinute)}/min",
+                style = MaterialTheme.typography.labelMedium
+            )
+            Text(
+                text = "Elapsed training time ${formatElapsedTrainingTime(accumulatedTrainingMillis)}",
+                style = MaterialTheme.typography.labelMedium
+            )
             if (trainingExampleCount > 0 || validationExampleCount > 0) {
                 Text(
                     text = "Train examples $trainingExampleCount | validation examples $validationExampleCount | validation batch $validationEvaluationExampleCount | train batch $TrainingBatchDocumentCount",
