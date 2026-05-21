@@ -1659,30 +1659,20 @@ fn generate_samples_from_work(mut work: GenerationWork) -> Result<GenerationResu
 fn load_input_documents() -> Result<Vec<String>, String> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
     let stories_path = root.join("data/input-stories-00.json");
-    let names_path = root.join("data/input-names.txt");
-
-    if stories_path.exists() {
-        let stories_json = std::fs::read_to_string(&stories_path)
-            .map_err(|error| format!("could not read {}: {error}", stories_path.display()))?;
-        let stories: Vec<Story> = serde_json::from_str(&stories_json)
-            .map_err(|error| format!("could not parse {}: {error}", stories_path.display()))?;
-        let documents = stories_to_sentences(stories);
-        if !documents.is_empty() {
-            return Ok(documents);
-        }
-    }
-
-    let names = std::fs::read_to_string(&names_path)
-        .map_err(|error| format!("could not read fallback {}: {error}", names_path.display()))?;
-    let documents = names
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_lowercase)
-        .take(MAX_DOCUMENT_COUNT)
-        .collect::<Vec<_>>();
+    let stories_json = std::fs::read_to_string(&stories_path).map_err(|error| {
+        format!(
+            "could not read required {}: {error}",
+            stories_path.display()
+        )
+    })?;
+    let stories: Vec<Story> = serde_json::from_str(&stories_json)
+        .map_err(|error| format!("could not parse {}: {error}", stories_path.display()))?;
+    let documents = stories_to_sentences(stories);
     if documents.is_empty() {
-        Err("no input documents found".into())
+        Err(format!(
+            "no training documents survived filtering in required {}",
+            stories_path.display()
+        ))
     } else {
         Ok(documents)
     }
@@ -1695,9 +1685,15 @@ fn stories_to_sentences(stories: Vec<Story>) -> Vec<String> {
         '7', '8', '9',
     ];
 
-    stories
+    eprintln!("stories_to_sentences: stories len = {}", stories.len());
+
+    let gpt_stories = stories.into_iter()
+        .filter(|story| story.source == "GPT-4").collect::<Vec<_>>();
+
+    eprintln!("stories_to_sentences: gpt_stories len = {}", gpt_stories.len());
+
+    let all_sentences = gpt_stories
         .into_iter()
-        .filter(|story| story.source == "GPT-4")
         .flat_map(|story| {
             story
                 .story
@@ -1717,8 +1713,27 @@ fn stories_to_sentences(stories: Vec<Story>) -> Vec<String> {
                 && sentence.contains(' ')
                 && sentence.chars().count() < CONTEXT_WINDOW_SIZE
         })
-        .take(MAX_DOCUMENT_COUNT)
-        .collect()
+        .collect::<Vec<_>>();
+
+    eprintln!(
+        "stories_to_sentences: all filtered sentences before cap = {}",
+        all_sentences.len()
+    );
+    let capped_sentences = cap_filtered_documents(all_sentences);
+    eprintln!(
+        "stories_to_sentences: capped sentences after MAX_DOCUMENT_COUNT = {}",
+        capped_sentences.len()
+    );
+    capped_sentences
+}
+
+fn cap_filtered_documents(mut documents: Vec<String>) -> Vec<String> {
+    // `MAX_DOCUMENT_COUNT` is only a cap, not a promise that this many examples
+    // survived source filtering. Collect first so the cap is applied against the
+    // actual filtered size instead of treating the configured maximum as the
+    // dataset size.
+    documents.truncate(documents.len().min(MAX_DOCUMENT_COUNT));
+    documents
 }
 
 fn snapshot_checkpoint_file_name(session: &TrainingSession) -> String {
@@ -1858,11 +1873,13 @@ fn loss_history_chart(progress_history: &[MicrogptTrainingProgress]) -> Element 
         min_loss,
         loss_range,
     );
+    let running_mean_points = running_mean_loss_points(progress_history, min_loss, loss_range);
+    let latest_running_mean = running_mean_loss(progress_history);
     let latest = progress_history.last().expect("non-empty progress history");
 
     rsx! {
         div {
-            div { class: "model-summary", "max {format_loss(max_loss)} | min {format_loss(min_loss)}" }
+            div { class: "model-summary", "max {format_loss(max_loss)} | min {format_loss(min_loss)} | running mean {format_loss(latest_running_mean)}" }
             svg { class: "chart", view_box: "0 0 1000 220", preserve_aspect_ratio: "none",
                 line { x1: "30", y1: "190", x2: "980", y2: "190", stroke: "#80958a", stroke_width: "1" }
                 line { x1: "30", y1: "20", x2: "30", y2: "190", stroke: "#80958a", stroke_width: "1" }
@@ -1887,12 +1904,65 @@ fn loss_history_chart(progress_history: &[MicrogptTrainingProgress]) -> Element 
                         stroke_linejoin: "round"
                     }
                 }
+                polyline {
+                    points: "{running_mean_points}",
+                    fill: "none",
+                    stroke: "#b7791f",
+                    stroke_width: "3",
+                    stroke_dasharray: "10 8",
+                    stroke_linecap: "round",
+                    stroke_linejoin: "round"
+                }
             }
             div { class: "model-summary",
-                "Train {format_loss(latest.loss)} | Step {latest.completed_step_count} / {latest.training_step_count}"
+                "Train {format_loss(latest.loss)} | Mean {format_loss(latest_running_mean)} | Step {latest.completed_step_count} / {latest.training_step_count}"
             }
         }
     }
+}
+
+fn running_mean_loss(progress_history: &[MicrogptTrainingProgress]) -> f64 {
+    let (total, count) = progress_history
+        .iter()
+        .filter(|progress| progress.completed_step_count > 0 || progress_history.len() == 1)
+        .fold((0.0, 0_usize), |(total, count), progress| {
+            (total + progress.loss, count + 1)
+        });
+    if count == 0 {
+        progress_history
+            .last()
+            .map(|progress| progress.loss)
+            .unwrap_or(0.0)
+    } else {
+        total / count as f64
+    }
+}
+
+fn running_mean_loss_points(
+    progress_history: &[MicrogptTrainingProgress],
+    min_loss: f64,
+    loss_range: f64,
+) -> String {
+    let last_index = progress_history.len().saturating_sub(1).max(1);
+    let mut total = 0.0;
+    let mut count = 0_usize;
+    progress_history
+        .iter()
+        .enumerate()
+        .filter_map(|(index, progress)| {
+            if progress.completed_step_count == 0 && progress_history.len() > 1 {
+                return None;
+            }
+            total += progress.loss;
+            count += 1;
+            let mean_loss = total / count as f64;
+            let x = 30.0 + 950.0 * index as f64 / last_index as f64;
+            let normalized_loss = (mean_loss - min_loss) / loss_range;
+            let y = 190.0 - 170.0 * normalized_loss;
+            Some(format!("{x:.2},{y:.2}"))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn polyline_points(
