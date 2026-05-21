@@ -47,16 +47,13 @@ package org.jshmrsn.microgpt.lib
  * If you understand this file, you understand the core algorithmic essence
  * of GPT training and inference.
  */
-import kotlin.math.PI
-import kotlin.math.cos
-import kotlin.math.ln
-import kotlin.math.pow
-import kotlin.math.sqrt
-import kotlin.random.Random
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlin.collections.plus
+import kotlin.math.*
+import kotlin.random.Random
 
 typealias Matrix = List<List<Value>>
 typealias KeyValueCache = List<List<List<Value>>>
@@ -94,7 +91,7 @@ data class TransformerModelParameters(
         listOf(tokenEmbedding, positionEmbedding, languageModelHead) + layers.flatMap { it.matrices() }
 
     fun values(): List<Value> =
-        matrices().flatMap { matrix -> matrix.flatMap { row -> row } }
+        matrices().flatMap { matrix -> matrix.flatten() }
 
     companion object {
         fun initialize(
@@ -160,19 +157,19 @@ private fun TransformerModelParameters.withValues(values: List<Value>): Transfor
 private fun <T> List<T>.replacedAt(index: Int, value: T): List<T> =
     mapIndexed { currentIndex, currentValue -> if (currentIndex == index) value else currentValue }
 
-data class TransformerRun(
+class TransformerRun(
     val logits: List<Value>,
     val keys: KeyValueCache,
     val values: KeyValueCache
 )
 
-data class TransformerLayerRun(
+class TransformerLayerRun(
     val hiddenState: List<Value>,
     val keys: KeyValueCache,
     val values: KeyValueCache
 )
 
-data class TransformerConfig(
+class TransformerConfig(
     val layerCount: Int,
     val embeddingSize: Int,
     val contextWindowSize: Int,
@@ -191,7 +188,7 @@ data class TransformerConfig(
     val attentionHeadSize: Int = embeddingSize / attentionHeadCount
 }
 
-data class CharacterTokenizer(
+class CharacterTokenizer(
     val uniqueCharacters: List<Char>,
     val sequenceBoundaryTokenId: Int
 ) {
@@ -204,11 +201,12 @@ data class CharacterTokenizer(
             listOf(sequenceBoundaryTokenId)
 }
 
-data class AdamOptimizerState(
+class AdamOptimizerState(
     val firstMomentEstimates: List<Double>,
     val secondMomentEstimates: List<Double>
 )
-data class AdamOptimizerConfig(
+
+class AdamOptimizerConfig(
     val learningRate: Double,
     val firstMomentDecay: Double,
     val secondMomentDecay: Double,
@@ -226,9 +224,7 @@ data class MicrogptTrainingProgress(
     val trainingStepCount: Int,
     val loss: Double,
     val validationLoss: Double?
-) {
-    val isComplete: Boolean = completedStepCount >= trainingStepCount
-}
+)
 
 data class MicrogptTrainingSession(
     val trainedMicrogpt: TrainedMicrogpt,
@@ -261,12 +257,12 @@ data class AdamUpdateResult(
     val optimizerState: AdamOptimizerState
 )
 
-private data class DocumentTrainingResult(
+private class DocumentTrainingResult(
     val loss: Double,
-    val gradients: Map<Value, Double>
+    val parameterGradients: DoubleArray
 )
 
-private data class ParameterUpdate(
+private class ParameterUpdate(
     val value: Value,
     val firstMomentEstimate: Double,
     val secondMomentEstimate: Double
@@ -675,7 +671,8 @@ private fun trainOnDocumentWithGradients(
     model: TransformerModelParameters,
     config: TransformerConfig,
     tokenizer: CharacterTokenizer,
-    document: String
+    document: String,
+    parameterIndexByValue: Map<Value, Int>
 ): DocumentTrainingResult {
     val loss = trainOnDocument(
         model = model,
@@ -685,62 +682,7 @@ private fun trainOnDocumentWithGradients(
     )
     return DocumentTrainingResult(
         loss = loss.data,
-        gradients = loss.backward()
-    )
-}
-
-private fun averageGradients(
-    parameters: List<Value>,
-    gradientsPerDocument: List<Map<Value, Double>>
-): Map<Value, Double> {
-    val inverseDocumentCount = 1.0 / gradientsPerDocument.size.toDouble()
-    return parameters.associateWith { parameter ->
-        gradientsPerDocument.sumOf { gradients -> gradients[parameter] ?: 0.0 } * inverseDocumentCount
-    }
-}
-
-fun trainMicrogptStep(session: MicrogptTrainingSession): MicrogptTrainingStepResult? {
-    if (session.isComplete) return null
-
-    val step = session.completedStepCount
-    val document = session.documents[step % session.documents.size]
-    val loss = trainOnDocument(
-        model = session.trainedMicrogpt.model,
-        config = session.trainedMicrogpt.config,
-        tokenizer = session.trainedMicrogpt.tokenizer,
-        document = document
-    )
-
-    val gradients = loss.backward()
-
-    val update = applyAdamUpdate(
-        model = session.trainedMicrogpt.model,
-        gradients = gradients,
-        optimizerState = session.optimizerState,
-        optimizerConfig = session.optimizerConfig,
-        step = step,
-        trainingStepCount = session.trainingStepCount
-    )
-    val updatedMicrogpt = session.trainedMicrogpt.copy(model = update.model)
-
-    val progress = MicrogptTrainingProgress(
-        completedStepCount = session.completedStepCount + 1,
-        trainingStepCount = session.trainingStepCount,
-        loss = loss.data,
-        validationLoss = null
-    )
-    val progressHistory = session.progressHistory + progress
-
-    return MicrogptTrainingStepResult(
-        session = session.copy(
-            trainedMicrogpt = updatedMicrogpt,
-            optimizerState = update.optimizerState,
-            completedStepCount = progress.completedStepCount,
-            latestLoss = progress.loss,
-            progressHistory = progressHistory
-        ),
-        progress = progress,
-        progressHistory = progressHistory
+        parameterGradients = loss.backward(parameterIndexByValue)
     )
 }
 
@@ -753,7 +695,13 @@ suspend fun trainMicrogptStepParallel(
     require(batchDocumentCount > 0) { "batchDocumentCount must be positive" }
 
     val step = session.completedStepCount
+    val parameters = session.trainedMicrogpt.model.values()
+    val parameterIndexByValue = parameters.withIndex().associate { (parameterIndex, parameter) ->
+        parameter to parameterIndex
+    }
     val batchDocuments = trainingBatchDocuments(session.documents, step, batchDocumentCount)
+    val accumulatedParameterGradients = DoubleArray(parameters.size)
+
     val documentResults = coroutineScope {
         batchDocuments.map { document ->
             async(Dispatchers.Default) {
@@ -762,19 +710,32 @@ suspend fun trainMicrogptStepParallel(
                     model = session.trainedMicrogpt.model,
                     config = session.trainedMicrogpt.config,
                     tokenizer = session.trainedMicrogpt.tokenizer,
-                    document = document
+                    document = document,
+                    parameterIndexByValue = parameterIndexByValue
                 )
-                    //.also { println("Training document end") }
+                //.also { println("Training document end") }
             }
         }.awaitAll()
     }
-    val parameters = session.trainedMicrogpt.model.values()
+
     val averageLoss = documentResults.sumOf { it.loss } / documentResults.size.toDouble()
-    val averagedGradients = averageGradients(parameters, documentResults.map { it.gradients })
+
+
+    documentResults.forEach { documentResult ->
+        for (parameterIndex in accumulatedParameterGradients.indices) {
+            accumulatedParameterGradients[parameterIndex] += documentResult.parameterGradients[parameterIndex]
+        }
+    }
+
+    val inverseDocumentCount = 1.0 / batchDocuments.size.toDouble()
+
+    for (parameterIndex in accumulatedParameterGradients.indices) {
+        accumulatedParameterGradients[parameterIndex] *= inverseDocumentCount
+    }
 
     val update = applyAdamUpdate(
         model = session.trainedMicrogpt.model,
-        gradients = averagedGradients,
+        gradients = accumulatedParameterGradients,
         optimizerState = session.optimizerState,
         optimizerConfig = session.optimizerConfig,
         step = step,
@@ -844,7 +805,7 @@ fun calculateDocumentLoss(
 
 fun applyAdamUpdate(
     model: TransformerModelParameters,
-    gradients: Map<Value, Double>,
+    gradients: DoubleArray,
     optimizerState: AdamOptimizerState,
     optimizerConfig: AdamOptimizerConfig,
     step: Int,
@@ -854,7 +815,7 @@ fun applyAdamUpdate(
     val stepLearningRate = optimizerConfig.learningRate * (1.0 - step.toDouble() / trainingStepCount.toDouble())
 
     val parameterUpdates = parameters.mapIndexed { parameterIndex, parameter ->
-        val gradient = gradients[parameter] ?: 0.0
+        val gradient = gradients[parameterIndex]
         val firstMomentEstimate =
             optimizerConfig.firstMomentDecay * optimizerState.firstMomentEstimates[parameterIndex] +
                 (1.0 - optimizerConfig.firstMomentDecay) * gradient
@@ -889,23 +850,6 @@ fun applyAdamUpdate(
 }
 
 fun generateSamples(
-    trainedMicrogpt: TrainedMicrogpt,
-    prefix: String,
-    sampleCount: Int,
-    temperature: Double,
-    randomNumberGenerator: Random
-): List<String> =
-    generateSamples(
-        model = trainedMicrogpt.model,
-        config = trainedMicrogpt.config,
-        tokenizer = trainedMicrogpt.tokenizer,
-        prefix = prefix,
-        sampleCount = sampleCount,
-        temperature = temperature,
-        randomNumberGenerator = randomNumberGenerator
-    )
-
-fun generateSamples(
     model: TransformerModelParameters,
     config: TransformerConfig,
     tokenizer: CharacterTokenizer,
@@ -913,11 +857,9 @@ fun generateSamples(
     sampleCount: Int,
     temperature: Double,
     randomNumberGenerator: Random
-): List<String> {
-    return List(sampleCount) {
-        val sample = generateSample(model, config, tokenizer, prefix, temperature, randomNumberGenerator)
-        sample
-    }
+) = List(sampleCount) {
+    val sample = generateSample(model, config, tokenizer, prefix, temperature, randomNumberGenerator)
+    sample
 }
 
 fun generateSample(

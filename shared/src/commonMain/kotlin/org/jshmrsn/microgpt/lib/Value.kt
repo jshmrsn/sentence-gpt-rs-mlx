@@ -36,6 +36,23 @@ class Value(
     val children: List<Value> = emptyList(),
     val localGradients: List<Double> = emptyList()
 ) {
+    private fun topologicalOrder(): List<Value> {
+        val topologicalOrder = mutableListOf<Value>()
+        val visited = mutableSetOf<Value>()
+
+        fun buildTopologicalOrder(node: Value) {
+            if (visited.add(node)) {
+                for (child in node.children) {
+                    buildTopologicalOrder(child)
+                }
+                topologicalOrder.add(node)
+            }
+        }
+
+        buildTopologicalOrder(this)
+        return topologicalOrder
+    }
+
     /**
      * Addition node.
      *
@@ -199,22 +216,7 @@ class Value(
      * is the sum of the contributions from all those paths.
      */
     fun backward(): Map<Value, Double> {
-        val topologicalOrder: List<Value> = run {
-            val topologicalOrder = mutableListOf<Value>()
-            val visited = mutableSetOf<Value>()
-
-            fun buildTopologicalOrder(node: Value) {
-                if (visited.add(node)) {
-                    for (child in node.children) {
-                        buildTopologicalOrder(child)
-                    }
-                    topologicalOrder.add(node)
-                }
-            }
-
-            buildTopologicalOrder(this)
-            topologicalOrder
-        }
+        val topologicalOrder = topologicalOrder()
 
         // dL/dL = 1
         // d(loss)/d(loss) = 1
@@ -234,6 +236,26 @@ class Value(
             }
         }
         return gradients
+    }
+
+    fun backward(parameterIndexByValue: Map<Value, Int>): DoubleArray {
+        val topologicalOrder = topologicalOrder()
+        val gradients = mutableMapOf(this to 1.0)
+        val parameterGradients = DoubleArray(parameterIndexByValue.size)
+
+        for (node in topologicalOrder.asReversed()) {
+            val nodeGradient = gradients.remove(node) ?: 0.0
+            val parameterIndex = parameterIndexByValue[node]
+            if (parameterIndex != null) {
+                parameterGradients[parameterIndex] += nodeGradient
+            }
+            for (childIndex in node.children.indices) {
+                val child = node.children[childIndex]
+                gradients[child] = (gradients[child] ?: 0.0) + node.localGradients[childIndex] * nodeGradient
+            }
+        }
+
+        return parameterGradients
     }
 }
 

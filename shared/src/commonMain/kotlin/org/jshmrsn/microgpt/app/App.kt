@@ -47,10 +47,29 @@ import kotlin.text.contains
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.TimeSource
 
-private val TrainingFrameBudget = 500.milliseconds
-private const val ValidationStepInterval = 50
-private const val TrainingBatchDocumentCount = 16
-private const val DemoDocumentLimit = 500
+val trainingFrameBudget = 500.milliseconds
+val validationStepInterval = 50
+val trainingDocumentBatchSize = 16
+val maxDocumentCount = 2000
+
+val maxTrainingStepCount = 8000
+val validationSetDivisor = 20
+val validationEvaluationDocumentCount = 8
+val contextWindowSize = 64
+
+val transformerConfig = TransformerConfig(
+    layerCount = 3,
+    embeddingSize = 32,
+    contextWindowSize = contextWindowSize,
+    attentionHeadCount = 8
+)
+
+val optimizerConfig = AdamOptimizerConfig(
+    learningRate = 0.006,
+    firstMomentDecay = 0.9,
+    secondMomentDecay = 0.999,
+    epsilon = 1e-8
+)
 
 private data class TrainingChunkResult(
     val session: MicrogptTrainingSession,
@@ -104,7 +123,7 @@ private fun calculateValidationLoss(session: MicrogptTrainingSession, completedS
         session.validationEvaluationDocumentCount,
         session.validationDocuments.size
     )
-    val validationBatchIndex = completedStepCount / ValidationStepInterval
+    val validationBatchIndex = completedStepCount / validationStepInterval
     return (0 until validationDocumentCount).sumOf { validationOffset ->
         val validationIndex =
             (validationBatchIndex * validationDocumentCount + validationOffset) % session.validationDocuments.size
@@ -191,15 +210,13 @@ fun App() {
         var samples by remember { mutableStateOf(emptyList<String>()) }
         var visibleMicrogpt by remember { mutableStateOf<TrainedMicrogpt?>(null) }
         var trainingSessionState by remember { mutableStateOf<MicrogptTrainingSession?>(null) }
-        var nextValidationStep by remember { mutableStateOf(ValidationStepInterval) }
+        var nextValidationStep by remember { mutableStateOf(validationStepInterval) }
         var accumulatedTrainingMillis by remember { mutableStateOf(0L) }
         var isTrainingActive by remember { mutableStateOf(false) }
         var isGeneratingSamples by remember { mutableStateOf(false) }
         var resetGeneration by remember { mutableStateOf(0) }
         val coroutineScope = rememberCoroutineScope()
         val sampleRandomNumberGenerator = remember { Random(1) }
-
-        val contextWindowSize = 44
 
         LaunchedEffect(resetGeneration) {
             isTrainingActive = false
@@ -273,7 +290,7 @@ fun App() {
                                 .split(".")
                                 .filter { sentence -> excludeCharacters.none { it in sentence } }
                                 .map { sentence ->
-                                   sentence
+                                    sentence
                                         .replace("\n", "")
                                         .replace(",", "")
                                         .trim()
@@ -284,27 +301,17 @@ fun App() {
 
                     // Keep the interactive demo in a toy-data regime so the scalar
                     // training loop can complete multiple passes over the corpus.
-                    sentences.take(DemoDocumentLimit).shuffledBy(Random(1))
+                    sentences.take(maxDocumentCount).shuffledBy(Random(1))
                 }
 
                 createMicrogptTrainingSession(
                     inputDocuments = inputDocuments,
                     randomNumberGenerator = Random(1),
-                    trainingStepCount = 8000,
-                    validationSetDivisor = 20,
-                    validationEvaluationDocumentCount = 8,
-                    transformerConfig = TransformerConfig(
-                        layerCount = 4,
-                        embeddingSize = 32,
-                        contextWindowSize = contextWindowSize,
-                        attentionHeadCount = 8
-                    ),
-                    optimizerConfig = AdamOptimizerConfig(
-                        learningRate = 0.01,
-                        firstMomentDecay = 0.9,
-                        secondMomentDecay = 0.999,
-                        epsilon = 1e-8
-                    )
+                    trainingStepCount = maxTrainingStepCount,
+                    validationSetDivisor = validationSetDivisor,
+                    validationEvaluationDocumentCount = validationEvaluationDocumentCount,
+                    transformerConfig = transformerConfig,
+                    optimizerConfig = optimizerConfig
                 )
             }
 
@@ -330,7 +337,7 @@ fun App() {
             visibleMicrogpt = trainingSession.trainedMicrogpt
             trainedMicrogpt = trainingSession.trainedMicrogpt
             trainingSessionState = trainingSession
-            nextValidationStep = ValidationStepInterval
+            nextValidationStep = validationStepInterval
         }
 
         LaunchedEffect(isTrainingActive, resetGeneration) {
@@ -350,14 +357,14 @@ fun App() {
                     do {
                         val result = trainMicrogptStepParallel(
                             session = backgroundSession,
-                            batchDocumentCount = TrainingBatchDocumentCount
+                            batchDocumentCount = trainingDocumentBatchSize
                         ) ?: break
                         backgroundSession = result.session
                         latestResult = result
                     } while (
                         !backgroundSession.isComplete &&
                         backgroundSession.completedStepCount < backgroundNextValidationStep &&
-                        frameStart.elapsedNow() < TrainingFrameBudget
+                        frameStart.elapsedNow() < trainingFrameBudget
                     )
 
                     var result = latestResult ?: return@withContext null
@@ -369,7 +376,7 @@ fun App() {
                             )
                         )
                         backgroundSession = result.session
-                        backgroundNextValidationStep += ValidationStepInterval
+                        backgroundNextValidationStep += validationStepInterval
                     }
 
                     TrainingChunkResult(
@@ -413,8 +420,8 @@ fun App() {
             val currentTrainingSession = trainingSessionState
             val isTrainingComplete = currentTrainingSession?.isComplete == true
             val progress = completedStepCount.toFloat() / trainingStepCount.toFloat()
-            val completedDocumentTrainCount = completedStepCount * TrainingBatchDocumentCount
-            val totalDocumentTrainCount = trainingStepCount * TrainingBatchDocumentCount
+            val completedDocumentTrainCount = completedStepCount * trainingDocumentBatchSize
+            val totalDocumentTrainCount = trainingStepCount * trainingDocumentBatchSize
             val documentTrainsPerMinute = if (accumulatedTrainingMillis > 0L) {
                 completedDocumentTrainCount.toDouble() * 60_000.0 / accumulatedTrainingMillis.toDouble()
             } else {
@@ -451,7 +458,11 @@ fun App() {
             )
             Text("Step $completedStepCount / $trainingStepCount")
             Text(
-                text = "Document trains $completedDocumentTrainCount / $totalDocumentTrainCount | running avg ${formatRate(documentTrainsPerMinute)}/min",
+                text = "Document trains $completedDocumentTrainCount / $totalDocumentTrainCount | running avg ${
+                    formatRate(
+                        documentTrainsPerMinute
+                    )
+                }/min",
                 style = MaterialTheme.typography.labelMedium
             )
             Text(
@@ -460,7 +471,7 @@ fun App() {
             )
             if (trainingExampleCount > 0 || validationExampleCount > 0) {
                 Text(
-                    text = "Train examples $trainingExampleCount | validation examples $validationExampleCount | validation batch $validationEvaluationExampleCount | train batch $TrainingBatchDocumentCount",
+                    text = "Train examples $trainingExampleCount | validation examples $validationExampleCount | validation batch $validationEvaluationExampleCount | train batch $trainingDocumentBatchSize",
                     style = MaterialTheme.typography.labelMedium
                 )
             }
@@ -519,7 +530,9 @@ fun App() {
                         try {
                             val generatedSamples = withContext(Dispatchers.Default) {
                                 generateSamples(
-                                    trainedMicrogpt = model,
+                                    model = model.model,
+                                    config = model.config,
+                                    tokenizer = model.tokenizer,
                                     prefix = prefix,
                                     randomNumberGenerator = sampleRandomNumberGenerator,
                                     sampleCount = 10,
