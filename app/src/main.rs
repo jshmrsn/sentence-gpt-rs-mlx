@@ -1,27 +1,32 @@
 use dioxus::prelude::*;
-use microgpt_lib::{
-    attach_validation_loss, calculate_training_loss_baseline, calculate_validation_loss,
-    create_microgpt_training_session, generate_samples, train_microgpt_step, AdamOptimizerConfig,
-    Matrix, MicrogptTrainingProgress, MicrogptTrainingSession, TrainedMicrogpt, TransformerConfig,
-    Value,
-};
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+use microgpt_lib::microgpt::{attach_validation_loss, calculate_training_loss_baseline, calculate_validation_loss, create_microgpt_training_session, generate_samples, train_microgpt_step, AdamOptimizerConfig, Matrix, MicrogptTrainingProgress, MicrogptTrainingSession, TrainedMicrogpt, TransformerConfig};
+use microgpt_lib::value::Value;
 
 const TRAINING_FRAME_BUDGET: Duration = Duration::from_millis(500);
 const VALIDATION_STEP_INTERVAL: usize = 50;
-const TRAINING_DOCUMENT_BATCH_SIZE: usize = 16;
-const MAX_DOCUMENT_COUNT: usize = 3000;
+const TRAINING_DOCUMENT_BATCH_SIZE: usize = 20;
+const MAX_DOCUMENT_COUNT: usize = 20000;
 const MAX_TRAINING_STEP_COUNT: usize = 8_000;
 const VALIDATION_SET_DIVISOR: usize = 20;
 const VALIDATION_EVALUATION_DOCUMENT_COUNT: usize = 8;
-const CONTEXT_WINDOW_SIZE: usize = 64;
-const LAYER_COUNT: usize = 3;
-const ATTENTION_HEADS: usize = 8;
-const EMBEDDING_SIZE: usize = 64;
+const CONTEXT_WINDOW_SIZE: usize = 80;
+const LAYER_COUNT: usize = 2;
+const ATTENTION_HEADS: usize = 4;
+const EMBEDDING_SIZE: usize = 32;
+
+fn get_optimizer_config() -> AdamOptimizerConfig {
+    AdamOptimizerConfig {
+        learning_rate: 0.004,
+        first_moment_decay: 0.9,
+        second_moment_decay: 0.999,
+        epsilon: 1e-8,
+    }
+}
 
 const CSS: &str = r#"
 :root {
@@ -484,12 +489,7 @@ impl AppState {
         let mut rng = ChaCha8Rng::seed_from_u64(1);
         let transformer_config = TransformerConfig::new(LAYER_COUNT, EMBEDDING_SIZE, CONTEXT_WINDOW_SIZE, ATTENTION_HEADS)
             .expect("valid built-in transformer config");
-        let optimizer_config = AdamOptimizerConfig {
-            learning_rate: 0.006,
-            first_moment_decay: 0.9,
-            second_moment_decay: 0.999,
-            epsilon: 1e-8,
-        };
+        let optimizer_config = get_optimizer_config();
 
         let documents = load_input_documents();
         match documents {

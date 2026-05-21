@@ -3,11 +3,6 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use microgpt_lib::{
-    attach_validation_loss, calculate_training_loss_baseline, calculate_validation_loss,
-    create_microgpt_training_session, generate_samples, train_microgpt_step, AdamOptimizerConfig,
-    Matrix, MicrogptTrainingProgress, MicrogptTrainingSession, TransformerConfig, Value,
-};
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use ratatui::{
@@ -26,6 +21,8 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+use microgpt_lib::microgpt::{attach_validation_loss, calculate_training_loss_baseline, calculate_validation_loss, create_microgpt_training_session, generate_samples, train_microgpt_step, AdamOptimizerConfig, Matrix, MicrogptTrainingProgress, MicrogptTrainingSession, TransformerConfig};
+use microgpt_lib::value::Value;
 
 const TRAINING_FRAME_BUDGET: Duration = Duration::from_millis(500);
 const VALIDATION_STEP_INTERVAL: usize = 50;
