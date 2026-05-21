@@ -1,8 +1,8 @@
-use std::collections::HashMap;
-use std::f64::consts::PI;
+use crate::value::Value;
 use rand::Rng;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
-use crate::value::Value;
+use std::collections::HashMap;
+use std::f64::consts::PI;
 
 pub type Matrix = Vec<Vec<Value>>;
 pub type KeyValueCache = Vec<Vec<Vec<Value>>>;

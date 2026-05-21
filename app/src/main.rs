@@ -1,29 +1,42 @@
 use dioxus::prelude::*;
-use rand::SeedableRng;
+use microgpt_lib::microgpt::{
+    attach_validation_loss as attach_cpu_validation_loss,
+    calculate_training_loss_baseline as calculate_cpu_training_loss_baseline,
+    calculate_validation_loss as calculate_cpu_validation_loss, create_microgpt_training_session,
+    generate_samples as generate_cpu_samples, train_microgpt_step, AdamOptimizerConfig,
+    CharacterTokenizer, Matrix, MicrogptTrainingProgress, MicrogptTrainingSession, TrainedMicrogpt,
+    TransformerConfig,
+};
+use microgpt_lib::mlx_microgpt::{
+    attach_validation_loss as attach_mlx_validation_loss,
+    calculate_validation_loss as calculate_mlx_validation_loss,
+    create_mlx_microgpt_training_session, generate_samples as generate_mlx_samples,
+    matrix_heatmaps as build_mlx_matrix_heatmaps, train_mlx_microgpt_step, MlxMatrixHeatmap,
+    MlxMicrogptTrainingSession, MlxTrainedMicrogpt,
+};
+use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
-use microgpt_lib::microgpt::{attach_validation_loss, calculate_training_loss_baseline, calculate_validation_loss, create_microgpt_training_session, generate_samples, train_microgpt_step, AdamOptimizerConfig, Matrix, MicrogptTrainingProgress, MicrogptTrainingSession, TrainedMicrogpt, TransformerConfig};
-use microgpt_lib::value::Value;
 
 const TRAINING_FRAME_BUDGET: Duration = Duration::from_millis(500);
 const VALIDATION_STEP_INTERVAL: usize = 50;
 const TRAINING_DOCUMENT_BATCH_SIZE: usize = 20;
-const MAX_DOCUMENT_COUNT: usize = 20000;
+const MAX_DOCUMENT_COUNT: usize = 500;
 const MAX_TRAINING_STEP_COUNT: usize = 8_000;
 const VALIDATION_SET_DIVISOR: usize = 20;
 const VALIDATION_EVALUATION_DOCUMENT_COUNT: usize = 8;
-const CONTEXT_WINDOW_SIZE: usize = 80;
-const LAYER_COUNT: usize = 2;
-const ATTENTION_HEADS: usize = 4;
-const EMBEDDING_SIZE: usize = 32;
+const CONTEXT_WINDOW_SIZE: usize = 50;
+const LAYER_COUNT: usize = 4;
+const ATTENTION_HEADS: usize = 8;
+const EMBEDDING_SIZE: usize = 64;
 
 fn get_optimizer_config() -> AdamOptimizerConfig {
     AdamOptimizerConfig {
-        learning_rate: 0.004,
-        first_moment_decay: 0.9,
-        second_moment_decay: 0.999,
+        learning_rate: 0.01,
+        first_moment_decay: 0.85,
+        second_moment_decay: 0.99,
         epsilon: 1e-8,
     }
 }
@@ -111,7 +124,7 @@ button, input {
 
 .status-grid {
     display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(5, minmax(0, 1fr));
     gap: 10px;
 }
 
@@ -192,6 +205,58 @@ button, input {
     min-height: 22px;
 }
 
+.document-list {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+}
+
+.document-controls {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin: 8px 0 12px;
+}
+
+.page-button {
+    border: 1px solid #b9c8bf;
+    background: #fff;
+    color: #28533f;
+    border-radius: 6px;
+    padding: 5px 8px;
+    cursor: pointer;
+    min-width: 34px;
+}
+
+.page-button.active {
+    background: #28533f;
+    border-color: #28533f;
+    color: #fff;
+}
+
+.document-item {
+    display: grid;
+    grid-template-columns: 46px minmax(0, 1fr);
+    gap: 8px;
+    background: #fbfdfb;
+    border: 1px solid #d3ded7;
+    border-radius: 6px;
+    padding: 8px 10px;
+}
+
+.document-index {
+    color: #53645c;
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+}
+
+.document-text {
+    color: #17202a;
+    font-size: 13px;
+    line-height: 1.35;
+    overflow-wrap: anywhere;
+}
+
 .section-title {
     margin: 0 0 8px;
     font-size: 16px;
@@ -251,7 +316,7 @@ button, input {
         margin-top: 12px;
     }
 
-    .status-grid, .heatmap-groups, .samples {
+    .status-grid, .heatmap-groups, .samples, .document-list {
         grid-template-columns: 1fr;
     }
 
@@ -261,20 +326,175 @@ button, input {
 }
 "#;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Backend {
+    Mlx,
+    Cpu,
+}
+
+impl Backend {
+    fn label(self) -> &'static str {
+        match self {
+            Backend::Mlx => "MLX",
+            Backend::Cpu => "CPU",
+        }
+    }
+
+    fn toggled(self) -> Self {
+        match self {
+            Backend::Mlx => Backend::Cpu,
+            Backend::Cpu => Backend::Mlx,
+        }
+    }
+}
+
+#[derive(Clone)]
+enum TrainingSession {
+    Mlx(MlxMicrogptTrainingSession),
+    Cpu(MicrogptTrainingSession),
+}
+
+impl TrainingSession {
+    fn backend(&self) -> Backend {
+        match self {
+            TrainingSession::Mlx(_) => Backend::Mlx,
+            TrainingSession::Cpu(_) => Backend::Cpu,
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        match self {
+            TrainingSession::Mlx(session) => session.is_complete(),
+            TrainingSession::Cpu(session) => session.is_complete(),
+        }
+    }
+
+    fn completed_step_count(&self) -> usize {
+        match self {
+            TrainingSession::Mlx(session) => session.completed_step_count,
+            TrainingSession::Cpu(session) => session.completed_step_count,
+        }
+    }
+
+    fn training_step_count(&self) -> usize {
+        match self {
+            TrainingSession::Mlx(session) => session.training_step_count,
+            TrainingSession::Cpu(session) => session.training_step_count,
+        }
+    }
+
+    fn latest_loss(&self) -> Option<f64> {
+        match self {
+            TrainingSession::Mlx(session) => session.latest_loss,
+            TrainingSession::Cpu(session) => session.latest_loss,
+        }
+    }
+
+    fn latest_validation_loss(&self) -> Option<f64> {
+        match self {
+            TrainingSession::Mlx(session) => session.latest_validation_loss,
+            TrainingSession::Cpu(session) => session.latest_validation_loss,
+        }
+    }
+
+    fn training_document_count(&self) -> usize {
+        match self {
+            TrainingSession::Mlx(session) => session.documents.len(),
+            TrainingSession::Cpu(session) => session.documents.len(),
+        }
+    }
+
+    fn training_documents(&self) -> &[String] {
+        match self {
+            TrainingSession::Mlx(session) => session.documents.as_slice(),
+            TrainingSession::Cpu(session) => session.documents.as_slice(),
+        }
+    }
+
+    fn validation_document_count(&self) -> usize {
+        match self {
+            TrainingSession::Mlx(session) => session.validation_documents.len(),
+            TrainingSession::Cpu(session) => session.validation_documents.len(),
+        }
+    }
+
+    fn validation_evaluation_document_count(&self) -> usize {
+        match self {
+            TrainingSession::Mlx(session) => session
+                .validation_evaluation_document_count
+                .min(session.validation_documents.len()),
+            TrainingSession::Cpu(session) => session
+                .validation_evaluation_document_count
+                .min(session.validation_documents.len()),
+        }
+    }
+
+    fn tokenizer(&self) -> &CharacterTokenizer {
+        match self {
+            TrainingSession::Mlx(session) => &session.trained_microgpt.tokenizer,
+            TrainingSession::Cpu(session) => &session.trained_microgpt.tokenizer,
+        }
+    }
+
+    fn config(&self) -> &TransformerConfig {
+        match self {
+            TrainingSession::Mlx(session) => &session.trained_microgpt.config,
+            TrainingSession::Cpu(session) => &session.trained_microgpt.config,
+        }
+    }
+
+    fn progress_history(&self) -> &[MicrogptTrainingProgress] {
+        match self {
+            TrainingSession::Mlx(session) => session.progress_history.as_slice(),
+            TrainingSession::Cpu(session) => session.progress_history.as_slice(),
+        }
+    }
+
+    fn trained_snapshot(&self) -> TrainedSnapshot {
+        match self {
+            TrainingSession::Mlx(session) => TrainedSnapshot::Mlx(session.trained_microgpt.clone()),
+            TrainingSession::Cpu(session) => TrainedSnapshot::Cpu(session.trained_microgpt.clone()),
+        }
+    }
+}
+
+#[derive(Clone)]
+enum TrainedSnapshot {
+    Mlx(MlxTrainedMicrogpt),
+    Cpu(TrainedMicrogpt),
+}
+
+#[derive(Clone)]
+struct ModelHeatmap {
+    label: String,
+    rows: usize,
+    columns: usize,
+    values: Vec<f32>,
+    min: f32,
+    max: f32,
+    mean_abs: f32,
+}
+
 #[derive(Clone)]
 struct AppState {
-    session: Option<MicrogptTrainingSession>,
+    backend: Backend,
+    session: Option<TrainingSession>,
+    model_heatmaps: Vec<ModelHeatmap>,
     is_training_active: bool,
     is_training_busy: bool,
     manual_training_chunk_requested: bool,
+    generation_requested: bool,
     is_generating_samples: bool,
     next_validation_step: usize,
     accumulated_training_millis: u128,
     prefix: String,
+    training_document_search: String,
+    training_document_page: usize,
     temperature: f64,
     samples: Vec<String>,
     initialization_error: Option<String>,
     sample_rng: ChaCha8Rng,
+    training_document_page_rng: ChaCha8Rng,
 }
 
 #[derive(Deserialize)]
@@ -284,9 +504,22 @@ struct Story {
 }
 
 struct TrainingChunkResult {
-    session: MicrogptTrainingSession,
+    session: TrainingSession,
+    model_heatmaps: Vec<ModelHeatmap>,
     next_validation_step: usize,
     elapsed_millis: u128,
+}
+
+struct GenerationWork {
+    trained_microgpt: TrainedSnapshot,
+    prefix: String,
+    temperature: f64,
+    sample_rng: ChaCha8Rng,
+}
+
+struct GenerationResult {
+    samples: Vec<String>,
+    sample_rng: ChaCha8Rng,
 }
 
 fn main() {
@@ -299,6 +532,35 @@ fn App() -> Element {
 
     use_future(move || async move {
         loop {
+            let generation_work = {
+                let mut current = state.write();
+                current.take_generation_work()
+            };
+
+            if let Some(generation_work) = generation_work {
+                match tokio::task::spawn_blocking(move || {
+                    generate_samples_from_work(generation_work)
+                })
+                .await
+                {
+                    Ok(Ok(generation_result)) => {
+                        state.write().apply_generation_result(generation_result);
+                    }
+                    Ok(Err(error)) => {
+                        state
+                            .write()
+                            .apply_generation_error(format!("generation failed: {error}"));
+                    }
+                    Err(error) => {
+                        state
+                            .write()
+                            .apply_generation_error(format!("generation worker failed: {error}"));
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(16)).await;
+                continue;
+            }
+
             let training_work = {
                 let mut current = state.write();
                 current.take_training_work()
@@ -310,7 +572,13 @@ fn App() -> Element {
                 })
                 .await
                 {
-                    Ok(chunk_result) => state.write().apply_training_chunk(chunk_result),
+                    Ok(Ok(chunk_result)) => state.write().apply_training_chunk(chunk_result),
+                    Ok(Err(error)) => {
+                        let mut current = state.write();
+                        current.is_training_active = false;
+                        current.is_training_busy = false;
+                        current.initialization_error = Some(format!("training failed: {error}"));
+                    }
                     Err(error) => {
                         let mut current = state.write();
                         current.is_training_active = false;
@@ -331,46 +599,40 @@ fn App() -> Element {
     let completed_document_train_count = snapshot.completed_document_train_count();
     let total_document_train_count = snapshot.total_document_train_count();
     let document_trains_per_minute = snapshot.document_trains_per_minute();
+    let backend_label = snapshot.backend.label();
     let training_example_count = snapshot
         .session
         .as_ref()
-        .map(|session| session.documents.len())
+        .map(TrainingSession::training_document_count)
         .unwrap_or(0);
     let validation_example_count = snapshot
         .session
         .as_ref()
-        .map(|session| session.validation_documents.len())
+        .map(TrainingSession::validation_document_count)
         .unwrap_or(0);
     let validation_batch_count = snapshot
         .session
         .as_ref()
-        .map(|session| {
-            session
-                .validation_evaluation_document_count
-                .min(session.validation_documents.len())
-        })
+        .map(TrainingSession::validation_evaluation_document_count)
         .unwrap_or(0);
     let latest_loss = snapshot
         .session
         .as_ref()
-        .and_then(|session| session.latest_loss);
+        .and_then(TrainingSession::latest_loss);
     let latest_validation_loss = snapshot
         .session
         .as_ref()
-        .and_then(|session| session.latest_validation_loss);
+        .and_then(TrainingSession::latest_validation_loss);
     let vocabulary_size = snapshot
         .session
         .as_ref()
-        .map(|session| session.trained_microgpt.tokenizer.vocabulary_size())
+        .map(|session| session.tokenizer().vocabulary_size())
         .unwrap_or(0);
     let is_complete = snapshot
         .session
         .as_ref()
-        .is_some_and(MicrogptTrainingSession::is_complete);
-    let trained = snapshot
-        .session
-        .as_ref()
-        .map(|session| &session.trained_microgpt);
+        .is_some_and(TrainingSession::is_complete);
+    let visible_training_documents = selected_training_documents(&snapshot);
 
     rsx! {
         style { "{CSS}" }
@@ -379,7 +641,7 @@ fn App() -> Element {
                 div { class: "topbar",
                     div {
                         h1 { class: "title", "microgpt Rust Visualized" }
-                        p { class: "subtitle", "CPU scalar autograd Transformer training, ported from Kotlin Multiplatform Compose to Rust and Dioxus." }
+                        p { class: "subtitle", "Transformer training ported from Kotlin Multiplatform Compose to Rust and Dioxus, with MLX and dry Rust CPU backends." }
                     }
                     div { class: "actions",
                         button {
@@ -396,19 +658,29 @@ fn App() -> Element {
                         }
                         button {
                             class: "button secondary",
-                            onclick: move |_| state.set(AppState::initialize()),
+                            disabled: snapshot.is_training_busy || snapshot.is_generating_samples,
+                            onclick: move |_| state.write().toggle_backend(),
+                            "Backend: {backend_label}"
+                        }
+                        button {
+                            class: "button secondary",
+                            onclick: move |_| {
+                                let backend = state.read().backend;
+                                state.set(AppState::initialize_with_backend(backend));
+                            },
                             "Reset"
                         }
                     }
                 }
 
                 if let Some(error) = &snapshot.initialization_error {
-                    div { class: "panel", "Initialization failed: {error}" }
+                    div { class: "panel", "Error: {error}" }
                 }
 
                 section { class: "panel",
                     div { class: "status-grid",
                         {metric("Status", status)}
+                        {metric("Backend", backend_label.into())}
                         {metric("Step", format!("{} / {}", snapshot.completed_step_count(), snapshot.training_step_count()))}
                         {metric("Train loss", latest_loss.map(format_loss).unwrap_or_else(|| "pending".into()))}
                         {metric("Validation", latest_validation_loss.map(format_loss).unwrap_or_else(|| "pending".into()))}
@@ -436,6 +708,34 @@ fn App() -> Element {
                 }
 
                 section { class: "panel",
+                    h2 { class: "section-title", "Training documents" }
+                    div { class: "field",
+                        label { "Search training examples" }
+                        input {
+                            class: "text-input",
+                            value: "{snapshot.training_document_search}",
+                            placeholder: "Show first 10, or type to rank matches",
+                            oninput: move |event| state.write().training_document_search = event.value(),
+                            autocapitalize: false,
+                            autocomplete: false,
+                            autocorrect: false,
+                            spellcheck: false
+                        }
+                    }
+                    div { class: "model-summary",
+                        "Showing {visible_training_documents.len()} of {training_example_count} training examples"
+                    }
+                    div { class: "document-list",
+                        for (document_index, document) in visible_training_documents.iter() {
+                            div { class: "document-item",
+                                div { class: "document-index", "#{document_index + 1}" }
+                                div { class: "document-text", "{document}" }
+                            }
+                        }
+                    }
+                }
+
+                section { class: "panel",
                     h2 { class: "section-title", "Generate samples" }
                     div { class: "controls",
                         div { class: "field",
@@ -443,7 +743,11 @@ fn App() -> Element {
                             input {
                                 class: "text-input",
                                 value: "{snapshot.prefix}",
-                                oninput: move |event| state.write().prefix = event.value()
+                                oninput: move |event| state.write().prefix = event.value(),
+                                autocapitalize: false,
+                                autocomplete: false,
+                                autocorrect: false,
+                                spellcheck: false
                             }
                         }
                         div { class: "field",
@@ -471,13 +775,13 @@ fn App() -> Element {
                     }
                     div { class: "samples",
                         for (index, sample) in snapshot.samples.iter().enumerate() {
-                            div { class: "sample", "Sample {index + 1}: {sample}" }
+                            div { class: "sample", "{sample}" }
                         }
                     }
                 }
 
                 section { class: "panel",
-                    {model_visualization(trained, snapshot.completed_step_count())}
+                    {model_visualization(snapshot.session.as_ref(), &snapshot.model_heatmaps, snapshot.completed_step_count())}
                 }
             }
         }
@@ -486,38 +790,69 @@ fn App() -> Element {
 
 impl AppState {
     fn initialize() -> Self {
+        Self::initialize_with_backend(Backend::Mlx)
+    }
+
+    fn initialize_with_backend(backend: Backend) -> Self {
         let mut rng = ChaCha8Rng::seed_from_u64(1);
-        let transformer_config = TransformerConfig::new(LAYER_COUNT, EMBEDDING_SIZE, CONTEXT_WINDOW_SIZE, ATTENTION_HEADS)
-            .expect("valid built-in transformer config");
+        let transformer_config = TransformerConfig::new(
+            LAYER_COUNT,
+            EMBEDDING_SIZE,
+            CONTEXT_WINDOW_SIZE,
+            ATTENTION_HEADS,
+        )
+        .expect("valid built-in transformer config");
         let optimizer_config = get_optimizer_config();
 
         let documents = load_input_documents();
         match documents {
             Ok(input_documents) => {
-                let mut session = create_microgpt_training_session(
+                let session_result = create_training_session(
                     input_documents,
                     &mut rng,
-                    MAX_TRAINING_STEP_COUNT,
-                    VALIDATION_SET_DIVISOR,
-                    VALIDATION_EVALUATION_DOCUMENT_COUNT,
+                    backend,
                     transformer_config,
                     optimizer_config,
                 );
 
-                let train_loss = calculate_training_loss_baseline(&session);
-                let validation_loss =
-                    calculate_validation_loss(&session, 0, VALIDATION_STEP_INTERVAL);
-                session = session.with_initial_progress(train_loss, validation_loss);
+                let session = match session_result {
+                    Ok(session) => session,
+                    Err(error) => {
+                        return Self {
+                            backend,
+                            session: None,
+                            model_heatmaps: Vec::new(),
+                            is_training_active: false,
+                            is_training_busy: false,
+                            manual_training_chunk_requested: false,
+                            generation_requested: false,
+                            is_generating_samples: false,
+                            next_validation_step: VALIDATION_STEP_INTERVAL,
+                            accumulated_training_millis: 0,
+                            prefix: String::new(),
+                            training_document_search: String::new(),
+                            temperature: 0.5,
+                            samples: Vec::new(),
+                            initialization_error: Some(error),
+                            sample_rng: ChaCha8Rng::seed_from_u64(1),
+                        };
+                    }
+                };
+                let model_heatmaps = build_model_heatmaps(&session);
 
                 Self {
+                    backend,
                     session: Some(session),
+                    model_heatmaps,
                     is_training_active: false,
                     is_training_busy: false,
                     manual_training_chunk_requested: false,
+                    generation_requested: false,
                     is_generating_samples: false,
                     next_validation_step: VALIDATION_STEP_INTERVAL,
                     accumulated_training_millis: 0,
                     prefix: String::new(),
+                    training_document_search: String::new(),
                     temperature: 0.5,
                     samples: Vec::new(),
                     initialization_error: None,
@@ -525,14 +860,18 @@ impl AppState {
                 }
             }
             Err(error) => Self {
+                backend,
                 session: None,
+                model_heatmaps: Vec::new(),
                 is_training_active: false,
                 is_training_busy: false,
                 manual_training_chunk_requested: false,
+                generation_requested: false,
                 is_generating_samples: false,
                 next_validation_step: VALIDATION_STEP_INTERVAL,
                 accumulated_training_millis: 0,
                 prefix: String::new(),
+                training_document_search: String::new(),
                 temperature: 0.5,
                 samples: Vec::new(),
                 initialization_error: Some(error),
@@ -541,11 +880,18 @@ impl AppState {
         }
     }
 
+    fn toggle_backend(&mut self) {
+        if self.is_training_busy || self.is_generating_samples {
+            return;
+        }
+        *self = Self::initialize_with_backend(self.backend.toggled());
+    }
+
     fn toggle_training(&mut self) {
         if self
             .session
             .as_ref()
-            .is_some_and(MicrogptTrainingSession::is_complete)
+            .is_some_and(TrainingSession::is_complete)
         {
             self.is_training_active = false;
             return;
@@ -557,7 +903,7 @@ impl AppState {
         self.manual_training_chunk_requested = true;
     }
 
-    fn take_training_work(&mut self) -> Option<(MicrogptTrainingSession, usize)> {
+    fn take_training_work(&mut self) -> Option<(TrainingSession, usize)> {
         if self.is_training_busy {
             return None;
         }
@@ -582,30 +928,50 @@ impl AppState {
         self.next_validation_step = chunk_result.next_validation_step;
         self.is_training_active = !is_complete && self.is_training_active;
         self.is_training_busy = false;
+        self.model_heatmaps = chunk_result.model_heatmaps;
         self.session = Some(chunk_result.session);
     }
 
     fn generate(&mut self) {
-        let Some(session) = &self.session else {
+        if self.session.is_none() {
             return;
-        };
+        }
+        self.generation_requested = true;
         self.is_generating_samples = true;
-        self.samples = generate_samples(
-            &session.trained_microgpt.model,
-            &session.trained_microgpt.config,
-            &session.trained_microgpt.tokenizer,
-            &self.prefix,
-            10,
-            self.temperature,
-            &mut self.sample_rng,
-        );
+        self.initialization_error = None;
+    }
+
+    fn take_generation_work(&mut self) -> Option<GenerationWork> {
+        if self.is_training_busy || !self.generation_requested {
+            return None;
+        }
+        let session = self.session.as_ref()?;
+        self.generation_requested = false;
+        Some(GenerationWork {
+            trained_microgpt: session.trained_snapshot(),
+            prefix: self.prefix.clone(),
+            temperature: self.temperature,
+            sample_rng: self.sample_rng.clone(),
+        })
+    }
+
+    fn apply_generation_result(&mut self, generation_result: GenerationResult) {
+        self.samples = generation_result.samples;
+        self.sample_rng = generation_result.sample_rng;
         self.is_generating_samples = false;
+        self.initialization_error = None;
+    }
+
+    fn apply_generation_error(&mut self, error: String) {
+        self.is_generating_samples = false;
+        self.initialization_error = Some(error);
     }
 
     fn status_label(&self) -> String {
         match &self.session {
             None => "Initializing".into(),
             Some(session) if session.is_complete() => "Ready".into(),
+            Some(_) if self.is_generating_samples => "Generating".into(),
             Some(_) if self.is_training_busy => "Training".into(),
             Some(_) if self.is_training_active => "Training queued".into(),
             Some(_) => "Paused".into(),
@@ -615,14 +981,14 @@ impl AppState {
     fn completed_step_count(&self) -> usize {
         self.session
             .as_ref()
-            .map(|session| session.completed_step_count)
+            .map(TrainingSession::completed_step_count)
             .unwrap_or(0)
     }
 
     fn training_step_count(&self) -> usize {
         self.session
             .as_ref()
-            .map(|session| session.training_step_count)
+            .map(TrainingSession::training_step_count)
             .unwrap_or(1)
     }
 
@@ -649,17 +1015,124 @@ impl AppState {
     fn progress_history(&self) -> &[MicrogptTrainingProgress] {
         self.session
             .as_ref()
-            .map(|session| session.progress_history.as_slice())
+            .map(TrainingSession::progress_history)
             .unwrap_or(&[])
     }
 }
 
+fn create_training_session(
+    input_documents: Vec<String>,
+    rng: &mut ChaCha8Rng,
+    backend: Backend,
+    transformer_config: TransformerConfig,
+    optimizer_config: AdamOptimizerConfig,
+) -> Result<TrainingSession, String> {
+    match backend {
+        Backend::Mlx => create_mlx_microgpt_training_session(
+            input_documents,
+            rng,
+            MAX_TRAINING_STEP_COUNT,
+            VALIDATION_SET_DIVISOR,
+            VALIDATION_EVALUATION_DOCUMENT_COUNT,
+            transformer_config,
+            optimizer_config,
+        )
+        .with_initial_progress()
+        .map(TrainingSession::Mlx)
+        .map_err(|error| error.to_string()),
+        Backend::Cpu => {
+            let mut session = create_microgpt_training_session(
+                input_documents,
+                rng,
+                MAX_TRAINING_STEP_COUNT,
+                VALIDATION_SET_DIVISOR,
+                VALIDATION_EVALUATION_DOCUMENT_COUNT,
+                transformer_config,
+                optimizer_config,
+            );
+            let train_loss = calculate_cpu_training_loss_baseline(&session);
+            let validation_loss =
+                calculate_cpu_validation_loss(&session, 0, VALIDATION_STEP_INTERVAL);
+            session = session.with_initial_progress(train_loss, validation_loss);
+            Ok(TrainingSession::Cpu(session))
+        }
+    }
+}
+
 fn train_session_until_budget(
-    mut session: MicrogptTrainingSession,
+    session: TrainingSession,
     mut next_validation_step: usize,
-) -> TrainingChunkResult {
+) -> Result<TrainingChunkResult, String> {
     let chunk_start = Instant::now();
     let frame_start = Instant::now();
+    let session = match session {
+        TrainingSession::Mlx(session) => TrainingSession::Mlx(train_mlx_until_budget(
+            session,
+            &mut next_validation_step,
+            frame_start,
+        )?),
+        TrainingSession::Cpu(session) => TrainingSession::Cpu(train_cpu_until_budget(
+            session,
+            &mut next_validation_step,
+            frame_start,
+        )),
+    };
+
+    let model_heatmaps = build_model_heatmaps(&session);
+    Ok(TrainingChunkResult {
+        session,
+        model_heatmaps,
+        next_validation_step,
+        elapsed_millis: chunk_start.elapsed().as_millis(),
+    })
+}
+
+fn train_mlx_until_budget(
+    mut session: MlxMicrogptTrainingSession,
+    next_validation_step: &mut usize,
+    frame_start: Instant,
+) -> Result<MlxMicrogptTrainingSession, String> {
+    let mut latest_result = None;
+
+    loop {
+        let Some(result) = train_mlx_microgpt_step(session.clone(), TRAINING_DOCUMENT_BATCH_SIZE)
+            .map_err(|error| error.to_string())?
+        else {
+            break;
+        };
+        session = result.session.clone();
+        latest_result = Some(result);
+
+        if session.is_complete()
+            || session.completed_step_count >= *next_validation_step
+            || frame_start.elapsed() >= TRAINING_FRAME_BUDGET
+        {
+            break;
+        }
+    }
+
+    if let Some(mut result) = latest_result {
+        if session.completed_step_count >= *next_validation_step {
+            let validation_loss = calculate_mlx_validation_loss(
+                &session,
+                session.completed_step_count,
+                VALIDATION_STEP_INTERVAL,
+            )
+            .map_err(|error| error.to_string())?;
+            result = attach_mlx_validation_loss(result, validation_loss);
+            session = result.session;
+            *next_validation_step += VALIDATION_STEP_INTERVAL;
+        }
+    }
+
+    Ok(session)
+}
+
+fn train_cpu_until_budget(
+    mut session: MicrogptTrainingSession,
+    next_validation_step: &mut usize,
+    frame_start: Instant,
+) -> MicrogptTrainingSession {
     let mut latest_result = None;
 
     loop {
@@ -671,7 +1144,7 @@ fn train_session_until_budget(
         latest_result = Some(result);
 
         if session.is_complete()
-            || session.completed_step_count >= next_validation_step
+            || session.completed_step_count >= *next_validation_step
             || frame_start.elapsed() >= TRAINING_FRAME_BUDGET
         {
             break;
@@ -679,23 +1152,48 @@ fn train_session_until_budget(
     }
 
     if let Some(mut result) = latest_result {
-        if session.completed_step_count >= next_validation_step {
-            let validation_loss = calculate_validation_loss(
+        if session.completed_step_count >= *next_validation_step {
+            let validation_loss = calculate_cpu_validation_loss(
                 &session,
                 session.completed_step_count,
                 VALIDATION_STEP_INTERVAL,
             );
-            result = attach_validation_loss(result, validation_loss);
+            result = attach_cpu_validation_loss(result, validation_loss);
             session = result.session;
-            next_validation_step += VALIDATION_STEP_INTERVAL;
+            *next_validation_step += VALIDATION_STEP_INTERVAL;
         }
     }
 
-    TrainingChunkResult {
-        session,
-        next_validation_step,
-        elapsed_millis: chunk_start.elapsed().as_millis(),
-    }
+    session
+}
+
+fn generate_samples_from_work(mut work: GenerationWork) -> Result<GenerationResult, String> {
+    let samples = match &work.trained_microgpt {
+        TrainedSnapshot::Mlx(trained_microgpt) => generate_mlx_samples(
+            &trained_microgpt.model,
+            &trained_microgpt.config,
+            &trained_microgpt.tokenizer,
+            &work.prefix,
+            10,
+            work.temperature,
+            &mut work.sample_rng,
+        )
+        .map_err(|error| error.to_string())?,
+        TrainedSnapshot::Cpu(trained_microgpt) => generate_cpu_samples(
+            &trained_microgpt.model,
+            &trained_microgpt.config,
+            &trained_microgpt.tokenizer,
+            &work.prefix,
+            10,
+            work.temperature,
+            &mut work.sample_rng,
+        ),
+    };
+
+    Ok(GenerationResult {
+        samples,
+        sample_rng: work.sample_rng,
+    })
 }
 
 fn load_input_documents() -> Result<Vec<String>, String> {
@@ -771,6 +1269,74 @@ fn metric(label: &str, value: String) -> Element {
             div { class: "metric-value", "{value}" }
         }
     }
+}
+
+fn selected_training_documents(state: &AppState) -> Vec<(usize, String)> {
+    let Some(session) = &state.session else {
+        return Vec::new();
+    };
+    let documents = session.training_documents();
+    let query = state.training_document_search.trim().to_lowercase();
+    if query.is_empty() {
+        return documents
+            .iter()
+            .take(10)
+            .enumerate()
+            .map(|(index, document)| (index, document.clone()))
+            .collect();
+    }
+
+    let terms = query
+        .split_whitespace()
+        .filter(|term| !term.is_empty())
+        .collect::<Vec<_>>();
+    let mut scored_documents = documents
+        .iter()
+        .enumerate()
+        .map(|(index, document)| {
+            (
+                document_match_score(&document.to_lowercase(), &query, &terms),
+                index,
+                document.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    scored_documents.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    scored_documents
+        .into_iter()
+        .take(10)
+        .map(|(_, index, document)| (index, document))
+        .collect()
+}
+
+fn document_match_score(document: &str, query: &str, terms: &[&str]) -> usize {
+    let mut score = if document.contains(query) {
+        1_000 + query.len() * 4
+    } else {
+        ordered_character_score(document, query)
+    };
+
+    for term in terms {
+        if document.contains(term) {
+            score += 100 + term.len() * 8;
+            score += document.matches(term).count() * 25;
+        } else {
+            score += ordered_character_score(document, term);
+        }
+    }
+
+    score
+}
+
+fn ordered_character_score(document: &str, query: &str) -> usize {
+    let mut score = 0;
+    let mut document_chars = document.chars();
+    for query_character in query.chars() {
+        if document_chars.any(|document_character| document_character == query_character) {
+            score += 1;
+        }
+    }
+    score
 }
 
 fn loss_metric_text(label: &str, loss: f64, vocabulary_size: usize) -> Element {
@@ -876,49 +1442,120 @@ fn polyline_points(
 }
 
 fn model_visualization(
-    trained_microgpt: Option<&TrainedMicrogpt>,
+    session: Option<&TrainingSession>,
+    heatmaps: &[ModelHeatmap],
     completed_step_count: usize,
 ) -> Element {
-    let Some(trained_microgpt) = trained_microgpt else {
+    let Some(session) = session else {
         return rsx! { div { class: "model-summary", "Initializing model" } };
     };
 
-    let config = &trained_microgpt.config;
-    let tokenizer = &trained_microgpt.tokenizer;
+    let config = session.config();
+    let tokenizer = session.tokenizer();
+    let backend = session.backend().label();
 
     rsx! {
         div {
             h2 { class: "section-title", "Model values" }
             div { class: "model-summary",
-                "Step {completed_step_count} | layers {config.layer_count} | embedding {config.embedding_size} | heads {config.attention_head_count} x {config.attention_head_size} | context {config.context_window_size} | vocab {tokenizer.vocabulary_size()}"
+                "{backend} | Step {completed_step_count} | layers {config.layer_count} | embedding {config.embedding_size} | heads {config.attention_head_count} x {config.attention_head_size} | context {config.context_window_size} | vocab {tokenizer.vocabulary_size()}"
             }
-            h3 { class: "section-title", "Embeddings and output" }
+            h3 { class: "section-title", "Parameter arrays" }
             div { class: "heatmap-groups",
-                {matrix_heatmap("Token embedding", &trained_microgpt.model.token_embedding, None)}
-                {matrix_heatmap("Position embedding", &trained_microgpt.model.position_embedding, None)}
-                {matrix_heatmap("Language head", &trained_microgpt.model.language_model_head, None)}
-            }
-            h3 { class: "section-title layer", "Transformer layers" }
-            for (layer_index, layer) in trained_microgpt.model.layers.iter().enumerate() {
-                div { class: "layer",
-                    div { class: "model-summary", "Layer {layer_index + 1}" }
-                    div { class: "heatmap-groups",
-                        {matrix_heatmap("Q", &layer.attention.query_weights, None)}
-                        {matrix_heatmap("K", &layer.attention.key_weights, None)}
-                        {matrix_heatmap("V", &layer.attention.value_weights, None)}
-                        {matrix_heatmap("Attn out", &layer.attention.output_projection_weights, None)}
-                        {matrix_heatmap("FF expand", &layer.feed_forward.expansion_weights, None)}
-                        {matrix_heatmap("FF project", &layer.feed_forward.projection_weights, None)}
-                    }
+                for heatmap in heatmaps.iter() {
+                    {matrix_heatmap(heatmap, None)}
                 }
             }
         }
     }
 }
 
-fn matrix_heatmap(label: &str, matrix: &Matrix, scale: Option<f64>) -> Element {
+fn build_model_heatmaps(session: &TrainingSession) -> Vec<ModelHeatmap> {
+    match session {
+        TrainingSession::Mlx(session) => build_mlx_matrix_heatmaps(&session.trained_microgpt.model)
+            .into_iter()
+            .map(ModelHeatmap::from)
+            .collect(),
+        TrainingSession::Cpu(session) => build_cpu_model_heatmaps(&session.trained_microgpt),
+    }
+}
+
+fn build_cpu_model_heatmaps(trained_microgpt: &TrainedMicrogpt) -> Vec<ModelHeatmap> {
+    let model = &trained_microgpt.model;
+    let mut heatmaps = vec![
+        matrix_heatmap_data("Token embedding", &model.token_embedding),
+        matrix_heatmap_data("Position embedding", &model.position_embedding),
+        matrix_heatmap_data("Language head", &model.language_model_head),
+    ];
+    for (layer_index, layer) in model.layers.iter().enumerate() {
+        let prefix = format!("Layer {}", layer_index + 1);
+        heatmaps.push(matrix_heatmap_data(
+            &format!("{prefix} Q"),
+            &layer.attention.query_weights,
+        ));
+        heatmaps.push(matrix_heatmap_data(
+            &format!("{prefix} K"),
+            &layer.attention.key_weights,
+        ));
+        heatmaps.push(matrix_heatmap_data(
+            &format!("{prefix} V"),
+            &layer.attention.value_weights,
+        ));
+        heatmaps.push(matrix_heatmap_data(
+            &format!("{prefix} Attn out"),
+            &layer.attention.output_projection_weights,
+        ));
+        heatmaps.push(matrix_heatmap_data(
+            &format!("{prefix} FF expand"),
+            &layer.feed_forward.expansion_weights,
+        ));
+        heatmaps.push(matrix_heatmap_data(
+            &format!("{prefix} FF project"),
+            &layer.feed_forward.projection_weights,
+        ));
+    }
+    heatmaps
+}
+
+fn matrix_heatmap_data(label: &str, matrix: &Matrix) -> ModelHeatmap {
     let rows = matrix.len();
     let columns = matrix.first().map(Vec::len).unwrap_or(0);
+    let values = matrix
+        .iter()
+        .flat_map(|row| row.iter().map(|value| value.data() as f32))
+        .collect::<Vec<_>>();
+    let min = values.iter().copied().fold(f32::INFINITY, f32::min);
+    let max = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mean_abs = values.iter().map(|value| value.abs()).sum::<f32>() / values.len().max(1) as f32;
+    ModelHeatmap {
+        label: label.into(),
+        rows,
+        columns,
+        values,
+        min,
+        max,
+        mean_abs,
+    }
+}
+
+impl From<MlxMatrixHeatmap> for ModelHeatmap {
+    fn from(heatmap: MlxMatrixHeatmap) -> Self {
+        Self {
+            label: heatmap.label,
+            rows: heatmap.rows,
+            columns: heatmap.columns,
+            values: heatmap.values,
+            min: heatmap.min,
+            max: heatmap.max,
+            mean_abs: heatmap.mean_abs,
+        }
+    }
+}
+
+fn matrix_heatmap(matrix: &ModelHeatmap, scale: Option<f64>) -> Element {
+    let label = &matrix.label;
+    let rows = matrix.rows;
+    let columns = matrix.columns;
     if rows == 0 || columns == 0 {
         return rsx! { div { class: "heatmap-card", "{label}: empty" } };
     }
@@ -934,47 +1571,39 @@ fn matrix_heatmap(label: &str, matrix: &Matrix, scale: Option<f64>) -> Element {
                 span { "{stats}" }
             }
             div { class: "heatmap", style: "{grid_style}",
-                for row in matrix.iter() {
-                    for value in row.iter() {
-                        div { class: "cell", style: "{weight_style(value, scale)}" }
-                    }
+                for value in matrix.values.iter() {
+                    div { class: "cell", style: "{weight_style(*value, scale)}" }
                 }
             }
         }
     }
 }
 
-fn matrix_max_abs(matrix: &Matrix) -> f64 {
+fn matrix_max_abs(matrix: &ModelHeatmap) -> f64 {
     matrix
+        .values
         .iter()
-        .flat_map(|row| row.iter())
-        .map(|value| value.data().abs())
+        .map(|value| value.abs() as f64)
         .fold(0.0, f64::max)
 }
 
-fn matrix_stats(matrix: &Matrix) -> String {
-    let values: Vec<_> = matrix
-        .iter()
-        .flat_map(|row| row.iter().map(Value::data))
-        .collect();
-    if values.is_empty() {
+fn matrix_stats(matrix: &ModelHeatmap) -> String {
+    if matrix.values.is_empty() {
         return "empty".into();
     }
-    let min_value = values.iter().copied().fold(f64::INFINITY, f64::min);
-    let max_value = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let mean_abs = values.iter().map(|value| value.abs()).sum::<f64>() / values.len() as f64;
     format!(
         "min {} max {} mean |w| {}",
-        format_compact(min_value),
-        format_compact(max_value),
-        format_compact(mean_abs)
+        format_compact(matrix.min as f64),
+        format_compact(matrix.max as f64),
+        format_compact(matrix.mean_abs as f64)
     )
 }
 
-fn weight_style(value: &Value, scale: f64) -> String {
-    let strength = (value.data().abs() / scale).min(1.0);
+fn weight_style(value: f32, scale: f64) -> String {
+    let value = value as f64;
+    let strength = (value.abs() / scale).min(1.0);
     let alpha = 0.12 + strength * 0.88;
-    let color = if value.data() >= 0.0 {
+    let color = if value >= 0.0 {
         format!("rgba(25, 118, 210, {alpha:.3})")
     } else {
         format!("rgba(198, 40, 40, {alpha:.3})")

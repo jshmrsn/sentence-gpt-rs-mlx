@@ -2,25 +2,36 @@
 
 This repository now contains a Rust port of the original Kotlin Multiplatform Compose microgpt demo.
 
-- `lib/` contains the CPU-only LLM training library.
+- `lib/` contains the Rust LLM training library, including an MLX-backed tensor implementation optimized for Apple Silicon.
 - `app/` contains the Dioxus desktop UI.
 - `terminal/` contains the Ratatui terminal UI.
 - `shared/src/commonMain/composeResources/files/` is still used as the source for the bundled training data.
 
-The training implementation is deliberately dry Rust: scalar reverse-mode autograd, character tokenization, a small Transformer, cross-entropy loss, Adam updates, validation loss, and autoregressive sampling. It does not use tensor libraries or GPU acceleration.
+The original scalar reverse-mode autograd code remains in `microgpt_lib::microgpt`. The default app and TUI now train through `microgpt_lib::mlx_microgpt`, which stores parameters as MLX arrays and runs the Transformer matrix math, gradients, Adam updates, validation loss, and autoregressive sampling through `mlx-rs`.
+
+## Prerequisites
+
+The MLX backend needs the native Apple build tools:
+
+```sh
+brew install cmake
+xcodebuild -downloadComponent MetalToolchain
+```
+
+`mlx-rs` is enabled by default for `microgpt-lib`.
 
 ## Run
 
 Dioxus desktop app:
 
 ```sh
-cargo run -p microgpt-app
+cargo run --release -p microgpt-app
 ```
 
 Ratatui terminal app:
 
 ```sh
-cargo run -p microgpt-tui
+cargo run --release -p microgpt-tui
 ```
 
 ## Optimized Run And Build
@@ -52,7 +63,7 @@ cargo test --workspace
 
 ## Project Shape
 
-The library mirrors the original Kotlin `shared/src/commonMain/kotlin/org/jshmrsn/microgpt/lib` logic:
+The scalar library mirrors the original Kotlin `shared/src/commonMain/kotlin/org/jshmrsn/microgpt/lib` logic:
 
 - `Value` is the scalar autograd node.
 - `TransformerModelParameters` owns token embeddings, position embeddings, attention weights, feed-forward weights, and the language-model head.
@@ -62,16 +73,18 @@ The library mirrors the original Kotlin `shared/src/commonMain/kotlin/org/jshmrs
 The Dioxus app mirrors the Compose UI flow:
 
 - Start, pause, reset, and chunk training controls.
+- Runtime backend switching between MLX and the dry Rust CPU backend. Switching resets the current session.
 - Training and validation loss metrics.
 - Loss history chart.
 - Prefix and temperature sample generation.
-- Weight heatmaps for embeddings, language head, and each Transformer layer.
+- Parameter heatmaps for embeddings, language head, and each Transformer layer.
 
 The Ratatui app provides the same training and sampling loop in the terminal:
 
 - `s` starts or pauses background training.
 - `c` runs one background training chunk.
 - `g` or `Enter` generates samples.
+- `b` toggles between the MLX and dry Rust CPU backends, resetting the current session.
 - Typed characters edit the prefix; `Backspace` deletes.
 - `+` and `-` adjust temperature.
 - `r` resets and `q` or `Esc` quits.
