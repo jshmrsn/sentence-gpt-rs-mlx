@@ -7,6 +7,10 @@ use std::f64::consts::PI;
 pub type Matrix = Vec<Vec<Value>>;
 pub type KeyValueCache = Vec<Vec<Vec<Value>>>;
 
+const MAX_GRADIENT_NORM: f64 = 1.0;
+const SAMPLING_TOP_K: usize = 8;
+const MIN_GENERATED_CHARACTER_COUNT: usize = 8;
+
 #[derive(Clone, Debug)]
 pub struct AttentionParameters {
     pub query_weights: Matrix,
@@ -43,24 +47,28 @@ impl TransformerModelParameters {
         layer_count: usize,
         random_number_generator: &mut impl Rng,
     ) -> Self {
+        let embedding_std = 0.02;
+        let projection_std = (1.0 / embedding_size as f64).sqrt();
+        let residual_projection_std = projection_std / (2.0 * layer_count as f64).sqrt();
+
         Self {
             token_embedding: matrix(
                 vocabulary_size,
                 embedding_size,
                 random_number_generator,
-                0.08,
+                embedding_std,
             ),
             position_embedding: matrix(
                 context_window_size,
                 embedding_size,
                 random_number_generator,
-                0.08,
+                embedding_std,
             ),
             language_model_head: matrix(
                 vocabulary_size,
                 embedding_size,
                 random_number_generator,
-                0.08,
+                projection_std,
             ),
             layers: (0..layer_count)
                 .map(|_| TransformerLayerParameters {
@@ -69,25 +77,25 @@ impl TransformerModelParameters {
                             embedding_size,
                             embedding_size,
                             random_number_generator,
-                            0.08,
+                            projection_std,
                         ),
                         key_weights: matrix(
                             embedding_size,
                             embedding_size,
                             random_number_generator,
-                            0.08,
+                            projection_std,
                         ),
                         value_weights: matrix(
                             embedding_size,
                             embedding_size,
                             random_number_generator,
-                            0.08,
+                            projection_std,
                         ),
                         output_projection_weights: matrix(
                             embedding_size,
                             embedding_size,
                             random_number_generator,
-                            0.08,
+                            residual_projection_std,
                         ),
                     },
                     feed_forward: FeedForwardParameters {
@@ -95,13 +103,13 @@ impl TransformerModelParameters {
                             4 * embedding_size,
                             embedding_size,
                             random_number_generator,
-                            0.08,
+                            projection_std,
                         ),
                         projection_weights: matrix(
                             embedding_size,
                             4 * embedding_size,
                             random_number_generator,
-                            0.08,
+                            residual_projection_std,
                         ),
                     },
                 })
@@ -443,6 +451,20 @@ pub fn softmax(logits: &[Value]) -> Vec<Value> {
         .collect()
 }
 
+pub fn cross_entropy_loss(logits: &[Value], target_token_id: usize) -> Value {
+    let max_logit_value = logits
+        .iter()
+        .map(Value::data)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let exponential_sum = logits.iter().fold(Value::new(0.0), |sum, logit| {
+        sum.add(&logit.add_f64(-max_logit_value).exp())
+    });
+    exponential_sum
+        .log()
+        .add_f64(max_logit_value)
+        .sub(&logits[target_token_id])
+}
+
 pub fn rmsnorm(input_vector: &[Value]) -> Vec<Value> {
     let mean_square = input_vector
         .iter()
@@ -768,8 +790,7 @@ pub fn train_on_document(
         let model_run = run_transformer_model(model, config, token_id, position_id, keys, values);
         keys = model_run.keys;
         values = model_run.values;
-        let probabilities = softmax(&model_run.logits);
-        let position_loss = probabilities[target_token_id].log().neg();
+        let position_loss = cross_entropy_loss(&model_run.logits, target_token_id);
         loss = loss.add(&position_loss);
     }
 
@@ -851,6 +872,7 @@ pub fn apply_adam_update(
     training_step_count: usize,
 ) -> AdamUpdateResult {
     let parameters = model.values();
+    let clipped_gradients = clipped_gradients(gradients, MAX_GRADIENT_NORM);
     let step_learning_rate =
         optimizer_config.learning_rate * (1.0 - step as f64 / training_step_count as f64);
 
@@ -858,7 +880,7 @@ pub fn apply_adam_update(
         .iter()
         .enumerate()
         .map(|(parameter_index, parameter)| {
-            let gradient = gradients[parameter_index];
+            let gradient = clipped_gradients[parameter_index];
             let first_moment_estimate = optimizer_config.first_moment_decay
                 * optimizer_state.first_moment_estimates[parameter_index]
                 + (1.0 - optimizer_config.first_moment_decay) * gradient;
@@ -899,6 +921,19 @@ pub fn apply_adam_update(
                 .collect(),
         },
     }
+}
+
+fn clipped_gradients(gradients: &[f64], max_norm: f64) -> Vec<f64> {
+    let norm = gradients
+        .iter()
+        .map(|gradient| gradient * gradient)
+        .sum::<f64>()
+        .sqrt();
+    if norm <= max_norm || norm == 0.0 {
+        return gradients.to_vec();
+    }
+    let scale = max_norm / (norm + 1e-12);
+    gradients.iter().map(|gradient| gradient * scale).collect()
 }
 
 pub fn generate_samples(
@@ -960,7 +995,13 @@ pub fn generate_sample(
             .map(|logit| logit.div_f64(temperature))
             .collect();
         let probabilities = softmax(&scaled_logits);
-        let probability_data: Vec<_> = probabilities.iter().map(Value::data).collect();
+        let mut probability_data: Vec<_> = probabilities.iter().map(Value::data).collect();
+        apply_sampling_constraints(
+            &mut probability_data,
+            tokenizer,
+            &sample,
+            normalized_prefix.chars().count(),
+        );
 
         token_id = weighted_choice(&probability_data, random_number_generator);
         if token_id == tokenizer.sequence_boundary_token_id {
@@ -971,6 +1012,72 @@ pub fn generate_sample(
     }
 
     sample
+}
+
+pub fn apply_sampling_constraints(
+    probabilities: &mut [f64],
+    tokenizer: &CharacterTokenizer,
+    sample: &str,
+    prefix_character_count: usize,
+) {
+    if probabilities.is_empty() {
+        return;
+    }
+
+    if sample
+        .chars()
+        .count()
+        .saturating_sub(prefix_character_count)
+        < MIN_GENERATED_CHARACTER_COUNT
+    {
+        probabilities[tokenizer.sequence_boundary_token_id] = 0.0;
+    }
+
+    if sample.is_empty() || sample.ends_with(' ') {
+        if let Some(space_token_id) = tokenizer.character_to_token_id.get(&' ') {
+            probabilities[*space_token_id] = 0.0;
+        }
+    }
+
+    keep_top_k(probabilities, SAMPLING_TOP_K);
+
+    if probabilities.iter().all(|probability| *probability <= 0.0) {
+        for probability in probabilities {
+            *probability = 1.0;
+        }
+    }
+}
+
+fn keep_top_k(probabilities: &mut [f64], top_k: usize) {
+    if top_k == 0 || probabilities.len() <= top_k {
+        return;
+    }
+
+    let mut sorted_probabilities = probabilities.to_vec();
+    sorted_probabilities.sort_by(|left, right| right.total_cmp(left));
+    let threshold = sorted_probabilities[top_k - 1];
+    for probability in probabilities {
+        if *probability < threshold {
+            *probability = 0.0;
+        }
+    }
+}
+
+pub fn normalize_training_document(document: &str) -> String {
+    let mut normalized = String::with_capacity(document.len());
+    let mut previous_was_space = true;
+
+    for character in document.chars().flat_map(char::to_lowercase) {
+        if character.is_ascii_lowercase() {
+            normalized.push(character);
+            previous_was_space = false;
+        } else if character.is_whitespace() && !previous_was_space {
+            normalized.push(' ');
+            previous_was_space = true;
+        }
+    }
+
+    normalized.trim().to_string()
 }
 
 pub fn create_microgpt_training_session(
@@ -984,7 +1091,7 @@ pub fn create_microgpt_training_session(
 ) -> MicrogptTrainingSession {
     let trimmed_documents: Vec<_> = input_documents
         .into_iter()
-        .map(|document| document.trim().to_string())
+        .map(|document| normalize_training_document(&document))
         .filter(|document| !document.is_empty())
         .collect();
     let shuffled_documents = shuffled_by(&trimmed_documents, random_number_generator);

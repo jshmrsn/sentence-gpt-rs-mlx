@@ -1,9 +1,11 @@
 use crate::microgpt::{
-    random_gaussian, shuffled_by, AdamOptimizerConfig, CharacterTokenizer,
-    MicrogptTrainingProgress, TransformerConfig,
+    apply_sampling_constraints, normalize_training_document, random_gaussian, shuffled_by,
+    AdamOptimizerConfig, CharacterTokenizer, MicrogptTrainingProgress, TransformerConfig,
 };
 use mlx_rs::{error::Result as MlxResult, ops, ops::indexing::IndexOp, transforms, Array};
 use rand::Rng;
+
+const MAX_GRADIENT_NORM: f32 = 1.0;
 
 #[derive(Clone, Debug)]
 pub struct MlxAttentionParameters {
@@ -41,24 +43,28 @@ impl MlxTransformerModelParameters {
         layer_count: usize,
         random_number_generator: &mut impl Rng,
     ) -> Self {
+        let embedding_std = 0.02;
+        let projection_std = (1.0 / embedding_size as f64).sqrt();
+        let residual_projection_std = projection_std / (2.0 * layer_count as f64).sqrt();
+
         Self {
             token_embedding: mlx_matrix(
                 vocabulary_size,
                 embedding_size,
                 random_number_generator,
-                0.08,
+                embedding_std,
             ),
             position_embedding: mlx_matrix(
                 context_window_size,
                 embedding_size,
                 random_number_generator,
-                0.08,
+                embedding_std,
             ),
             language_model_head: mlx_matrix(
                 vocabulary_size,
                 embedding_size,
                 random_number_generator,
-                0.08,
+                projection_std,
             ),
             layers: (0..layer_count)
                 .map(|_| MlxTransformerLayerParameters {
@@ -67,25 +73,25 @@ impl MlxTransformerModelParameters {
                             embedding_size,
                             embedding_size,
                             random_number_generator,
-                            0.08,
+                            projection_std,
                         ),
                         key_weights: mlx_matrix(
                             embedding_size,
                             embedding_size,
                             random_number_generator,
-                            0.08,
+                            projection_std,
                         ),
                         value_weights: mlx_matrix(
                             embedding_size,
                             embedding_size,
                             random_number_generator,
-                            0.08,
+                            projection_std,
                         ),
                         output_projection_weights: mlx_matrix(
                             embedding_size,
                             embedding_size,
                             random_number_generator,
-                            0.08,
+                            residual_projection_std,
                         ),
                     },
                     feed_forward: MlxFeedForwardParameters {
@@ -93,13 +99,13 @@ impl MlxTransformerModelParameters {
                             4 * embedding_size,
                             embedding_size,
                             random_number_generator,
-                            0.08,
+                            projection_std,
                         ),
                         projection_weights: mlx_matrix(
                             embedding_size,
                             4 * embedding_size,
                             random_number_generator,
-                            0.08,
+                            residual_projection_std,
                         ),
                     },
                 })
@@ -269,7 +275,7 @@ pub fn create_mlx_microgpt_training_session(
 ) -> MlxMicrogptTrainingSession {
     let trimmed_documents: Vec<_> = input_documents
         .into_iter()
-        .map(|document| document.trim().to_string())
+        .map(|document| normalize_training_document(&document))
         .filter(|document| !document.is_empty())
         .collect();
     let shuffled_documents = shuffled_by(&trimmed_documents, random_number_generator);
@@ -546,8 +552,18 @@ pub fn generate_sample(
         let scaled_logits = &run.logits / Array::from_f32(temperature as f32);
         let probabilities = ops::softmax_axis(&scaled_logits, 0, None)?;
         probabilities.eval()?;
-        let weights = probabilities.as_slice::<f32>();
-        token_id = weighted_choice(weights, random_number_generator);
+        let mut weights = probabilities
+            .as_slice::<f32>()
+            .iter()
+            .map(|probability| *probability as f64)
+            .collect::<Vec<_>>();
+        apply_sampling_constraints(
+            &mut weights,
+            tokenizer,
+            &sample,
+            normalized_prefix.chars().count(),
+        );
+        token_id = weighted_choice(&weights, random_number_generator);
         if token_id == tokenizer.sequence_boundary_token_id {
             break;
         }
@@ -838,6 +854,7 @@ fn apply_adam_update(
     let epsilon = Array::from_f32(optimizer_config.epsilon as f32);
     let first_bias_correction = Array::from_f32(1.0 - beta1.powf(step as f32 + 1.0));
     let second_bias_correction = Array::from_f32(1.0 - beta2.powf(step as f32 + 1.0));
+    let gradient_scale = gradient_clip_scale(gradients, MAX_GRADIENT_NORM)?;
 
     let mut updated_parameters = Vec::with_capacity(parameters.len());
     let mut first_moment_estimates = Vec::with_capacity(parameters.len());
@@ -849,10 +866,11 @@ fn apply_adam_update(
         .zip(optimizer_state.first_moment_estimates.iter())
         .zip(optimizer_state.second_moment_estimates.iter())
     {
+        let gradient = gradient * &gradient_scale;
         let new_first_moment =
-            first_moment * Array::from_f32(beta1) + gradient * Array::from_f32(1.0 - beta1);
+            first_moment * Array::from_f32(beta1) + &gradient * Array::from_f32(1.0 - beta1);
         let new_second_moment = second_moment * Array::from_f32(beta2)
-            + ops::square(gradient)? * Array::from_f32(1.0 - beta2);
+            + ops::square(&gradient)? * Array::from_f32(1.0 - beta2);
         let bias_corrected_first_moment = &new_first_moment / &first_bias_correction;
         let bias_corrected_second_moment = &new_second_moment / &second_bias_correction;
         let update = &learning_rate * bias_corrected_first_moment
@@ -874,6 +892,16 @@ fn apply_adam_update(
             second_moment_estimates,
         },
     ))
+}
+
+fn gradient_clip_scale(gradients: &[Array], max_norm: f32) -> MlxResult<Array> {
+    let squared_norms = gradients
+        .iter()
+        .map(|gradient| ops::sum(&ops::square(gradient)?, None))
+        .collect::<MlxResult<Vec<_>>>()?;
+    let total_squared_norm = ops::sum(&ops::stack_axis(&squared_norms, 0)?, None)?;
+    let scale = Array::from_f32(max_norm) / (total_squared_norm.sqrt()? + Array::from_f32(1e-12));
+    ops::clip(scale, ((), 1.0))
 }
 
 fn create_key_value_cache(layer_count: usize) -> Vec<Vec<Array>> {
@@ -903,9 +931,9 @@ fn mlx_matrix(
     Array::from_slice(&data, &[output_size as i32, input_size as i32])
 }
 
-fn weighted_choice(weights: &[f32], random_number_generator: &mut impl Rng) -> usize {
-    let total: f32 = weights.iter().sum();
-    let mut random_threshold = random_number_generator.gen::<f32>() * total;
+fn weighted_choice(weights: &[f64], random_number_generator: &mut impl Rng) -> usize {
+    let total: f64 = weights.iter().sum();
+    let mut random_threshold = random_number_generator.gen::<f64>() * total;
     for (weight_index, weight) in weights.iter().enumerate() {
         random_threshold -= weight;
         if random_threshold <= 0.0 {

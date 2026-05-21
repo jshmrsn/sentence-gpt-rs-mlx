@@ -9,6 +9,8 @@ This repository now contains a Rust port of the original Kotlin Multiplatform Co
 
 The original scalar reverse-mode autograd code remains in `microgpt_lib::microgpt`. The default app and TUI now train through `microgpt_lib::mlx_microgpt`, which stores parameters as MLX arrays and runs the Transformer matrix math, gradients, Adam updates, validation loss, and autoregressive sampling through `mlx-rs`.
 
+Both backends keep character-level tokens. Input documents are normalized to lowercase `a-z` plus spaces before tokenization, which keeps the vocabulary focused on simple sentence generation.
+
 ## Prerequisites
 
 The MLX backend needs the native Apple build tools:
@@ -69,6 +71,8 @@ The scalar library mirrors the original Kotlin `shared/src/commonMain/kotlin/org
 - `TransformerModelParameters` owns token embeddings, position embeddings, attention weights, feed-forward weights, and the language-model head.
 - `train_microgpt_step` batches documents, accumulates gradients, and applies Adam on CPU.
 - `generate_sample` and `generate_samples` run autoregressive character sampling.
+- Training uses log-sum-exp cross-entropy, residual-scaled initialization, and global gradient clipping.
+- Sampling uses top-k filtering plus simple sentence constraints to avoid immediate end tokens, leading spaces, and repeated spaces.
 
 The Dioxus app mirrors the Compose UI flow:
 
