@@ -5,7 +5,7 @@ pub use microgpt_lib::microgpt::AdamOptimizerConfig;
 pub const TRAINING_FRAME_BUDGET: Duration = Duration::from_millis(500);
 pub const VALIDATION_STEP_INTERVAL: usize = 25;
 pub const TRAINING_DOCUMENT_BATCH_SIZE: usize = 32;
-pub const MAX_DOCUMENT_COUNT: usize = 20000;
+pub const MAX_DOCUMENT_COUNT: usize = 50000;
 pub const MAX_TRAINING_STEP_COUNT: usize = 8_000;
 pub const VALIDATION_SET_DIVISOR: usize = 20;
 pub const VALIDATION_EVALUATION_DOCUMENT_COUNT: usize = 12;
