@@ -85,6 +85,12 @@ button, input {
     gap: 10px;
 }
 
+.config-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 10px;
+}
+
 .metric {
     border-left: 3px solid #28533f;
     padding-left: 10px;
@@ -298,7 +304,7 @@ button, input {
         margin-top: 12px;
     }
 
-    .status-grid, .heatmap-groups, .samples, .document-list {
+    .status-grid, .config-grid, .heatmap-groups, .samples, .document-list {
         grid-template-columns: 1fr;
     }
 

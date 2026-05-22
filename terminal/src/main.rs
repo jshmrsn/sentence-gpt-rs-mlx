@@ -24,10 +24,10 @@ use sentence_gpt_rs_mlx_config::{
     create_training_session, format_compact, format_count, format_learning_rate, format_loss,
     get_optimizer_config, load_input_documents, next_validation_step_after, running_mean_loss,
     train_session_until_budget as train_shared_session_until_budget, Backend, TrainingSession,
-    ATTENTION_HEADS, CONTEXT_WINDOW_SIZE, EMBEDDING_SIZE, LAYER_COUNT,
-    TRAINING_DOCUMENT_BATCH_SIZE, VALIDATION_STEP_INTERVAL,
 };
-use sentence_gpt_rs_mlx_lib::checkpoint::{load_checkpoint_from_path, save_checkpoint_to_path};
+use sentence_gpt_rs_mlx_lib::checkpoint::{
+    load_checkpoint_from_path, save_checkpoint_to_path, TrainingRunConfig,
+};
 use sentence_gpt_rs_mlx_lib::microgpt::{
     generate_samples as generate_cpu_samples, Matrix, MicrogptTrainingProgress, TrainedMicrogpt,
     TransformerConfig, Vector,
@@ -64,6 +64,7 @@ struct TrainingChunkResult {
 
 struct App {
     session: TrainingSession,
+    training_run_config: TrainingRunConfig,
     // Matrix summaries are hidden by default because collecting them requires
     // reading parameter tensors back for display. Press `v` when you want to
     // inspect value ranges.
@@ -127,31 +128,40 @@ impl App {
     }
 
     fn initialize_with_backend(backend: Backend) -> Result<Self, String> {
+        Self::initialize_with_config(backend, backend.default_training_run_config())
+    }
+
+    fn initialize_with_config(
+        backend: Backend,
+        training_run_config: TrainingRunConfig,
+    ) -> Result<Self, String> {
         let mut rng = ChaCha8Rng::seed_from_u64(1);
         let transformer_config = TransformerConfig::new(
-            LAYER_COUNT,
-            EMBEDDING_SIZE,
-            CONTEXT_WINDOW_SIZE,
-            ATTENTION_HEADS,
+            training_run_config.layer_count,
+            training_run_config.embedding_size,
+            training_run_config.context_window_size,
+            training_run_config.attention_heads,
         )
-        .expect("valid built-in transformer config");
+        .map_err(|error| error.to_string())?;
         let optimizer_config = get_optimizer_config();
-        let input_documents = load_input_documents()?;
+        let input_documents = load_input_documents(training_run_config)?;
         let session = create_training_session(
             input_documents,
             &mut rng,
             backend,
             transformer_config,
             optimizer_config,
+            training_run_config,
         )?;
         Ok(Self {
             session,
+            training_run_config,
             matrix_summaries: Vec::new(),
             visualize_network_values: false,
             is_training_active: false,
             is_training_busy: false,
             generation_requested: false,
-            next_validation_step: VALIDATION_STEP_INTERVAL,
+            next_validation_step: training_run_config.validation_step_interval,
             accumulated_training_millis: 0,
             throughput_start_step: 0,
             prefix: String::new(),
@@ -246,7 +256,7 @@ impl App {
         let path = checkpoint_file_path();
         match self
             .session
-            .export_checkpoint()
+            .export_checkpoint(self.training_run_config)
             .and_then(|checkpoint| save_checkpoint_to_path(&checkpoint, &path))
         {
             Ok(()) => self.status_message = format!("Exported {}", path.display()),
@@ -259,13 +269,20 @@ impl App {
             return;
         }
         let path = checkpoint_file_path();
-        match load_checkpoint_from_path(&path)
-            .and_then(|checkpoint| TrainingSession::import_checkpoint(&checkpoint))
-        {
-            Ok(session) => {
+        match load_checkpoint_from_path(&path).and_then(|checkpoint| {
+            let training_run_config = checkpoint.training_run_config.unwrap_or_else(|| {
+                Backend::from_checkpoint_backend(checkpoint.backend).default_training_run_config()
+            });
+            TrainingSession::import_checkpoint(&checkpoint)
+                .map(|session| (session, training_run_config))
+        }) {
+            Ok((session, training_run_config)) => {
                 self.session = session;
-                self.next_validation_step =
-                    next_validation_step_after(self.session.completed_step_count());
+                self.training_run_config = training_run_config;
+                self.next_validation_step = next_validation_step_after(
+                    self.session.completed_step_count(),
+                    self.training_run_config.validation_step_interval,
+                );
                 self.accumulated_training_millis = 0;
                 self.throughput_start_step = self.session.completed_step_count();
                 self.is_training_active = false;
@@ -336,14 +353,19 @@ impl App {
         let session = self.session.clone();
         let next_validation_step = self.next_validation_step;
         let visualize_network_values = self.visualize_network_values;
+        let training_run_config = self.training_run_config;
         let (sender, receiver) = mpsc::channel();
         self.is_training_busy = true;
         self.training_receiver = Some(receiver);
         self.status_message = "Training".into();
 
         thread::spawn(move || {
-            let result =
-                train_session_until_budget(session, next_validation_step, visualize_network_values);
+            let result = train_session_until_budget(
+                session,
+                next_validation_step,
+                visualize_network_values,
+                training_run_config,
+            );
             let _ = sender.send(result);
         });
     }
@@ -452,7 +474,9 @@ impl App {
             .session
             .completed_step_count()
             .saturating_sub(self.throughput_start_step);
-        completed_steps_since_rate_start as f64 * TRAINING_DOCUMENT_BATCH_SIZE as f64 * 60_000.0
+        completed_steps_since_rate_start as f64
+            * self.training_run_config.training_document_batch_size as f64
+            * 60_000.0
             / self.accumulated_training_millis as f64
     }
 }
@@ -494,7 +518,7 @@ fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
             Span::raw(format!("  {}", app.status_message)),
         ]),
         Line::from(format!(
-            "backend {} | params {} | lr {} | values {} | layers {} | embedding {} | heads {} x {} | context {} | vocab {} | prefix {:?} | temp {:.1}",
+            "backend {} | params {} | lr {} | values {} | layers {} | embedding {} | heads {} x {} | context {} | batch {} | val every {} | vocab {} | prefix {:?} | temp {:.1}",
             backend,
             format_count(app.session.parameter_count()),
             format_learning_rate(app.session.current_learning_rate()),
@@ -504,6 +528,8 @@ fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
             config.attention_head_count,
             config.attention_head_size,
             config.context_window_size,
+            app.training_run_config.training_document_batch_size,
+            app.training_run_config.validation_step_interval,
             app.session.tokenizer_vocabulary_size(),
             app.prefix,
             app.temperature
@@ -632,11 +658,13 @@ fn train_session_until_budget(
     session: TrainingSession,
     next_validation_step: usize,
     visualize_network_values: bool,
+    training_run_config: TrainingRunConfig,
 ) -> Result<TrainingChunkResult, String> {
     // A chunk is deliberately bounded by wall-clock time. Continuous training is
     // implemented as many small chunks, which lets the terminal process input
     // and redraw metrics between updates.
-    let training_result = train_shared_session_until_budget(session, next_validation_step)?;
+    let training_result =
+        train_shared_session_until_budget(session, next_validation_step, training_run_config)?;
 
     let matrix_summaries = if visualize_network_values {
         build_matrix_summaries(&training_result.session)

@@ -5,7 +5,7 @@ use std::{
 
 use rand_chacha::ChaCha8Rng;
 use sentence_gpt_rs_mlx_lib::{
-    checkpoint::{CheckpointBackend, MicrogptCheckpoint},
+    checkpoint::{CheckpointBackend, MicrogptCheckpoint, TrainingRunConfig},
     microgpt::{
         attach_validation_loss as attach_cpu_validation_loss,
         calculate_training_loss_baseline as calculate_cpu_training_loss_baseline,
@@ -30,17 +30,30 @@ use serde::Deserialize;
 pub use sentence_gpt_rs_mlx_lib::microgpt::AdamOptimizerConfig;
 
 pub const TRAINING_FRAME_BUDGET: Duration = Duration::from_millis(500);
-pub const VALIDATION_STEP_INTERVAL: usize = 25;
-pub const TRAINING_DOCUMENT_BATCH_SIZE: usize = 32;
-pub const MAX_DOCUMENT_COUNT: usize = 5000000;
 pub const MAX_TRAINING_STEP_COUNT: usize = 1_000_000;
-pub const VALIDATION_SET_DIVISOR: usize = 50;
-pub const VALIDATION_EVALUATION_DOCUMENT_COUNT: usize = 12;
-pub const CONTEXT_WINDOW_SIZE: usize = 128;
-pub const LAYER_COUNT: usize = 6;
-pub const ATTENTION_HEADS: usize = 8;
-pub const EMBEDDING_SIZE: usize = 128;
 pub const RUNNING_MEAN_LOSS_RECENT_WEIGHT: f64 = 0.35;
+pub const MLX_DEFAULT_TRAINING_RUN_CONFIG: TrainingRunConfig = TrainingRunConfig {
+    validation_step_interval: 25,
+    training_document_batch_size: 32,
+    max_document_count: 5_000_000,
+    validation_set_divisor: 50,
+    validation_evaluation_document_count: 12,
+    context_window_size: 128,
+    layer_count: 6,
+    attention_heads: 8,
+    embedding_size: 128,
+};
+pub const CPU_DEFAULT_TRAINING_RUN_CONFIG: TrainingRunConfig = TrainingRunConfig {
+    validation_step_interval: 25,
+    training_document_batch_size: 8,
+    max_document_count: 100,
+    validation_set_divisor: 20,
+    validation_evaluation_document_count: 4,
+    context_window_size: 32,
+    layer_count: 2,
+    attention_heads: 4,
+    embedding_size: 16,
+};
 
 pub fn get_optimizer_config() -> AdamOptimizerConfig {
     AdamOptimizerConfig {
@@ -72,6 +85,20 @@ impl Backend {
         match self {
             Backend::Mlx => Backend::Cpu,
             Backend::Cpu => Backend::Mlx,
+        }
+    }
+
+    pub fn default_training_run_config(self) -> TrainingRunConfig {
+        match self {
+            Backend::Mlx => MLX_DEFAULT_TRAINING_RUN_CONFIG,
+            Backend::Cpu => CPU_DEFAULT_TRAINING_RUN_CONFIG,
+        }
+    }
+
+    pub fn from_checkpoint_backend(backend: CheckpointBackend) -> Self {
+        match backend {
+            CheckpointBackend::Mlx => Backend::Mlx,
+            CheckpointBackend::Cpu => Backend::Cpu,
         }
     }
 }
@@ -230,11 +257,16 @@ impl TrainingSession {
         }
     }
 
-    pub fn export_checkpoint(&self) -> Result<MicrogptCheckpoint, String> {
-        match self {
+    pub fn export_checkpoint(
+        &self,
+        training_run_config: TrainingRunConfig,
+    ) -> Result<MicrogptCheckpoint, String> {
+        let mut checkpoint = match self {
             TrainingSession::Mlx(session) => export_mlx_training_session_checkpoint(session),
             TrainingSession::Cpu(session) => Ok(export_cpu_training_session_checkpoint(session)),
-        }
+        }?;
+        checkpoint.training_run_config = Some(training_run_config);
+        Ok(checkpoint)
     }
 
     pub fn import_checkpoint(checkpoint: &MicrogptCheckpoint) -> Result<Self, String> {
@@ -261,14 +293,15 @@ pub fn create_training_session(
     backend: Backend,
     transformer_config: TransformerConfig,
     optimizer_config: AdamOptimizerConfig,
+    training_run_config: TrainingRunConfig,
 ) -> Result<TrainingSession, String> {
     match backend {
         Backend::Mlx => create_mlx_microgpt_training_session(
             input_documents,
             rng,
             MAX_TRAINING_STEP_COUNT,
-            VALIDATION_SET_DIVISOR,
-            VALIDATION_EVALUATION_DOCUMENT_COUNT,
+            training_run_config.validation_set_divisor,
+            training_run_config.validation_evaluation_document_count,
             transformer_config,
             optimizer_config,
         )
@@ -280,14 +313,17 @@ pub fn create_training_session(
                 input_documents,
                 rng,
                 MAX_TRAINING_STEP_COUNT,
-                VALIDATION_SET_DIVISOR,
-                VALIDATION_EVALUATION_DOCUMENT_COUNT,
+                training_run_config.validation_set_divisor,
+                training_run_config.validation_evaluation_document_count,
                 transformer_config,
                 optimizer_config,
             );
             let train_loss = calculate_cpu_training_loss_baseline(&session);
-            let validation_loss =
-                calculate_cpu_validation_loss(&session, 0, VALIDATION_STEP_INTERVAL);
+            let validation_loss = calculate_cpu_validation_loss(
+                &session,
+                0,
+                training_run_config.validation_step_interval,
+            );
             session = session.with_initial_progress(train_loss, validation_loss);
             Ok(TrainingSession::Cpu(session))
         }
@@ -303,6 +339,7 @@ pub struct TrainingBudgetResult {
 pub fn train_session_until_budget(
     session: TrainingSession,
     mut next_validation_step: usize,
+    training_run_config: TrainingRunConfig,
 ) -> Result<TrainingBudgetResult, String> {
     let chunk_start = Instant::now();
     let frame_start = Instant::now();
@@ -311,11 +348,13 @@ pub fn train_session_until_budget(
             session,
             &mut next_validation_step,
             frame_start,
+            training_run_config,
         )?),
         TrainingSession::Cpu(session) => TrainingSession::Cpu(train_cpu_until_budget(
             session,
             &mut next_validation_step,
             frame_start,
+            training_run_config,
         )),
     };
 
@@ -330,26 +369,28 @@ fn train_mlx_until_budget(
     mut session: MlxMicrogptTrainingSession,
     next_validation_step: &mut usize,
     frame_start: Instant,
+    training_run_config: TrainingRunConfig,
 ) -> Result<MlxMicrogptTrainingSession, String> {
     loop {
         if session.is_complete() {
             break;
         }
 
-        let mut result = train_mlx_microgpt_step(session, TRAINING_DOCUMENT_BATCH_SIZE)
-            .map_err(|error| error.to_string())?
-            .expect("incomplete MLX session should produce a training step");
+        let mut result =
+            train_mlx_microgpt_step(session, training_run_config.training_document_batch_size)
+                .map_err(|error| error.to_string())?
+                .expect("incomplete MLX session should produce a training step");
 
         let mut validation_was_attached = false;
         if result.session.completed_step_count >= *next_validation_step {
             let validation_loss = calculate_mlx_validation_loss(
                 &result.session,
                 result.session.completed_step_count,
-                VALIDATION_STEP_INTERVAL,
+                training_run_config.validation_step_interval,
             )
             .map_err(|error| error.to_string())?;
             result = attach_mlx_validation_loss(result, validation_loss);
-            *next_validation_step += VALIDATION_STEP_INTERVAL;
+            *next_validation_step += training_run_config.validation_step_interval;
             validation_was_attached = true;
         }
 
@@ -371,24 +412,26 @@ fn train_cpu_until_budget(
     mut session: MicrogptTrainingSession,
     next_validation_step: &mut usize,
     frame_start: Instant,
+    training_run_config: TrainingRunConfig,
 ) -> MicrogptTrainingSession {
     loop {
         if session.is_complete() {
             break;
         }
 
-        let mut result = train_microgpt_step(session, TRAINING_DOCUMENT_BATCH_SIZE)
-            .expect("incomplete CPU session should produce a training step");
+        let mut result =
+            train_microgpt_step(session, training_run_config.training_document_batch_size)
+                .expect("incomplete CPU session should produce a training step");
 
         let mut validation_was_attached = false;
         if result.session.completed_step_count >= *next_validation_step {
             let validation_loss = calculate_cpu_validation_loss(
                 &result.session,
                 result.session.completed_step_count,
-                VALIDATION_STEP_INTERVAL,
+                training_run_config.validation_step_interval,
             );
             result = attach_cpu_validation_loss(result, validation_loss);
-            *next_validation_step += VALIDATION_STEP_INTERVAL;
+            *next_validation_step += training_run_config.validation_step_interval;
             validation_was_attached = true;
         }
 
@@ -406,8 +449,11 @@ fn train_cpu_until_budget(
     session
 }
 
-pub fn next_validation_step_after(completed_step_count: usize) -> usize {
-    ((completed_step_count / VALIDATION_STEP_INTERVAL) + 1) * VALIDATION_STEP_INTERVAL
+pub fn next_validation_step_after(
+    completed_step_count: usize,
+    validation_step_interval: usize,
+) -> usize {
+    ((completed_step_count / validation_step_interval) + 1) * validation_step_interval
 }
 
 pub fn running_mean_loss(progress_history: &[MicrogptTrainingProgress]) -> Option<f64> {
@@ -469,7 +515,7 @@ struct Story {
     source: String,
 }
 
-pub fn load_input_documents() -> Result<Vec<String>, String> {
+pub fn load_input_documents(training_run_config: TrainingRunConfig) -> Result<Vec<String>, String> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
     let stories_path = root.join("data/input-stories-00.json");
     let stories_json = std::fs::read_to_string(&stories_path).map_err(|error| {
@@ -480,7 +526,7 @@ pub fn load_input_documents() -> Result<Vec<String>, String> {
     })?;
     let stories: Vec<Story> = serde_json::from_str(&stories_json)
         .map_err(|error| format!("could not parse {}: {error}", stories_path.display()))?;
-    let documents = stories_to_sentences(stories);
+    let documents = stories_to_sentences(stories, training_run_config);
     if documents.is_empty() {
         Err(format!(
             "no training documents survived filtering in required {}",
@@ -491,7 +537,10 @@ pub fn load_input_documents() -> Result<Vec<String>, String> {
     }
 }
 
-fn stories_to_sentences(stories: Vec<Story>) -> Vec<String> {
+fn stories_to_sentences(
+    stories: Vec<Story>,
+    training_run_config: TrainingRunConfig,
+) -> Vec<String> {
     const SENTENCE_DISQUALIFYING_CHARACTERS: &[char] = &[
         '$', '&', '"', '“', '”', '(', ')', '*', '\'', '_', '-', '–', '…', '%', '~', '`', '[', ']',
         '{', '}', '\\', ';', '|', '—', 'é', '/', '’', '‘', ':', '0', '1', '2', '3', '4', '5', '6',
@@ -515,8 +564,9 @@ fn stories_to_sentences(stories: Vec<Story>) -> Vec<String> {
         .filter(|sentence| {
             sentence.len() > 10
                 && sentence.contains(' ')
-                && sentence.chars().count() < CONTEXT_WINDOW_SIZE
+                && sentence.chars().count() < training_run_config.context_window_size
         })
+        .take(training_run_config.max_document_count)
         .collect::<Vec<_>>()
 }
 

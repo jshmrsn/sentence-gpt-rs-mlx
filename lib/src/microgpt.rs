@@ -645,6 +645,7 @@ pub fn export_training_session_checkpoint(session: &MicrogptTrainingSession) -> 
     let parameter_tensors = session.trained_microgpt.model.checkpoint_tensors();
     MicrogptCheckpoint {
         backend: CheckpointBackend::Cpu,
+        training_run_config: None,
         config: session.trained_microgpt.config.clone(),
         tokenizer: session.trained_microgpt.tokenizer.clone(),
         documents: session.documents.clone(),

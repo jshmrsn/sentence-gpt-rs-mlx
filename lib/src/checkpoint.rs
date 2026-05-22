@@ -32,9 +32,23 @@ impl CheckpointTensor {
     }
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TrainingRunConfig {
+    pub validation_step_interval: usize,
+    pub training_document_batch_size: usize,
+    pub max_document_count: usize,
+    pub validation_set_divisor: usize,
+    pub validation_evaluation_document_count: usize,
+    pub context_window_size: usize,
+    pub layer_count: usize,
+    pub attention_heads: usize,
+    pub embedding_size: usize,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MicrogptCheckpoint {
     pub backend: CheckpointBackend,
+    pub training_run_config: Option<TrainingRunConfig>,
     pub config: TransformerConfig,
     pub tokenizer: CharacterTokenizer,
     pub documents: Vec<String>,

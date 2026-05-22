@@ -396,6 +396,7 @@ pub fn export_training_session_checkpoint(
     let parameter_arrays = session.trained_microgpt.model.values();
     Ok(MicrogptCheckpoint {
         backend: CheckpointBackend::Mlx,
+        training_run_config: None,
         config: session.trained_microgpt.config.clone(),
         tokenizer: session.trained_microgpt.tokenizer.clone(),
         documents: session.documents.clone(),

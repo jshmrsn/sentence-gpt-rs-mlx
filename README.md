@@ -2,15 +2,15 @@
 
 GPT training demo based on microgpt, but targeting full simple sentences, accelerated on Apple Silicon with MLX (via mlx-rs) and additional optimizations relative to microgpt, written in Rust, with both Dioxus GUI and ratatui TUI frontends.
 
-The alternative CPU backend is more closely derived from the original microgpt (refactored to be functional/immutable and use structures over dictionaries), but using it requires manually reducing model size parameters.
+The alternative CPU backend is more closely derived from the original microgpt, but refactored to a functional/immutable style, and to use structures over dictionaries. Switching to the CPU backend will automatically use a smaller default model size, and therefore the output quality will be reduced. 
 
-The repo is largely written by Codex GPT 5.5, but engineered over many feedback iterations.
+The project is largely written by Codex GPT 5.5, but engineered over many feedback iterations.
 
-Includes many LLM-generated inline comments to describe machine learning techniques and math, which enables this repo to be a helpful learning resource for people like myself who have limited background in ML.
+The model code includes many LLM-generated inline comments to describe the machine learning techniques and math, which makes this project a helpful learning resource for people like myself who have limited background in ML.
 
 ![sentence-gpt-rs-mlx GUI screenshot](screenshot.png)
 
-## Info
+## More info
 
 The project trains a tiny GPT-style character model on short story sentences. It keeps per-character tokens instead of using BPE or sentencepiece-style tokenization, so model behavior remains easy to inspect while still training toward full simple-sentence generation.
 
@@ -65,7 +65,7 @@ TUI:
 cargo run --release -p sentence-gpt-rs-mlx-tui
 ```
 
-## Build
+#### Build
 
 ```sh
 cargo build --release -p sentence-gpt-rs-mlx-app
@@ -80,4 +80,4 @@ The binaries land under `target/release/`.
 - `config/` contains shared app/TUI configuration, story loading, backend/session orchestration, training chunk scheduling, and display formatting.
 - `app/` contains the Dioxus desktop GUI.
 - `terminal/` contains the ratatui terminal UI.
-- `data/input-stories-00.json` is the required training corpus.
+- `data/input-stories-00.json` contains the training data.

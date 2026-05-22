@@ -16,10 +16,11 @@ use sentence_gpt_rs_mlx_config::{
     format_percent, format_percent_style, get_optimizer_config, load_input_documents,
     next_validation_step_after, running_mean_loss, running_mean_loss_values,
     train_session_until_budget as train_shared_session_until_budget, Backend, TrainedSnapshot,
-    TrainingSession, ATTENTION_HEADS, CONTEXT_WINDOW_SIZE, EMBEDDING_SIZE, LAYER_COUNT,
-    TRAINING_DOCUMENT_BATCH_SIZE, VALIDATION_STEP_INTERVAL,
+    TrainingSession,
 };
-use sentence_gpt_rs_mlx_lib::checkpoint::{load_checkpoint_from_path, save_checkpoint_to_path};
+use sentence_gpt_rs_mlx_lib::checkpoint::{
+    load_checkpoint_from_path, save_checkpoint_to_path, TrainingRunConfig,
+};
 use sentence_gpt_rs_mlx_lib::microgpt::{
     generate_samples as generate_cpu_samples, Matrix, MicrogptTrainingProgress, TrainedMicrogpt,
     TransformerConfig, Vector,
@@ -39,6 +40,19 @@ use styles::CSS;
 enum DocumentBrowserDataset {
     Training,
     Validation,
+}
+
+#[derive(Clone, Copy)]
+enum TrainingRunConfigField {
+    ValidationStepInterval,
+    TrainingDocumentBatchSize,
+    MaxDocumentCount,
+    ValidationSetDivisor,
+    ValidationEvaluationDocumentCount,
+    ContextWindowSize,
+    LayerCount,
+    AttentionHeads,
+    EmbeddingSize,
 }
 
 impl DocumentBrowserDataset {
@@ -80,6 +94,7 @@ struct ModelHeatmap {
 #[derive(Clone)]
 struct AppState {
     backend: Backend,
+    training_run_config: TrainingRunConfig,
     session: Option<TrainingSession>,
     // Full parameter heatmaps require copying model values to the UI and drawing
     // many small cells. That is excellent for inspection but expensive during
@@ -181,6 +196,10 @@ fn App() -> Element {
             };
 
             if let Some((session, next_validation_step, visualize_network_values)) = training_work {
+                let training_run_config = {
+                    let current = state.read();
+                    current.training_run_config
+                };
                 // `spawn_blocking` keeps the Dioxus/Tokio UI runtime from being
                 // monopolized by MLX or CPU matrix math.
                 match tokio::task::spawn_blocking(move || {
@@ -188,6 +207,7 @@ fn App() -> Element {
                         session,
                         next_validation_step,
                         visualize_network_values,
+                        training_run_config,
                     )
                 })
                 .await
@@ -252,6 +272,7 @@ fn App() -> Element {
         .session
         .as_ref()
         .is_some_and(TrainingSession::is_complete);
+    let can_configure_training_run = snapshot.can_configure_training_run();
     let visible_documents = snapshot.visible_browser_documents();
     let is_document_search_empty = snapshot.training_document_search.trim().is_empty();
     let browser_document_count = snapshot.browser_document_count();
@@ -375,7 +396,7 @@ fn App() -> Element {
                         "Document trains {completed_document_train_count} / {total_document_train_count} | running avg {format_rate(document_trains_per_minute)}/min | elapsed {format_elapsed_training_time(snapshot.accumulated_training_millis)}"
                     }
                     div { class: "model-summary",
-                        "Train examples {training_example_count} | validation examples {validation_example_count} | validation batch {validation_batch_count} | train batch {TRAINING_DOCUMENT_BATCH_SIZE}"
+                        "Train examples {training_example_count} | validation examples {validation_example_count} | validation batch {validation_batch_count} | train batch {snapshot.training_run_config.training_document_batch_size}"
                     }
                     div { class: "model-summary",
                         "Snapshot export: {snapshot_export_directory_label}"
@@ -385,6 +406,30 @@ fn App() -> Element {
                     }
                     if let Some(validation_loss) = latest_validation_loss {
                         {loss_metric_text("Validation loss", validation_loss, vocabulary_size)}
+                    }
+                }
+
+                section { class: "panel",
+                    div { class: "model-header",
+                        h2 { class: "section-title", "Training configuration" }
+                        div { class: "model-summary",
+                            if can_configure_training_run {
+                                "Editable before training starts"
+                            } else {
+                                "Locked after training starts"
+                            }
+                        }
+                    }
+                    div { class: "config-grid",
+                        {config_number_input("Validation interval steps", snapshot.training_run_config.validation_step_interval, can_configure_training_run, TrainingRunConfigField::ValidationStepInterval, state)}
+                        {config_number_input("Docs per batch", snapshot.training_run_config.training_document_batch_size, can_configure_training_run, TrainingRunConfigField::TrainingDocumentBatchSize, state)}
+                        {config_number_input("Max total docs", snapshot.training_run_config.max_document_count, can_configure_training_run, TrainingRunConfigField::MaxDocumentCount, state)}
+                        {config_number_input("Validation docs divisor", snapshot.training_run_config.validation_set_divisor, can_configure_training_run, TrainingRunConfigField::ValidationSetDivisor, state)}
+                        {config_number_input("Docs per validation eval", snapshot.training_run_config.validation_evaluation_document_count, can_configure_training_run, TrainingRunConfigField::ValidationEvaluationDocumentCount, state)}
+                        {config_number_input("Context", snapshot.training_run_config.context_window_size, can_configure_training_run, TrainingRunConfigField::ContextWindowSize, state)}
+                        {config_number_input("Layers", snapshot.training_run_config.layer_count, can_configure_training_run, TrainingRunConfigField::LayerCount, state)}
+                        {config_number_input("Heads", snapshot.training_run_config.attention_heads, can_configure_training_run, TrainingRunConfigField::AttentionHeads, state)}
+                        {config_number_input("Embedding", snapshot.training_run_config.embedding_size, can_configure_training_run, TrainingRunConfigField::EmbeddingSize, state)}
                     }
                 }
 
@@ -551,111 +596,102 @@ impl AppState {
     }
 
     fn initialize_with_backend(backend: Backend) -> Self {
+        Self::initialize_with_config(backend, backend.default_training_run_config())
+    }
+
+    fn initialize_with_config(backend: Backend, training_run_config: TrainingRunConfig) -> Self {
         let mut rng = ChaCha8Rng::seed_from_u64(1);
         let transformer_config = TransformerConfig::new(
-            LAYER_COUNT,
-            EMBEDDING_SIZE,
-            CONTEXT_WINDOW_SIZE,
-            ATTENTION_HEADS,
-        )
-        .expect("valid built-in transformer config");
+            training_run_config.layer_count,
+            training_run_config.embedding_size,
+            training_run_config.context_window_size,
+            training_run_config.attention_heads,
+        );
         let optimizer_config = get_optimizer_config();
 
-        let documents = load_input_documents();
-        match documents {
-            Ok(input_documents) => {
-                let session_result = create_training_session(
-                    input_documents,
-                    &mut rng,
-                    backend,
-                    transformer_config,
-                    optimizer_config,
-                );
-
-                let session = match session_result {
-                    Ok(session) => session,
-                    Err(error) => {
-                        return Self {
+        match transformer_config {
+            Ok(transformer_config) => {
+                let documents = load_input_documents(training_run_config);
+                match documents {
+                    Ok(input_documents) => {
+                        match create_training_session(
+                            input_documents,
+                            &mut rng,
                             backend,
-                            session: None,
-                            model_heatmaps: Vec::new(),
-                            visualize_network_values: false,
-                            is_training_active: false,
-                            is_training_busy: false,
-                            manual_training_chunk_requested: false,
-                            generation_requested: false,
-                            is_generating_samples: false,
-                            next_validation_step: VALIDATION_STEP_INTERVAL,
-                            accumulated_training_millis: 0,
-                            throughput_start_step: 0,
-                            prefix: String::new(),
-                            document_browser_dataset: DocumentBrowserDataset::Training,
-                            training_document_search: String::new(),
-                            cached_browser_search_matches: Vec::new(),
-                            training_document_page: 0,
-                            temperature: 0.5,
-                            samples: Vec::new(),
-                            initialization_error: Some(error),
-                            checkpoint_message: None,
-                            snapshot_export_directory: None,
-                            sample_rng: ChaCha8Rng::seed_from_u64(1),
-                            training_document_page_rng: ChaCha8Rng::seed_from_u64(2),
-                        };
+                            transformer_config,
+                            optimizer_config,
+                            training_run_config,
+                        ) {
+                            Ok(session) => Self {
+                                backend,
+                                training_run_config,
+                                session: Some(session),
+                                model_heatmaps: Vec::new(),
+                                visualize_network_values: false,
+                                is_training_active: false,
+                                is_training_busy: false,
+                                manual_training_chunk_requested: false,
+                                generation_requested: false,
+                                is_generating_samples: false,
+                                next_validation_step: training_run_config.validation_step_interval,
+                                accumulated_training_millis: 0,
+                                throughput_start_step: 0,
+                                prefix: String::new(),
+                                document_browser_dataset: DocumentBrowserDataset::Training,
+                                training_document_search: String::new(),
+                                cached_browser_search_matches: Vec::new(),
+                                training_document_page: 0,
+                                temperature: 0.5,
+                                samples: Vec::new(),
+                                initialization_error: None,
+                                checkpoint_message: None,
+                                snapshot_export_directory: None,
+                                sample_rng: ChaCha8Rng::seed_from_u64(1),
+                                training_document_page_rng: ChaCha8Rng::seed_from_u64(2),
+                            },
+                            Err(error) => {
+                                Self::failed_initialization(backend, training_run_config, error)
+                            }
+                        }
                     }
-                };
-                Self {
-                    backend,
-                    session: Some(session),
-                    model_heatmaps: Vec::new(),
-                    visualize_network_values: false,
-                    is_training_active: false,
-                    is_training_busy: false,
-                    manual_training_chunk_requested: false,
-                    generation_requested: false,
-                    is_generating_samples: false,
-                    next_validation_step: VALIDATION_STEP_INTERVAL,
-                    accumulated_training_millis: 0,
-                    throughput_start_step: 0,
-                    prefix: String::new(),
-                    document_browser_dataset: DocumentBrowserDataset::Training,
-                    training_document_search: String::new(),
-                    cached_browser_search_matches: Vec::new(),
-                    training_document_page: 0,
-                    temperature: 0.5,
-                    samples: Vec::new(),
-                    initialization_error: None,
-                    checkpoint_message: None,
-                    snapshot_export_directory: None,
-                    sample_rng: ChaCha8Rng::seed_from_u64(1),
-                    training_document_page_rng: ChaCha8Rng::seed_from_u64(2),
+                    Err(error) => Self::failed_initialization(backend, training_run_config, error),
                 }
             }
-            Err(error) => Self {
-                backend,
-                session: None,
-                model_heatmaps: Vec::new(),
-                visualize_network_values: false,
-                is_training_active: false,
-                is_training_busy: false,
-                manual_training_chunk_requested: false,
-                generation_requested: false,
-                is_generating_samples: false,
-                next_validation_step: VALIDATION_STEP_INTERVAL,
-                accumulated_training_millis: 0,
-                throughput_start_step: 0,
-                prefix: String::new(),
-                document_browser_dataset: DocumentBrowserDataset::Training,
-                training_document_search: String::new(),
-                cached_browser_search_matches: Vec::new(),
-                training_document_page: 0,
-                temperature: 0.5,
-                samples: Vec::new(),
-                initialization_error: Some(error),
-                checkpoint_message: None,
-                snapshot_export_directory: None,
-                sample_rng: ChaCha8Rng::seed_from_u64(1),
-                training_document_page_rng: ChaCha8Rng::seed_from_u64(2),
-            },
+            Err(error) => Self::failed_initialization(backend, training_run_config, error),
+        }
+    }
+
+    fn failed_initialization(
+        backend: Backend,
+        training_run_config: TrainingRunConfig,
+        error: String,
+    ) -> Self {
+        Self {
+            backend,
+            training_run_config,
+            session: None,
+            model_heatmaps: Vec::new(),
+            visualize_network_values: false,
+            is_training_active: false,
+            is_training_busy: false,
+            manual_training_chunk_requested: false,
+            generation_requested: false,
+            is_generating_samples: false,
+            next_validation_step: training_run_config.validation_step_interval,
+            accumulated_training_millis: 0,
+            throughput_start_step: 0,
+            prefix: String::new(),
+            document_browser_dataset: DocumentBrowserDataset::Training,
+            training_document_search: String::new(),
+            cached_browser_search_matches: Vec::new(),
+            training_document_page: 0,
+            temperature: 0.5,
+            samples: Vec::new(),
+            initialization_error: Some(error),
+            checkpoint_message: None,
+            snapshot_export_directory: None,
+            sample_rng: ChaCha8Rng::seed_from_u64(1),
+            training_document_page_rng: ChaCha8Rng::seed_from_u64(2),
         }
     }
 
@@ -663,6 +699,73 @@ impl AppState {
         self.training_document_search = search;
         self.training_document_page = 0;
         self.refresh_cached_browser_search_matches();
+    }
+
+    fn can_configure_training_run(&self) -> bool {
+        !self.is_training_busy
+            && !self.is_generating_samples
+            && self
+                .session
+                .as_ref()
+                .is_none_or(|session| session.completed_step_count() == 0)
+    }
+
+    fn set_training_run_config_value(&mut self, field: TrainingRunConfigField, value: String) {
+        if !self.can_configure_training_run() {
+            return;
+        }
+        let Ok(value) = value.parse::<usize>() else {
+            return;
+        };
+        if value == 0 {
+            return;
+        }
+
+        match field {
+            TrainingRunConfigField::ValidationStepInterval => {
+                self.training_run_config.validation_step_interval = value;
+            }
+            TrainingRunConfigField::TrainingDocumentBatchSize => {
+                self.training_run_config.training_document_batch_size = value;
+            }
+            TrainingRunConfigField::MaxDocumentCount => {
+                self.training_run_config.max_document_count = value;
+            }
+            TrainingRunConfigField::ValidationSetDivisor => {
+                self.training_run_config.validation_set_divisor = value;
+            }
+            TrainingRunConfigField::ValidationEvaluationDocumentCount => {
+                self.training_run_config
+                    .validation_evaluation_document_count = value;
+            }
+            TrainingRunConfigField::ContextWindowSize => {
+                self.training_run_config.context_window_size = value;
+            }
+            TrainingRunConfigField::LayerCount => {
+                self.training_run_config.layer_count = value;
+            }
+            TrainingRunConfigField::AttentionHeads => {
+                self.training_run_config.attention_heads = value;
+            }
+            TrainingRunConfigField::EmbeddingSize => {
+                self.training_run_config.embedding_size = value;
+            }
+        }
+        self.recreate_unstarted_session();
+    }
+
+    fn recreate_unstarted_session(&mut self) {
+        let mut next = Self::initialize_with_config(self.backend, self.training_run_config);
+        next.visualize_network_values = self.visualize_network_values;
+        next.prefix = self.prefix.clone();
+        next.temperature = self.temperature;
+        next.snapshot_export_directory = self.snapshot_export_directory.clone();
+        next.sample_rng = self.sample_rng.clone();
+        next.training_document_page_rng = self.training_document_page_rng.clone();
+        next.document_browser_dataset = self.document_browser_dataset;
+        next.training_document_search = self.training_document_search.clone();
+        next.refresh_cached_browser_search_matches();
+        *self = next;
     }
 
     fn clear_training_document_search(&mut self) {
@@ -788,7 +891,7 @@ impl AppState {
         self.snapshot_export_directory = Some(directory.clone());
         let path = directory.join(snapshot_checkpoint_file_name(session));
         match session
-            .export_checkpoint()
+            .export_checkpoint(self.training_run_config)
             .and_then(|checkpoint| save_checkpoint_to_path(&checkpoint, &path))
         {
             Ok(()) => {
@@ -807,13 +910,20 @@ impl AppState {
         if self.is_training_busy || self.is_generating_samples {
             return;
         }
-        match load_checkpoint_from_path(&path)
-            .and_then(|checkpoint| TrainingSession::import_checkpoint(&checkpoint))
-        {
-            Ok(session) => {
+        match load_checkpoint_from_path(&path).and_then(|checkpoint| {
+            let training_run_config = checkpoint.training_run_config.unwrap_or_else(|| {
+                Backend::from_checkpoint_backend(checkpoint.backend).default_training_run_config()
+            });
+            TrainingSession::import_checkpoint(&checkpoint)
+                .map(|session| (session, training_run_config))
+        }) {
+            Ok((session, training_run_config)) => {
                 self.backend = session.backend();
-                self.next_validation_step =
-                    next_validation_step_after(session.completed_step_count());
+                self.training_run_config = training_run_config;
+                self.next_validation_step = next_validation_step_after(
+                    session.completed_step_count(),
+                    self.training_run_config.validation_step_interval,
+                );
                 self.accumulated_training_millis = 0;
                 self.throughput_start_step = session.completed_step_count();
                 self.is_training_active = false;
@@ -936,7 +1046,7 @@ impl AppState {
         };
         let path = directory.join(snapshot_checkpoint_file_name(session));
         match session
-            .export_checkpoint()
+            .export_checkpoint(self.training_run_config)
             .and_then(|checkpoint| save_checkpoint_to_path(&checkpoint, &path))
         {
             Ok(()) => {
@@ -1018,11 +1128,11 @@ impl AppState {
     }
 
     fn completed_document_train_count(&self) -> usize {
-        self.completed_step_count() * TRAINING_DOCUMENT_BATCH_SIZE
+        self.completed_step_count() * self.training_run_config.training_document_batch_size
     }
 
     fn total_document_train_count(&self) -> usize {
-        self.training_step_count() * TRAINING_DOCUMENT_BATCH_SIZE
+        self.training_step_count() * self.training_run_config.training_document_batch_size
     }
 
     fn document_trains_per_minute(&self) -> f64 {
@@ -1032,7 +1142,9 @@ impl AppState {
         let completed_steps_since_rate_start = self
             .completed_step_count()
             .saturating_sub(self.throughput_start_step);
-        completed_steps_since_rate_start as f64 * TRAINING_DOCUMENT_BATCH_SIZE as f64 * 60_000.0
+        completed_steps_since_rate_start as f64
+            * self.training_run_config.training_document_batch_size as f64
+            * 60_000.0
             / self.accumulated_training_millis as f64
     }
 
@@ -1048,11 +1160,13 @@ fn train_session_until_budget(
     session: TrainingSession,
     next_validation_step: usize,
     visualize_network_values: bool,
+    training_run_config: TrainingRunConfig,
 ) -> Result<TrainingChunkResult, String> {
     // One background chunk trains until the frame budget expires. The app then
     // yields back to the UI, updates metrics, and queues another chunk if
     // continuous training is active.
-    let training_result = train_shared_session_until_budget(session, next_validation_step)?;
+    let training_result =
+        train_shared_session_until_budget(session, next_validation_step, training_run_config)?;
 
     let model_heatmaps = if visualize_network_values {
         build_model_heatmaps(&training_result.session)
@@ -1113,6 +1227,30 @@ fn metric(label: &str, value: String) -> Element {
         div { class: "metric",
             div { class: "metric-label", "{label}" }
             div { class: "metric-value", "{value}" }
+        }
+    }
+}
+
+fn config_number_input(
+    label: &'static str,
+    value: usize,
+    is_editable: bool,
+    field: TrainingRunConfigField,
+    mut state: Signal<AppState>,
+) -> Element {
+    rsx! {
+        div { class: "field",
+            label { "{label}" }
+            input {
+                class: "text-input",
+                r#type: "number",
+                min: "1",
+                value: "{value}",
+                disabled: !is_editable,
+                oninput: move |event| {
+                    state.write().set_training_run_config_value(field, event.value());
+                }
+            }
         }
     }
 }
