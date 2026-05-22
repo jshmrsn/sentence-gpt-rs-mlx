@@ -485,17 +485,6 @@ pub fn format_loss(loss: f64) -> String {
     format!("{loss:.4}")
 }
 
-pub fn format_perplexity(loss: f64) -> String {
-    let perplexity = loss.exp();
-    if perplexity >= 1_000.0 {
-        format!("{perplexity:.0}")
-    } else if perplexity >= 100.0 {
-        format!("{perplexity:.1}")
-    } else {
-        format!("{perplexity:.2}")
-    }
-}
-
 pub fn format_learning_rate(learning_rate: f64) -> String {
     format!("{learning_rate:.6}")
 }

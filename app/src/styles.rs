@@ -165,6 +165,29 @@ button, input {
     gap: 12px;
 }
 
+.disclosure-button {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    border: 0;
+    background: transparent;
+    color: #17202a;
+    padding: 0;
+    cursor: pointer;
+}
+
+.disclosure-button .section-title {
+    margin: 0;
+}
+
+.disclosure-arrow {
+    width: 14px;
+    color: #53645c;
+    font-size: 13px;
+    font-weight: 800;
+    line-height: 1;
+}
+
 .field label {
     display: block;
     margin-bottom: 5px;

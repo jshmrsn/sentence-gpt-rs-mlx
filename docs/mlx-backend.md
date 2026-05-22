@@ -653,14 +653,6 @@ Then:
 weighted_loss_sum / token_count
 ```
 
-The UI can display perplexity as:
-
-```text
-perplexity = exp(loss)
-```
-
-For character-level modeling, perplexity means roughly "effective average number of plausible next characters".
-
 ## Generation Path
 
 Training uses a full-sequence batched forward pass. Generation uses a one-token-at-a-time forward pass with a key/value cache.

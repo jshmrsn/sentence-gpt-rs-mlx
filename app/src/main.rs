@@ -6,15 +6,15 @@
 // they run in blocking worker tasks while the UI stays responsive.
 
 use chrono::Local;
-use dioxus::desktop::{Config, WindowBuilder};
+use dioxus::desktop::{tao::dpi::LogicalSize, Config, WindowBuilder};
 use dioxus::prelude::*;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use rfd::FileDialog;
 use sentence_gpt_rs_mlx_config::{
-    create_training_session, format_count, format_learning_rate, format_loss, format_percent,
-    format_percent_style, format_perplexity, load_input_documents, next_validation_step_after,
-    optimizer_config_for_training_run, running_mean_loss, running_mean_loss_values,
+    create_training_session, format_count, format_learning_rate, format_loss, format_percent_style,
+    load_input_documents, next_validation_step_after, optimizer_config_for_training_run,
+    running_mean_loss, running_mean_loss_values,
     train_session_until_budget as train_shared_session_until_budget, Backend, TrainedSnapshot,
     TrainingSession,
 };
@@ -116,6 +116,7 @@ struct AppState {
     training_document_search: String,
     cached_browser_search_matches: Vec<(usize, String)>,
     training_document_page: usize,
+    training_config_expanded: bool,
     temperature: f64,
     samples: Vec<String>,
     initialization_error: Option<String>,
@@ -145,7 +146,13 @@ struct GenerationResult {
 
 fn main() {
     dioxus::LaunchBuilder::desktop()
-        .with_cfg(Config::new().with_window(WindowBuilder::new().with_title("sentence-gpt-rs-mlx")))
+        .with_cfg(
+            Config::new().with_window(
+                WindowBuilder::new()
+                    .with_title("sentence-gpt-rs-mlx")
+                    .with_inner_size(LogicalSize::new(1280.0, 900.0)),
+            ),
+        )
         .launch(App);
 }
 
@@ -256,6 +263,11 @@ fn App() -> Element {
         .map(|session| session.tokenizer().vocabulary_size())
         .unwrap_or(0);
     let selected_training_run_config = snapshot.selected_training_run_config();
+    let training_config_arrow = if snapshot.training_config_expanded {
+        "▾"
+    } else {
+        "▸"
+    };
     let is_complete = snapshot
         .session
         .as_ref()
@@ -282,7 +294,6 @@ fn App() -> Element {
                 div { class: "topbar",
                     div {
                         h1 { class: "title", "sentence-gpt-rs-mlx" }
-                        p { class: "subtitle", "GPT training demo based on microgpt, but targeting full simple sentences, accelerated on Apple Silicon with MLX (via mlx-rs) with additional optimizations, written in Rust, with a Dioxus desktop GUI." }
                     }
                     div { class: "actions",
                         div { class: "primary-actions",
@@ -309,21 +320,32 @@ fn App() -> Element {
                             }
                         }
                         div { class: "snapshot-actions",
-                            span { class: "action-label", "Snapshot" }
+                            span {
+                                class: "action-label",
+                                title: "Export or import full training snapshots, including model parameters, optimizer state, data split, and progress.",
+                                "Snapshot"
+                            }
                             button {
                                 class: "button secondary",
                                 disabled: snapshot.session.is_none() || snapshot.is_training_busy || snapshot.is_generating_samples,
                                 onclick: move |_| {
-                                    let selected_directory = {
-                                        state.read().snapshot_export_directory.clone()
+                                    let suggested_file_name = {
+                                        state
+                                            .read()
+                                            .session
+                                            .as_ref()
+                                            .map(snapshot_checkpoint_file_name)
                                     };
-                                    let directory = selected_directory.or_else(|| {
-                                        FileDialog::new()
-                                            .set_title("Select snapshot export directory")
-                                            .pick_folder()
-                                    });
-                                    if let Some(directory) = directory {
-                                        state.write().export_checkpoint_to_directory(directory);
+                                    let Some(suggested_file_name) = suggested_file_name else {
+                                        return;
+                                    };
+                                    if let Some(path) = FileDialog::new()
+                                        .set_title("Export sentence-gpt-rs-mlx snapshot")
+                                        .add_filter("sentence-gpt-rs-mlx checkpoint", &["bin"])
+                                        .set_file_name(&suggested_file_name)
+                                        .save_file()
+                                    {
+                                        state.write().export_checkpoint_to_path(path);
                                     }
                                 },
                                 "Export"
@@ -359,10 +381,14 @@ fn App() -> Element {
                                         state.write().set_snapshot_export_directory(directory);
                                     }
                                 },
-                                "Set Directory"
+                                "Set Auto-Export Directory"
                             }
                             if let Some(directory_label) = &snapshot_export_directory_label {
-                                span { class: "directory-label", "{directory_label}" }
+                                span {
+                                    class: "directory-label",
+                                    title: "Selected directory for automatic validation snapshots: {directory_label}",
+                                    "{directory_label}"
+                                }
                             }
                         }
                     }
@@ -379,9 +405,9 @@ fn App() -> Element {
                     div { class: "status-grid",
                         {metric("Status", status)}
                         {metric("Backend", backend_label.into())}
-                        {metric("Params", format_count(snapshot.session.as_ref().map(TrainingSession::parameter_count).unwrap_or(0)))}
-                        {metric("LR", snapshot.session.as_ref().map(|session| format_learning_rate(session.current_learning_rate())).unwrap_or_else(|| "pending".into()))}
-                        {metric("Step", format!("{} / {}", snapshot.completed_step_count(), snapshot.training_step_count()))}
+                        {metric("Model params", format_count(snapshot.session.as_ref().map(TrainingSession::parameter_count).unwrap_or(0)))}
+                        {metric("Learning rate", snapshot.session.as_ref().map(|session| format_learning_rate(session.current_learning_rate())).unwrap_or_else(|| "pending".into()))}
+                        {metric("Training step", format!("{} / {}", snapshot.completed_step_count(), snapshot.training_step_count()))}
                         {metric("Train loss", latest_loss.map(format_loss).unwrap_or_else(|| "pending".into()))}
                         {metric("Validation", latest_validation_loss.map(format_loss).unwrap_or_else(|| "pending".into()))}
                     }
@@ -389,22 +415,22 @@ fn App() -> Element {
                         div { class: "progress-fill", style: "width: {format_percent_style(progress)};" }
                     }
                     div { class: "model-summary",
-                        "Document trains {completed_document_train_count} / {total_document_train_count} | running avg {format_rate(document_trains_per_minute)}/min | elapsed {format_elapsed_training_time(snapshot.accumulated_training_millis)}"
+                        "document trains {completed_document_train_count} / {total_document_train_count} | running avg {format_rate(document_trains_per_minute)}/min | elapsed {format_elapsed_training_time(snapshot.accumulated_training_millis)}"
                     }
                     div { class: "model-summary",
-                        "Train examples {training_example_count} | validation examples {validation_example_count} | train batch {selected_training_run_config.training_document_batch_size}"
-                    }
-                    if let Some(loss) = latest_loss {
-                        {loss_metric_text("Train loss", loss, vocabulary_size)}
-                    }
-                    if let Some(validation_loss) = latest_validation_loss {
-                        {loss_metric_text("Validation loss", validation_loss, vocabulary_size)}
+                        "training docs {training_example_count} | validation docs {validation_example_count} | vocab size {vocabulary_size}"
                     }
                 }
 
                 section { class: "panel",
                     div { class: "model-header",
-                        h2 { class: "section-title", "Training configuration" }
+                        button {
+                            class: "disclosure-button",
+                            onclick: move |_| state.write().toggle_training_config_expanded(),
+                            title: "Show or hide training configuration controls.",
+                            span { class: "disclosure-arrow", "{training_config_arrow}" }
+                            span { class: "section-title", "Training configuration" }
+                        }
                         div { class: "model-summary",
                             if can_configure_training_run {
                                 "Staged until training starts"
@@ -419,28 +445,30 @@ fn App() -> Element {
                             "Restore defaults"
                         }
                     }
-                    div { class: "config-grid",
-                        {config_number_input("Validation interval steps", selected_training_run_config.validation_step_interval, can_configure_training_run, TrainingRunConfigField::ValidationStepInterval, state)}
-                        {config_number_input("Docs per batch", selected_training_run_config.training_document_batch_size, can_configure_training_run, TrainingRunConfigField::TrainingDocumentBatchSize, state)}
-                        {config_number_input("Max total docs", selected_training_run_config.max_document_count, can_configure_training_run, TrainingRunConfigField::MaxDocumentCount, state)}
-                        {config_number_input("Validation docs divisor", selected_training_run_config.validation_set_divisor, can_configure_training_run, TrainingRunConfigField::ValidationSetDivisor, state)}
-                        {config_number_input("Validation docs cap", selected_training_run_config.validation_set_max_document_count, can_configure_training_run, TrainingRunConfigField::ValidationSetMaxDocumentCount, state)}
-                        {config_number_input("Context size", selected_training_run_config.context_window_size, can_configure_training_run, TrainingRunConfigField::ContextWindowSize, state)}
-                        {config_number_input("Layers", selected_training_run_config.layer_count, can_configure_training_run, TrainingRunConfigField::LayerCount, state)}
-                        {config_number_input("Attention heads", selected_training_run_config.attention_heads, can_configure_training_run, TrainingRunConfigField::AttentionHeads, state)}
-                        {config_number_input("Embedding size", selected_training_run_config.embedding_size, can_configure_training_run, TrainingRunConfigField::EmbeddingSize, state)}
-                        {config_checkbox_input("Learned biases", selected_training_run_config.transformer_features.use_learned_biases, can_configure_training_run, TrainingRunConfigToggleField::LearnedBiases, state)}
-                        {config_checkbox_input("RoPE positions", selected_training_run_config.transformer_features.use_rope_position_encoding, can_configure_training_run, TrainingRunConfigToggleField::RopePositionEncoding, state)}
-                        {config_checkbox_input("Absolute positions", selected_training_run_config.transformer_features.use_learned_absolute_position_encoding, can_configure_training_run, TrainingRunConfigToggleField::LearnedAbsolutePositionEncoding, state)}
-                        {config_checkbox_input("Residual dropout", selected_training_run_config.transformer_features.use_residual_dropout, can_configure_training_run, TrainingRunConfigToggleField::ResidualDropout, state)}
-                        {config_checkbox_input("Learned RMSNorm gain", selected_training_run_config.transformer_features.use_learned_rmsnorm_gain, can_configure_training_run, TrainingRunConfigToggleField::LearnedRmsNormGain, state)}
-                        {config_checkbox_input("Final RMSNorm", selected_training_run_config.transformer_features.use_final_rmsnorm, can_configure_training_run, TrainingRunConfigToggleField::FinalRmsNorm, state)}
-                        {config_checkbox_input("SwiGLU MLP", selected_training_run_config.transformer_features.use_swiglu_feed_forward, can_configure_training_run, TrainingRunConfigToggleField::SwigluFeedForward, state)}
-                        {config_checkbox_input("GELU MLP activation", selected_training_run_config.transformer_features.use_gelu_feed_forward, can_configure_training_run, TrainingRunConfigToggleField::GeluFeedForward, state)}
-                        {config_checkbox_input("Tied output embeddings", selected_training_run_config.transformer_features.use_tied_output_embeddings, can_configure_training_run, TrainingRunConfigToggleField::TiedOutputEmbeddings, state)}
-                        {config_checkbox_input("Gradient clipping", selected_training_run_config.optimizer_features.use_gradient_clipping, can_configure_training_run, TrainingRunConfigToggleField::GradientClipping, state)}
-                        {config_checkbox_input("Weight decay", selected_training_run_config.optimizer_features.use_weight_decay, can_configure_training_run, TrainingRunConfigToggleField::WeightDecay, state)}
-                        {config_checkbox_input("Warmup/cosine LR", selected_training_run_config.optimizer_features.use_warmup_cosine_learning_rate, can_configure_training_run, TrainingRunConfigToggleField::WarmupCosineLearningRate, state)}
+                    if snapshot.training_config_expanded {
+                        div { class: "config-grid",
+                            {config_number_input("Validation interval steps", selected_training_run_config.validation_step_interval, can_configure_training_run, TrainingRunConfigField::ValidationStepInterval, state)}
+                            {config_number_input("Docs per batch", selected_training_run_config.training_document_batch_size, can_configure_training_run, TrainingRunConfigField::TrainingDocumentBatchSize, state)}
+                            {config_number_input("Max total docs", selected_training_run_config.max_document_count, can_configure_training_run, TrainingRunConfigField::MaxDocumentCount, state)}
+                            {config_number_input("Validation docs divisor", selected_training_run_config.validation_set_divisor, can_configure_training_run, TrainingRunConfigField::ValidationSetDivisor, state)}
+                            {config_number_input("Validation docs cap", selected_training_run_config.validation_set_max_document_count, can_configure_training_run, TrainingRunConfigField::ValidationSetMaxDocumentCount, state)}
+                            {config_number_input("Context size", selected_training_run_config.context_window_size, can_configure_training_run, TrainingRunConfigField::ContextWindowSize, state)}
+                            {config_number_input("Layers", selected_training_run_config.layer_count, can_configure_training_run, TrainingRunConfigField::LayerCount, state)}
+                            {config_number_input("Attention heads", selected_training_run_config.attention_heads, can_configure_training_run, TrainingRunConfigField::AttentionHeads, state)}
+                            {config_number_input("Embedding size", selected_training_run_config.embedding_size, can_configure_training_run, TrainingRunConfigField::EmbeddingSize, state)}
+                            {config_checkbox_input("Learned biases", selected_training_run_config.transformer_features.use_learned_biases, can_configure_training_run, TrainingRunConfigToggleField::LearnedBiases, state)}
+                            {config_checkbox_input("RoPE positions", selected_training_run_config.transformer_features.use_rope_position_encoding, can_configure_training_run, TrainingRunConfigToggleField::RopePositionEncoding, state)}
+                            {config_checkbox_input("Absolute positions", selected_training_run_config.transformer_features.use_learned_absolute_position_encoding, can_configure_training_run, TrainingRunConfigToggleField::LearnedAbsolutePositionEncoding, state)}
+                            {config_checkbox_input("Residual dropout", selected_training_run_config.transformer_features.use_residual_dropout, can_configure_training_run, TrainingRunConfigToggleField::ResidualDropout, state)}
+                            {config_checkbox_input("Learned RMSNorm gain", selected_training_run_config.transformer_features.use_learned_rmsnorm_gain, can_configure_training_run, TrainingRunConfigToggleField::LearnedRmsNormGain, state)}
+                            {config_checkbox_input("Final RMSNorm", selected_training_run_config.transformer_features.use_final_rmsnorm, can_configure_training_run, TrainingRunConfigToggleField::FinalRmsNorm, state)}
+                            {config_checkbox_input("SwiGLU MLP", selected_training_run_config.transformer_features.use_swiglu_feed_forward, can_configure_training_run, TrainingRunConfigToggleField::SwigluFeedForward, state)}
+                            {config_checkbox_input("GELU MLP activation", selected_training_run_config.transformer_features.use_gelu_feed_forward, can_configure_training_run, TrainingRunConfigToggleField::GeluFeedForward, state)}
+                            {config_checkbox_input("Tied output embeddings", selected_training_run_config.transformer_features.use_tied_output_embeddings, can_configure_training_run, TrainingRunConfigToggleField::TiedOutputEmbeddings, state)}
+                            {config_checkbox_input("Gradient clipping", selected_training_run_config.optimizer_features.use_gradient_clipping, can_configure_training_run, TrainingRunConfigToggleField::GradientClipping, state)}
+                            {config_checkbox_input("Weight decay", selected_training_run_config.optimizer_features.use_weight_decay, can_configure_training_run, TrainingRunConfigToggleField::WeightDecay, state)}
+                            {config_checkbox_input("Warmup/cosine LR", selected_training_run_config.optimizer_features.use_warmup_cosine_learning_rate, can_configure_training_run, TrainingRunConfigToggleField::WarmupCosineLearningRate, state)}
+                        }
                     }
                 }
 
@@ -460,7 +488,10 @@ fn App() -> Element {
                         }
                     }
                     div { class: "field",
-                        label { "Search {browser_dataset_label_lowercase} examples" }
+                        label {
+                            title: "Filter and rank visible {browser_dataset_label_lowercase} documents by matching text.",
+                            "Search {browser_dataset_label_lowercase} examples"
+                        }
                         div { class: "search-row",
                             input {
                                 class: "text-input",
@@ -528,7 +559,10 @@ fn App() -> Element {
                     h2 { class: "section-title", "Generate samples" }
                     div { class: "controls",
                         div { class: "field",
-                            label { "Prefix" }
+                            label {
+                                title: "Text to seed generation before the model continues the sample.",
+                                "Prefix"
+                            }
                             input {
                                 class: "text-input",
                                 value: "{snapshot.prefix}",
@@ -540,7 +574,10 @@ fn App() -> Element {
                             }
                         }
                         div { class: "field",
-                            label { "Temperature {format_rate(snapshot.temperature)}" }
+                            label {
+                                title: "Sampling randomness. Lower values are more conservative; higher values are more varied.",
+                                "Temperature {format_rate(snapshot.temperature)}"
+                            }
                             input {
                                 class: "range",
                                 r#type: "range",
@@ -658,6 +695,7 @@ impl AppState {
                                 training_document_search: String::new(),
                                 cached_browser_search_matches: Vec::new(),
                                 training_document_page: 0,
+                                training_config_expanded: true,
                                 temperature: 0.5,
                                 samples: Vec::new(),
                                 initialization_error: None,
@@ -720,6 +758,7 @@ impl AppState {
             training_document_search: String::new(),
             cached_browser_search_matches: Vec::new(),
             training_document_page: 0,
+            training_config_expanded: true,
             temperature: 0.5,
             samples: Vec::new(),
             initialization_error: Some(error),
@@ -875,6 +914,10 @@ impl AppState {
         self.initialization_error = None;
     }
 
+    fn toggle_training_config_expanded(&mut self) {
+        self.training_config_expanded = !self.training_config_expanded;
+    }
+
     fn reset_training(&mut self) {
         if self.is_training_busy || self.is_generating_samples {
             return;
@@ -908,6 +951,7 @@ impl AppState {
         next.training_document_page_rng = self.training_document_page_rng.clone();
         next.document_browser_dataset = self.document_browser_dataset;
         next.training_document_search = self.training_document_search.clone();
+        next.training_config_expanded = self.training_config_expanded;
         next.refresh_cached_browser_search_matches();
         *self = next;
     }
@@ -1026,15 +1070,13 @@ impl AppState {
         self.recreate_session_with_config(self.selected_training_run_config());
     }
 
-    fn export_checkpoint_to_directory(&mut self, directory: PathBuf) {
+    fn export_checkpoint_to_path(&mut self, path: PathBuf) {
         if self.is_training_busy || self.is_generating_samples {
             return;
         }
         let Some(session) = &self.session else {
             return;
         };
-        self.snapshot_export_directory = Some(directory.clone());
-        let path = directory.join(snapshot_checkpoint_file_name(session));
         match session
             .export_checkpoint(self.training_run_config)
             .and_then(|checkpoint| save_checkpoint_to_path(&checkpoint, &path))
@@ -1325,11 +1367,25 @@ fn snapshot_checkpoint_file_name(session: &TrainingSession) -> String {
 }
 
 fn metric(label: &str, value: String) -> Element {
+    let tooltip = metric_tooltip(label);
     rsx! {
         div { class: "metric",
-            div { class: "metric-label", "{label}" }
+            div { class: "metric-label", title: "{tooltip}", "{label}" }
             div { class: "metric-value", "{value}" }
         }
+    }
+}
+
+fn metric_tooltip(label: &str) -> &'static str {
+    match label {
+        "Status" => "Current worker state for training or sample generation.",
+        "Backend" => "Execution backend used for training and inference.",
+        "Model params" => "Number of trainable model parameters.",
+        "Learning rate" => "Current optimizer learning rate after scheduling.",
+        "Training step" => "Completed training steps out of the configured training budget.",
+        "Train loss" => "Latest cross-entropy loss measured on training data.",
+        "Validation" => "Latest cross-entropy loss measured on the full fixed validation set.",
+        _ => "Metric reported by the current training session.",
     }
 }
 
@@ -1340,9 +1396,10 @@ fn config_number_input(
     field: TrainingRunConfigField,
     mut state: Signal<AppState>,
 ) -> Element {
+    let tooltip = config_label_tooltip(label);
     rsx! {
         div { class: "field",
-            label { "{label}" }
+            label { title: "{tooltip}", "{label}" }
             input {
                 class: "text-input",
                 r#type: "number",
@@ -1364,8 +1421,9 @@ fn config_checkbox_input(
     field: TrainingRunConfigToggleField,
     mut state: Signal<AppState>,
 ) -> Element {
+    let tooltip = config_label_tooltip(label);
     rsx! {
-        label { class: "checkbox-field",
+        label { class: "checkbox-field", title: "{tooltip}",
             input {
                 r#type: "checkbox",
                 checked: value,
@@ -1376,6 +1434,51 @@ fn config_checkbox_input(
             }
             span { "{label}" }
         }
+    }
+}
+
+fn config_label_tooltip(label: &str) -> &'static str {
+    match label {
+        "Validation interval steps" => {
+            "How many training steps run between validation loss evaluations."
+        }
+        "Docs per batch" => "Number of training documents sampled for each optimizer step.",
+        "Max total docs" => {
+            "Maximum number of filtered source documents available for training and validation."
+        }
+        "Validation docs divisor" => {
+            "Validation set size before capping: total filtered documents divided by this value."
+        }
+        "Validation docs cap" => {
+            "Maximum number of documents reserved for the fixed validation set."
+        }
+        "Context size" => "Maximum number of characters the model can condition on at once.",
+        "Layers" => "Number of repeated Transformer blocks in the model.",
+        "Attention heads" => "Number of attention heads used in each Transformer layer.",
+        "Embedding size" => "Width of token, hidden, and attention projection vectors.",
+        "Learned biases" => {
+            "Enable trainable bias vectors in linear projections and output logits."
+        }
+        "RoPE positions" => "Use rotary position embeddings in attention queries and keys.",
+        "Absolute positions" => "Add learned absolute position embeddings to token embeddings.",
+        "Residual dropout" => {
+            "Apply dropout to attention and MLP residual updates during training."
+        }
+        "Learned RMSNorm gain" => "Use trainable per-channel gain values in RMSNorm layers.",
+        "Final RMSNorm" => "Normalize the final hidden state before producing output logits.",
+        "SwiGLU MLP" => "Use the gated SwiGLU feed-forward block instead of a single activation.",
+        "GELU MLP activation" => {
+            "When SwiGLU is disabled, use GELU instead of ReLU in the feed-forward block."
+        }
+        "Tied output embeddings" => {
+            "Share token embedding weights with the output language-model head."
+        }
+        "Gradient clipping" => "Limit gradient norm before Adam updates to reduce unstable steps.",
+        "Weight decay" => "Apply AdamW-style parameter decay during optimization.",
+        "Warmup/cosine LR" => {
+            "Use warmup followed by cosine learning-rate decay instead of linear decay."
+        }
+        _ => "Training configuration value.",
     }
 }
 
@@ -1407,22 +1510,6 @@ fn ordered_character_score(document: &str, query: &str) -> usize {
         }
     }
     score
-}
-
-fn loss_metric_text(label: &str, loss: f64, vocabulary_size: usize) -> Element {
-    let estimated_accuracy = estimated_accuracy_from_loss(loss, vocabulary_size);
-    let perplexity = format_perplexity(loss);
-    let random_accuracy = if vocabulary_size > 0 {
-        1.0 / vocabulary_size as f64
-    } else {
-        0.0
-    };
-
-    rsx! {
-        div { class: "model-summary",
-            "{label} perplexity {perplexity} | estimated accuracy {format_percent(estimated_accuracy)} | random {format_percent(random_accuracy)} | vocab {vocabulary_size}"
-        }
-    }
 }
 
 fn loss_history_chart(progress_history: &[MicrogptTrainingProgress]) -> Element {
@@ -1557,12 +1644,4 @@ fn format_elapsed_training_time(milliseconds: u128) -> String {
     } else {
         format!("{minutes}m {seconds:02}s")
     }
-}
-
-fn estimated_accuracy_from_loss(loss: f64, vocabulary_size: usize) -> f64 {
-    let random_loss = (vocabulary_size as f64).ln();
-    if random_loss <= 0.0 {
-        return 1.0;
-    }
-    (1.0 - loss / random_loss).clamp(0.0, 1.0)
 }

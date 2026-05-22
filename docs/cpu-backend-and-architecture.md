@@ -1152,27 +1152,6 @@ validation_loss = sum(document_loss * document_prediction_count)
 
 This avoids giving a short sentence and a long sentence equal weight when the long sentence contributed many more next-token predictions.
 
-## Perplexity
-
-The app can display perplexity from loss:
-
-```rust
-pub fn format_perplexity(loss: f64) -> String {
-    let perplexity = loss.exp();
-    // formatting...
-}
-```
-
-Perplexity is:
-
-```text
-perplexity = exp(cross_entropy_loss)
-```
-
-Interpretation: if loss is `log(N)`, perplexity is `N`, roughly meaning the model is as uncertain as choosing among `N` equally likely tokens. Lower is better.
-
-For this model, perplexity is measured per character. It is a different scale from word-level or subword-level LLM perplexity.
-
 ## Progress History
 
 Each step appends a `MicrogptTrainingProgress`:
