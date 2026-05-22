@@ -1,13 +1,13 @@
 # MLX Backend Overview
 
-This document explains how the MLX backend in `lib/src/mlx_microgpt.rs` works, why it is structured the way it is, and the machine-learning concepts behind it. The backend trains the same tiny character-level GPT-style model as the CPU implementation, but expresses the math as MLX tensor operations so Apple Silicon can run larger matrix operations efficiently.
+This document walks through the MLX backend in `lib/src/mlx_microgpt.rs`: the shape of the code, the model it trains, and the machine-learning ideas used along the way. The backend trains the same small character-level GPT-style model as the CPU implementation, with the arithmetic written as MLX tensor operations so Apple Silicon can do the larger matrix work efficiently.
 
-The practical difference is:
+The main difference from the CPU backend is the unit of computation:
 
 - The CPU backend builds many scalar `Value` objects and runs explicit reverse-mode autodiff over that graph.
 - The MLX backend stores parameters and activations as MLX `Array` tensors and asks MLX to compute gradients with `value_and_grad`.
 
-In short, MLX changes the execution model from "many Rust scalar operations" to "a few batched tensor graphs".
+The learning problem is the same in both cases. MLX changes how the arithmetic is represented and scheduled.
 
 ## Source Map
 
@@ -30,7 +30,7 @@ The central MLX functions are:
 - `apply_adam_update`
 - `generate_sample`
 
-## Model At A Glance
+## Model Overview
 
 The model is a small decoder-only Transformer trained as a character-level language model.
 
@@ -57,15 +57,15 @@ The model has:
 
 ## Why Character-Level?
 
-The tokenizer is deliberately simple: each unique character in the dataset gets a token id, plus a boundary token. The boundary token is used both as a "start of sequence" and "end of sequence" marker.
+The tokenizer uses one token per character in the dataset, plus a boundary token. The boundary token is used both as a "start of sequence" and "end of sequence" marker.
 
-This keeps the model inspectable:
+That choice keeps the model close to the text:
 
 - No BPE or SentencePiece vocabulary.
 - No subword merge rules.
-- The target at each position is literally the next character.
+- The target at each position is the next character.
 
-That simplicity makes the training objective easy to reason about. The downside is that the model must learn spelling, words, punctuation, and sentence structure from character transitions, which is harder and less efficient than token-level modeling.
+The cost is sequence length. A word is several training steps, not one token. The model has to learn spelling, word boundaries, punctuation, and sentence structure from character transitions.
 
 ## Parameters And Tensor Shapes
 
@@ -82,7 +82,7 @@ pub struct MlxTransformerModelParameters {
 }
 ```
 
-Important active shapes:
+Active shapes:
 
 ```text
 token_embedding:              [vocab_size, embedding_size]
@@ -126,7 +126,7 @@ Inside the constructor:
 4. The model parameters are initialized.
 5. Adam first/second moment tensors are initialized as zeros with the same shape as every parameter tensor.
 
-The optimizer state uses tensors, not scalar vectors:
+The optimizer state stores tensors with the same shapes as the parameters:
 
 ```rust
 let parameters = model.values();
@@ -154,7 +154,7 @@ target_tokens: [context_window_size]
 loss_mask:     [context_window_size]
 ```
 
-Short sentences are padded with the boundary token, but padding positions get `loss_mask = 0`. That lets the backend build rectangular tensors without teaching the model to predict padding.
+Short sentences are padded with the boundary token. Padding positions get `loss_mask = 0`, so the backend can build rectangular tensors while excluding those positions from the loss.
 
 For a batch of `B` windows and sequence length `T`:
 
@@ -212,7 +212,7 @@ That replaces the CPU backend's scalar graph traversal.
 
 ## Lazy Evaluation In MLX
 
-MLX operations are lazy. Many calls build a computation graph rather than immediately running it. That is useful because MLX can fuse and schedule work, but it also means the code must force evaluation at important boundaries.
+MLX operations are lazy. Many calls build a computation graph rather than running immediately. This gives MLX room to fuse and schedule work, and it means the Rust code has to mark the points where values are needed on the host.
 
 The backend forces evaluation when it needs host-side values:
 
@@ -261,7 +261,7 @@ let target_logits = flat_logits
 let token_losses = (log_normalizer.reshape(&[-1])? - target_logits) * &loss_mask;
 ```
 
-Finally, it averages over real prediction positions:
+The final loss is the average over unmasked prediction positions:
 
 ```rust
 ops::sum(&token_losses, None)
@@ -480,7 +480,7 @@ let cosine = angle.cos();
 let sine = angle.sin();
 ```
 
-RoPE is applied to queries and keys, not values:
+RoPE is applied to queries and keys. Values are left as content vectors:
 
 ```rust
 let query = apply_rotary_position_embedding_batch(...)?;
@@ -535,7 +535,7 @@ let updated_hidden_state = block_output + residual_state;
 
 And similarly for feed-forward updates.
 
-This drops parts of the proposed update, not the residual state itself. The residual path remains intact.
+This drops parts of the block's proposed update while leaving the residual path intact.
 
 The backend uses inverted dropout:
 
@@ -553,7 +553,7 @@ The masks are deterministic functions of:
 - Stream id, separating attention masks from feed-forward masks.
 - Element index.
 
-That means checkpoint resume does not need to serialize RNG state for dropout masks. Given the same step and shape, the mask can be rebuilt.
+Checkpoint resume can rebuild the same mask from the step and shape, so there is no separate dropout RNG state to serialize.
 
 ## AdamW Optimizer
 
@@ -627,7 +627,7 @@ This prevents rare large gradients from producing unstable parameter updates.
 
 ## Validation Loss
 
-Validation uses the same forward loss as training but without dropout:
+Validation uses the same forward loss as training, with dropout disabled:
 
 ```rust
 Ok(batch_loss(&params, config, &[token_window], None)?.item::<f32>() as f64)
@@ -640,7 +640,7 @@ Important details:
 - Document losses are weighted by prediction-token count.
 - The reported value is still cross-entropy in nats per predicted character.
 
-Token-weighted aggregation matters because otherwise a very short sentence and a long sentence would contribute equally. The implementation uses:
+The validation average is weighted by prediction count. A three-character sentence carries fewer prediction targets than a thirty-character sentence, and the average reflects that. The implementation uses:
 
 ```rust
 weighted_loss_sum += document_loss * document_token_count as f64;
@@ -689,17 +689,17 @@ values[layer_index].push(value);
 
 Then attention for the current token attends over the cached time steps. This avoids recomputing previous key/value projections from scratch on every generated token.
 
-This generation path is simpler than production-scale KV caching because cache entries are Rust `Vec<Vec<Array>>`, not one preallocated tensor cache. For this tiny model, that is acceptable and keeps the code easy to inspect.
+This generation path uses ordinary Rust vectors of MLX arrays for the cache. Larger inference systems usually use preallocated tensor caches. For this model size, the vector form keeps the data structure easy to follow.
 
 ## CPU Backend Versus MLX Backend
 
-The CPU backend is useful as a learning/reference implementation:
+The CPU backend is the more explicit reference implementation:
 
 ```text
 scalar Value graph -> explicit backward pass
 ```
 
-The MLX backend is the performance implementation:
+The MLX backend carries the same computation in batched tensor form:
 
 ```text
 batched Array graph -> MLX autodiff
@@ -715,7 +715,7 @@ CPU backward_for(...)              -> MLX value_and_grad(...)
 CPU scalar Adam update             -> MLX tensor AdamW update
 ```
 
-Both backends share the same high-level model choices and tokenizer behavior. The MLX backend changes how the math is executed, not what objective the model is trained to optimize.
+Both backends share the same high-level model choices and tokenizer behavior. The MLX backend changes how the math is executed; the training objective remains the same.
 
 ## Numerical Notes
 
@@ -728,9 +728,9 @@ Several implementation choices are specifically about numerical stability:
 - Adam uses `epsilon` in the denominator.
 - Gradient clipping limits update spikes.
 
-These details are small, but without them training can easily become unstable, especially with attention softmax and adaptive optimizer denominators.
+These details are modest in code, but they keep the numerical scale well behaved, especially around attention softmax and adaptive optimizer denominators.
 
-## Mental Model For A Training Step
+## Training Step As A Pipeline
 
 A single MLX training step can be read as:
 
@@ -757,5 +757,4 @@ documents
   -> new immutable session/model state
 ```
 
-That is the entire backend in one pipeline.
-
+That pipeline is the backend: a batch of token windows is turned into a scalar loss, MLX differentiates the loss with respect to the parameters, and AdamW produces the next model state.

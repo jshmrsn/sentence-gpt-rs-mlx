@@ -1,8 +1,8 @@
 # CPU Backend And Overall Architecture
 
-This document explains how the plain Rust CPU backend works, how it fits into the application architecture, and which machine-learning concepts and training techniques the project uses. It is written as a companion to `docs/mlx-backend.md`.
+This document walks through the plain Rust CPU backend, the surrounding application architecture, and the machine-learning ideas used by the project. It is written as a companion to `docs/mlx-backend.md`.
 
-The CPU backend is the reference implementation. It intentionally avoids a tensor framework so the math is visible in ordinary Rust data structures:
+The CPU backend is the reference implementation. It avoids a tensor framework so the math remains visible in ordinary Rust data structures:
 
 - A scalar number is a `Value`.
 - A vector is `Vec<Value>`.
@@ -10,11 +10,11 @@ The CPU backend is the reference implementation. It intentionally avoids a tenso
 - The computation graph is built implicitly by calling methods such as `add`, `mul`, `exp`, and `log`.
 - Reverse-mode autodiff walks that graph to compute gradients.
 
-That makes CPU training much slower than MLX, but much easier to inspect. The backend is useful for learning, debugging, and confirming that the tensor implementation is doing the same conceptual work.
+CPU training is much slower than MLX training. In exchange, the computation graph, derivatives, and optimizer updates can be read directly from the code.
 
 ## Source Map
 
-The important files are:
+The main files are:
 
 - `lib/src/value.rs`: scalar reverse-mode automatic differentiation.
 - `lib/src/microgpt.rs`: CPU model, training loop, validation loss, generation, optimizer, checkpoint import/export helpers.
@@ -47,9 +47,9 @@ The central shared architecture functions are:
 - `TrainingSession::export_checkpoint`
 - `TrainingSession::import_checkpoint`
 
-## Big Picture
+## Overview
 
-The project trains a tiny decoder-only Transformer as a character-level language model. The model reads a short sequence of characters and predicts the next character at every position.
+The project trains a small decoder-only Transformer as a character-level language model. The model reads a short sequence of characters and predicts the next character at every position.
 
 Example training pair:
 
@@ -58,7 +58,7 @@ input:   <BOS> T h e   c a t
 target:  T     h e   c a t <EOS>
 ```
 
-The model is "decoder-only" because it only predicts future text from previous text. It does not have an encoder side like sequence-to-sequence translation models.
+The model is "decoder-only" because it predicts future text from previous text. Sequence-to-sequence translation models have a separate encoder side; this model has only the decoder-style prediction path.
 
 The model is "causal" because each position can only attend to earlier positions and itself. During CPU training this causality comes naturally from processing one position at a time and appending keys/values to the KV cache. There is no future information in the cache.
 
@@ -101,9 +101,9 @@ lib/
   scalar autodiff
 ```
 
-The `lib` crate knows how to train and generate. The `config` crate knows when and with which backend to call training. The `app` crate owns interactive state and delegates expensive work to blocking worker tasks.
+The `lib` crate contains the model code for training and generation. The `config` crate chooses the backend, prepares data, and schedules training chunks. The `app` crate holds the interactive state and sends expensive work to blocking worker tasks.
 
-This separation matters because the GUI should not know the internal details of attention or AdamW, and the model code should not know about buttons, file dialogs, or charts.
+The boundary is plain: the GUI can work without knowing the details of attention or AdamW, and the model code can work without knowing about buttons, file dialogs, or charts.
 
 ## Backend Abstraction
 
@@ -151,7 +151,7 @@ This gives the UI one path for:
 - checkpoint export/import
 - trained snapshot for generation
 
-The enum wrapper is intentionally simple. It avoids a trait-object design and keeps each backend's concrete type available where needed.
+The enum wrapper is a direct fit for the current code. It keeps each backend's concrete type available where needed without introducing a trait layer.
 
 ## Default Configs
 
@@ -171,7 +171,7 @@ pub const CPU_DEFAULT_TRAINING_RUN_CONFIG: TrainingRunConfig = TrainingRunConfig
 };
 ```
 
-The CPU path is scalar and graph-heavy, so the default keeps training interactive. The MLX default can use larger batches and model dimensions because MLX executes batched tensor operations on Apple Silicon.
+The CPU path is scalar and graph-heavy, so the default is sized for interactive training. The MLX default can use larger batches and model dimensions because MLX executes batched tensor operations on Apple Silicon.
 
 The shared optimizer config is:
 
@@ -212,7 +212,7 @@ JSON stories
   -> flatten selected story groups into sentence documents
 ```
 
-The most important design choice is story-level splitting. Sentences stay grouped by original source story until after the train/validation split:
+One design choice is especially relevant for validation: sentences stay grouped by original source story until after the train/validation split.
 
 ```rust
 let shuffled_stories = shuffled_by(&input_stories, rng);
@@ -222,7 +222,7 @@ let validation_documents = flatten_story_sentences(&shuffled_stories[..validatio
 let documents = flatten_story_sentences(&shuffled_stories[validation_story_count..]);
 ```
 
-This reduces leakage. If one story contributes two very similar sentences, they should not be split across train and validation by accident.
+This reduces leakage. If one story contributes two very similar sentences, keeping the story together prevents those near-duplicates from landing on opposite sides of the split.
 
 Duplicate sentence filtering is global:
 
@@ -237,7 +237,7 @@ That prevents repeated text from overweighting the objective and also reduces th
 
 ## Character Tokenization
 
-The tokenizer is deliberately simple. Every distinct character becomes one token id, plus one sequence-boundary token:
+The tokenizer uses one token id for every distinct character, plus one sequence-boundary token:
 
 ```rust
 pub struct CharacterTokenizer {
@@ -265,7 +265,7 @@ pub fn encode_document(&self, document: &str) -> Vec<usize> {
 
 The first boundary token teaches how text starts. The final boundary token teaches when generation should stop.
 
-This is not how most production LLMs tokenize text. Production systems usually use BPE, Unigram, WordPiece, or another subword tokenizer. Character tokenization is slower in sequence length, but easier to understand and inspect.
+Most larger language models use BPE, Unigram, WordPiece, or another subword tokenizer. Character tokenization produces longer sequences, but the examples stay close to the original text and the vocabulary is easy to inspect.
 
 ## CPU Data Structures
 
@@ -389,11 +389,11 @@ let projection_std = (1.0 / embedding_size as f64).sqrt();
 let residual_projection_std = projection_std / (2.0 * layer_count as f64).sqrt();
 ```
 
-The important ideas are:
+The main ideas are:
 
-- Embeddings start small, so initial logits are not extreme.
+- Embeddings start small, so initial logits stay near zero.
 - Projection matrices scale roughly with hidden size.
-- Residual projection weights are smaller when there are more layers, so repeated residual additions do not immediately blow up activation magnitudes.
+- Residual projection weights are smaller when there are more layers, so repeated residual additions start at a controlled scale.
 - RMSNorm gains start at one.
 - Biases start at zero.
 
@@ -536,7 +536,7 @@ The result is a dense vector aligned with `model.values()`.
 
 ## Flattened Parameters
 
-The optimizer wants a flat vector of parameters and gradients, but the model is nested. The CPU model provides a stable flattened parameter order:
+The model is nested, while the optimizer works over a flat vector of parameters and gradients. The CPU model provides a stable flattened parameter order:
 
 ```rust
 pub fn values(&self) -> Vec<Value> {
@@ -610,7 +610,7 @@ Window selection is deterministic:
 let document_index = deterministic_index(step, batch_offset, 0x9e37, documents.len());
 ```
 
-The same `(step, batch_offset)` picks the same document/window after restoring a checkpoint. That means the checkpoint does not need to store mutable batch-sampling RNG state.
+The same `(step, batch_offset)` picks the same document/window after restoring a checkpoint. The checkpoint therefore does not need to store mutable batch-sampling RNG state.
 
 ## Forward Pass
 
@@ -711,7 +711,7 @@ rms(x) = sqrt(mean(x_i^2) + eps)
 y_i = gain_i * x_i / rms(x)
 ```
 
-RMSNorm does not subtract the mean. It mainly controls vector magnitude. The learned `gain` vector lets the model choose which channels should be louder or quieter after normalization.
+RMSNorm leaves the mean alone and controls vector magnitude. The learned `gain` vector lets the model choose which channels should be louder or quieter after normalization.
 
 ## Causal Self-Attention
 
@@ -809,7 +809,7 @@ y0 = x0 * cos(angle) - x1 * sin(angle)
 y1 = x0 * sin(angle) + x1 * cos(angle)
 ```
 
-RoPE is applied to queries and keys, not values. This lets query-key dot products encode relative position. In other words, attention can learn not only "which previous token matters?" but also "how far back is it?"
+RoPE is applied to queries and keys, not values. After both vectors have been rotated by their positions, their dot product can carry information about relative distance. Attention can then learn both which previous token is relevant and how far back it is.
 
 ## SwiGLU Feed-Forward Block
 
@@ -938,7 +938,7 @@ where `m = max(logits)`.
 
 ## Teacher Forcing
 
-Training uses teacher forcing. At every position, the model receives the true previous token, not its own sampled output:
+Training uses teacher forcing. At every position, the model receives the true previous token rather than its own sampled output:
 
 ```rust
 let token_id = token_window.input_tokens[position_id];
@@ -1013,7 +1013,7 @@ for gradient in &mut accumulated_parameter_gradients {
 }
 ```
 
-This is mini-batch gradient descent: noisier than full-batch training, but much cheaper and usually better behaved than one example at a time.
+This is mini-batch gradient descent. It is noisier than full-batch training, but much cheaper and usually steadier than one example at a time.
 
 ## Gradient Clipping
 
@@ -1042,7 +1042,7 @@ if norm > max_norm:
     g_i = g_i * max_norm / norm
 ```
 
-This preserves gradient direction but limits step size. It protects training from rare batches that produce very large gradients.
+This preserves gradient direction while limiting step size. It protects training from rare batches that produce very large gradients.
 
 ## AdamW Optimizer
 
@@ -1113,7 +1113,7 @@ Warmup prevents very large early updates while Adam's moving averages are still 
 
 ## Validation Loss
 
-Validation loss uses held-out documents. It is computed periodically by `config/src/lib.rs`, not every step:
+Validation loss uses held-out documents. `config/src/lib.rs` computes it periodically:
 
 ```rust
 if result.session.completed_step_count >= *next_validation_step {
@@ -1171,7 +1171,7 @@ perplexity = exp(cross_entropy_loss)
 
 Interpretation: if loss is `log(N)`, perplexity is `N`, roughly meaning the model is as uncertain as choosing among `N` equally likely tokens. Lower is better.
 
-For character-level models, perplexity is character-level, not word-level. It should not be compared directly with word/subword LLM perplexities.
+For this model, perplexity is measured per character. It is a different scale from word-level or subword-level LLM perplexity.
 
 ## Progress History
 
@@ -1193,7 +1193,7 @@ previous_loss * (1.0 - RUNNING_MEAN_LOSS_RECENT_WEIGHT)
     + progress.loss * RUNNING_MEAN_LOSS_RECENT_WEIGHT
 ```
 
-This makes noisy mini-batch loss easier to read in the UI.
+This gives the UI a steadier curve than the raw mini-batch loss alone.
 
 ## Frame-Budgeted Training
 
@@ -1206,7 +1206,7 @@ pub const TRAINING_FRAME_BUDGET: Duration = Duration::from_millis(500);
 Training continues until one of these happens:
 
 - the session is complete
-- validation was just attached
+- validation was attached on this chunk
 - the next validation step is reached
 - the frame budget expires
 
@@ -1229,7 +1229,7 @@ tokio::task::spawn_blocking(move || {
 })
 ```
 
-This keeps CPU-heavy scalar graph construction and backpropagation away from the UI runtime.
+Scalar graph construction and backpropagation run away from the UI runtime.
 
 ## Pausing And Queued Work
 
@@ -1262,7 +1262,7 @@ self.manual_training_chunk_requested = false;
 Some((session.clone(), self.next_validation_step))
 ```
 
-The UI keeps ownership of the current session until the worker returns a complete updated session. This avoids partial state updates mid-training-step.
+The UI keeps the current session until the worker returns a complete updated session. This avoids partial state updates during a training step.
 
 ## Training Config State
 
@@ -1445,7 +1445,7 @@ explicit computation graph
 manual reverse-mode autodiff
 one position at a time
 document-level Rayon parallelism
-slow but inspectable
+scalar and inspectable, with low throughput
 ```
 
 MLX backend:
@@ -1455,10 +1455,10 @@ batched tensors
 framework autodiff
 full-sequence tensor operations
 Apple Silicon acceleration
-fast but less transparent
+batched and much faster, with more work handled inside MLX
 ```
 
-The CPU backend is not intended to be competitive with MLX on throughput. Its value is clarity. It shows what the tensor backend is compressing into larger operations.
+The CPU backend's role is clarity rather than throughput. It shows the scalar operations that the tensor backend collects into larger array computations.
 
 ## Training Features And Techniques
 
@@ -1487,24 +1487,24 @@ The project combines several modern LLM training ideas in miniature:
 - Token-weighted validation loss.
 - Validation scheduling independent of training steps.
 - Checkpoint save/load with optimizer state.
-- Top-k sampling with temperature and simple guard rails.
+- Top-k sampling with temperature and decoding constraints.
 - Background worker training for UI responsiveness.
 
-## What Is Intentionally Simplified
+## Simplifications
 
-Several things are deliberately simpler than production systems:
+Several parts are kept small enough to read in one sitting:
 
-- Tokenization is character-based, not subword-based.
+- Tokenization is character-based rather than subword-based.
 - There is no fused kernel or optimized tensor math in the CPU backend.
 - CPU attention runs one position at a time.
 - Context windows are short.
 - The dataset is filtered heavily for short, simple examples.
-- Sampling constraints are handwritten demo guard rails.
+- Sampling constraints are handwritten decoding rules.
 - There is no distributed training, mixed precision, or gradient accumulation across many device steps.
 
-These simplifications make the implementation readable while preserving the core learning mechanics of a GPT-style model.
+The result is still a GPT-style training loop, but with the surrounding machinery kept small enough to inspect.
 
-## Mental Model For A CPU Training Step
+## CPU Training Step As A Pipeline
 
 A CPU training step can be read as:
 
@@ -1531,4 +1531,3 @@ minimize average_t -log P(token[t + 1] | token[0..t])
 ```
 
 Everything else in the backend exists to make that objective trainable, stable, reproducible, inspectable, and usable from the desktop app.
-
