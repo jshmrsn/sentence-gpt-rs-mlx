@@ -403,13 +403,13 @@ fn App() -> Element {
 
                 section { class: "panel",
                     div { class: "status-grid",
-                        {metric("Status", status)}
-                        {metric("Backend", backend_label.into())}
-                        {metric("Model params", format_count(snapshot.session.as_ref().map(TrainingSession::parameter_count).unwrap_or(0)))}
-                        {metric("Learning rate", snapshot.session.as_ref().map(|session| format_learning_rate(session.current_learning_rate())).unwrap_or_else(|| "pending".into()))}
-                        {metric("Training step", format!("{} / {}", snapshot.completed_step_count(), snapshot.training_step_count()))}
-                        {metric("Train loss", latest_loss.map(format_loss).unwrap_or_else(|| "pending".into()))}
-                        {metric("Validation", latest_validation_loss.map(format_loss).unwrap_or_else(|| "pending".into()))}
+                        {metric("Status", "Current worker state for training or sample generation.", status)}
+                        {metric("Backend", "Execution backend used for training and inference.", backend_label.into())}
+                        {metric("Model params", "Number of trainable model parameters.", format_count(snapshot.session.as_ref().map(TrainingSession::parameter_count).unwrap_or(0)))}
+                        {metric("Learning rate", "Current optimizer learning rate after scheduling.", snapshot.session.as_ref().map(|session| format_learning_rate(session.current_learning_rate())).unwrap_or_else(|| "pending".into()))}
+                        {metric("Training step", "Completed training steps out of the configured training budget.", format!("{} / {}", snapshot.completed_step_count(), snapshot.training_step_count()))}
+                        {metric("Train loss", "Latest cross-entropy loss measured on training data.", latest_loss.map(format_loss).unwrap_or_else(|| "pending".into()))}
+                        {metric("Validation loss", "Latest cross-entropy loss measured on the full fixed validation set.", latest_validation_loss.map(format_loss).unwrap_or_else(|| "pending".into()))}
                     }
                     div { class: "progress-track",
                         div { class: "progress-fill", style: "width: {format_percent_style(progress)};" }
@@ -1366,26 +1366,12 @@ fn snapshot_checkpoint_file_name(session: &TrainingSession) -> String {
     format!("sentence-gpt-rs-mlx-{backend}-{timestamp}-step-{step:06}-train-loss-{loss}.bin")
 }
 
-fn metric(label: &str, value: String) -> Element {
-    let tooltip = metric_tooltip(label);
+fn metric(label: &str, tooltip: &str, value: String) -> Element {
     rsx! {
         div { class: "metric",
             div { class: "metric-label", title: "{tooltip}", "{label}" }
             div { class: "metric-value", "{value}" }
         }
-    }
-}
-
-fn metric_tooltip(label: &str) -> &'static str {
-    match label {
-        "Status" => "Current worker state for training or sample generation.",
-        "Backend" => "Execution backend used for training and inference.",
-        "Model params" => "Number of trainable model parameters.",
-        "Learning rate" => "Current optimizer learning rate after scheduling.",
-        "Training step" => "Completed training steps out of the configured training budget.",
-        "Train loss" => "Latest cross-entropy loss measured on training data.",
-        "Validation" => "Latest cross-entropy loss measured on the full fixed validation set.",
-        _ => "Metric reported by the current training session.",
     }
 }
 

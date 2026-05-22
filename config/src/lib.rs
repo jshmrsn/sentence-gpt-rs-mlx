@@ -35,11 +35,11 @@ pub const TRAINING_FRAME_BUDGET: Duration = Duration::from_millis(500);
 pub const MAX_TRAINING_STEP_COUNT: usize = 1_000_000;
 pub const RUNNING_MEAN_LOSS_RECENT_WEIGHT: f64 = 0.35;
 pub const MLX_DEFAULT_TRAINING_RUN_CONFIG: TrainingRunConfig = TrainingRunConfig {
-    validation_step_interval: 30,
+    validation_step_interval: 100,
     training_document_batch_size: 32,
     max_document_count: 5_000_000,
     validation_set_divisor: 50,
-    validation_set_max_document_count: 50,
+    validation_set_max_document_count: 100,
     context_window_size: 128,
     layer_count: 6,
     attention_heads: 8,
