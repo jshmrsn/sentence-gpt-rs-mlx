@@ -48,6 +48,7 @@ pub const MLX_DEFAULT_TRAINING_RUN_CONFIG: TrainingRunConfig = TrainingRunConfig
     layer_count: 6,
     attention_heads: 8,
     embedding_size: 128,
+    mlp_expansion_factor: 3,
     transformer_features: TransformerFeatureConfig::optimized_defaults(),
     optimizer_features: OptimizerFeatureConfig::optimized_defaults(),
 };
@@ -65,6 +66,7 @@ pub const CPU_DEFAULT_TRAINING_RUN_CONFIG: TrainingRunConfig = TrainingRunConfig
     layer_count: 2,
     attention_heads: 4,
     embedding_size: 16,
+    mlp_expansion_factor: 3,
     transformer_features: TransformerFeatureConfig::optimized_defaults(),
     optimizer_features: OptimizerFeatureConfig::optimized_defaults(),
 };
@@ -731,6 +733,7 @@ mod tests {
             layer_count: 1,
             attention_heads: 2,
             embedding_size: 8,
+            mlp_expansion_factor: 3,
             transformer_features: TransformerFeatureConfig::optimized_defaults(),
             optimizer_features: OptimizerFeatureConfig::optimized_defaults(),
         };
@@ -802,6 +805,7 @@ mod tests {
             layer_count: 1,
             attention_heads: 2,
             embedding_size: 8,
+            mlp_expansion_factor: 3,
             transformer_features: TransformerFeatureConfig::optimized_defaults(),
             optimizer_features: OptimizerFeatureConfig::optimized_defaults(),
         };
@@ -855,6 +859,7 @@ mod tests {
             layer_count: 1,
             attention_heads: 2,
             embedding_size: 8,
+            mlp_expansion_factor: 3,
             transformer_features: TransformerFeatureConfig::optimized_defaults(),
             optimizer_features: OptimizerFeatureConfig::optimized_defaults(),
         };

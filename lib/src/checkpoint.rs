@@ -61,6 +61,7 @@ pub struct TrainingRunConfig {
     pub layer_count: usize,
     pub attention_heads: usize,
     pub embedding_size: usize,
+    pub mlp_expansion_factor: usize,
     pub transformer_features: TransformerFeatureConfig,
     pub optimizer_features: OptimizerFeatureConfig,
 }
@@ -108,9 +109,11 @@ pub fn load_checkpoint_from_path(path: impl AsRef<Path>) -> Result<MicrogptCheck
     // Validate the prefix first so the error points at "wrong file type" instead
     // of a lower-level deserialize failure. The version-like marker also gives us
     // an obvious place to introduce a future incompatible checkpoint format.
-    if bytes.len() < CHECKPOINT_FORMAT_MARKER.len() || &bytes[..CHECKPOINT_FORMAT_MARKER.len()] != CHECKPOINT_FORMAT_MARKER
+    if bytes.len() < CHECKPOINT_FORMAT_MARKER.len()
+        || &bytes[..CHECKPOINT_FORMAT_MARKER.len()] != CHECKPOINT_FORMAT_MARKER
     {
         return Err("not a sentence-gpt-rs-mlx checkpoint file".into());
     }
-    bincode::deserialize(&bytes[CHECKPOINT_FORMAT_MARKER.len()..]).map_err(|error| error.to_string())
+    bincode::deserialize(&bytes[CHECKPOINT_FORMAT_MARKER.len()..])
+        .map_err(|error| error.to_string())
 }

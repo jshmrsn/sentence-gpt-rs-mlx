@@ -53,6 +53,7 @@ enum TrainingRunConfigField {
     LayerCount,
     AttentionHeads,
     EmbeddingSize,
+    MlpExpansionFactor,
 }
 
 #[derive(Clone, Copy)]
@@ -173,6 +174,7 @@ struct SystemOverviewStep {
     title: String,
     status: String,
     details: Vec<String>,
+    info_key: Option<&'static str>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -491,24 +493,6 @@ fn App() -> Element {
                     div { class: "model-header",
                         button {
                             class: "disclosure-button",
-                            onclick: move |_| state.write().toggle_system_overview_expanded(),
-                            title: "Show or hide the high-level training and inference system overview.",
-                            span { class: "disclosure-arrow", "{system_overview_arrow}" }
-                            span { class: "section-title", "System overview" }
-                        }
-                        div { class: "model-summary",
-                            "Aggregated by subsystem"
-                        }
-                    }
-                    if snapshot.system_overview_expanded {
-                        {system_overview_panel(&snapshot, token_embedding_snapshot.as_ref())}
-                    }
-                }
-
-                section { class: "panel",
-                    div { class: "model-header",
-                        button {
-                            class: "disclosure-button",
                             onclick: move |_| state.write().toggle_training_config_expanded(),
                             title: "Show or hide training configuration controls.",
                             span { class: "disclosure-arrow", "{training_config_arrow}" }
@@ -539,6 +523,7 @@ fn App() -> Element {
                             {config_number_input("Layers", selected_training_run_config.layer_count, can_configure_training_run, TrainingRunConfigField::LayerCount, state)}
                             {config_number_input("Attention heads", selected_training_run_config.attention_heads, can_configure_training_run, TrainingRunConfigField::AttentionHeads, state)}
                             {config_number_input("Embedding size", selected_training_run_config.embedding_size, can_configure_training_run, TrainingRunConfigField::EmbeddingSize, state)}
+                            {config_number_input("MLP expansion factor", selected_training_run_config.mlp_expansion_factor, can_configure_training_run, TrainingRunConfigField::MlpExpansionFactor, state)}
                             {config_checkbox_input("Learned biases", selected_training_run_config.transformer_features.use_learned_biases, can_configure_training_run, TrainingRunConfigToggleField::LearnedBiases, state)}
                             {config_checkbox_input("RoPE positions", selected_training_run_config.transformer_features.use_rope_position_encoding, can_configure_training_run, TrainingRunConfigToggleField::RopePositionEncoding, state)}
                             {config_checkbox_input("Absolute positions", selected_training_run_config.transformer_features.use_learned_absolute_position_encoding, can_configure_training_run, TrainingRunConfigToggleField::LearnedAbsolutePositionEncoding, state)}
@@ -716,6 +701,24 @@ fn App() -> Element {
                     }
                 }
 
+                section { class: "panel",
+                    div { class: "model-header",
+                        button {
+                            class: "disclosure-button",
+                            onclick: move |_| state.write().toggle_system_overview_expanded(),
+                            title: "Show or hide the high-level training and inference system overview.",
+                            span { class: "disclosure-arrow", "{system_overview_arrow}" }
+                            span { class: "section-title", "System overview" }
+                        }
+                        div { class: "model-summary",
+                            "Aggregated by subsystem"
+                        }
+                    }
+                    if snapshot.system_overview_expanded {
+                        {system_overview_panel(&snapshot, token_embedding_snapshot.as_ref())}
+                    }
+                }
+
             }
         }
     }
@@ -754,11 +757,12 @@ impl AppState {
         cpu_training_run_config: TrainingRunConfig,
     ) -> Self {
         let mut rng = ChaCha8Rng::seed_from_u64(1);
-        let transformer_config = TransformerConfig::new_with_features(
+        let transformer_config = TransformerConfig::new_with_features_and_mlp_expansion_factor(
             training_run_config.layer_count,
             training_run_config.embedding_size,
             training_run_config.context_window_size,
             training_run_config.attention_heads,
+            training_run_config.mlp_expansion_factor,
             training_run_config.transformer_features,
         );
         let optimizer_config = optimizer_config_for_training_run(training_run_config);
@@ -946,6 +950,9 @@ impl AppState {
             }
             TrainingRunConfigField::EmbeddingSize => {
                 training_run_config.embedding_size = value;
+            }
+            TrainingRunConfigField::MlpExpansionFactor => {
+                training_run_config.mlp_expansion_factor = value;
             }
         }
         self.initialization_error = None;
@@ -1593,6 +1600,7 @@ fn system_overview_panel(
                     format_count(snapshot.training_run_config.max_document_count)
                 ),
             ],
+            info_key: Some("data-corpus"),
         },
         SystemOverviewStep {
             title: "Batch windows".into(),
@@ -1608,6 +1616,7 @@ fn system_overview_panel(
                     format_count(snapshot.completed_document_train_count())
                 ),
             ],
+            info_key: Some("data-batch-windows"),
         },
         SystemOverviewStep {
             title: "Validation".into(),
@@ -1620,6 +1629,7 @@ fn system_overview_panel(
                 format!("next step {}", snapshot.next_validation_step),
                 "held-out documents".into(),
             ],
+            info_key: Some("data-validation"),
         },
     ];
 
@@ -1635,6 +1645,7 @@ fn system_overview_panel(
                 ),
                 format!("context {}", config.context_window_size),
             ],
+            info_key: Some("tokens-vocabulary"),
         },
         SystemOverviewStep {
             title: "Positions".into(),
@@ -1650,6 +1661,7 @@ fn system_overview_panel(
                     format_enabled(features.use_learned_absolute_position_encoding)
                 ),
             ],
+            info_key: Some("tokens-positions"),
         },
         SystemOverviewStep {
             title: "Input vectors".into(),
@@ -1666,6 +1678,7 @@ fn system_overview_panel(
                     format_enabled(features.use_tied_output_embeddings)
                 ),
             ],
+            info_key: Some("tokens-input-vectors"),
         },
     ];
 
@@ -1684,6 +1697,7 @@ fn system_overview_panel(
                 "cross entropy".into(),
                 "masked padding".into(),
             ],
+            info_key: None,
         },
         SystemOverviewStep {
             title: "Gradients".into(),
@@ -1699,6 +1713,7 @@ fn system_overview_panel(
                     snapshot.training_run_config.training_document_batch_size
                 ),
             ],
+            info_key: None,
         },
         SystemOverviewStep {
             title: "AdamW".into(),
@@ -1718,11 +1733,13 @@ fn system_overview_panel(
                     session.training_step_count()
                 ),
             ],
+            info_key: None,
         },
     ];
 
     rsx! {
         div { class: "overview-sections",
+            {model_circuit_overview(snapshot, config, token_embedding_snapshot, &latest_train_loss, &latest_validation_loss, &layer_inspection_snapshot)}
             {overview_flow_section("Data", "Corpus selection, batching, and validation split.", &data_steps, false)}
             {overview_flow_section("Tokens", "Character ids become fixed-width vectors with position information.", &token_steps, false)}
             div { class: "overview-section",
@@ -1736,6 +1753,125 @@ fn system_overview_panel(
             }
             {layer_stack_section(config, mlp_activation, &latest_train_loss, &latest_validation_loss, &layer_inspection_snapshot)}
             {overview_flow_section("Optimizer", "Loss, gradients, and AdamW update state.", &optimizer_steps, true)}
+        }
+    }
+}
+
+fn model_circuit_overview(
+    snapshot: &AppState,
+    config: &TransformerConfig,
+    token_embedding_snapshot: Option<&Result<TokenEmbeddingSnapshot, String>>,
+    latest_train_loss: &str,
+    latest_validation_loss: &str,
+    layer_inspection_snapshot: &Result<LayerInspectionSnapshot, String>,
+) -> Element {
+    let layer_energy = layer_inspection_snapshot
+        .as_ref()
+        .ok()
+        .map(network_energy)
+        .unwrap_or(0.0);
+    let active_token_slots = snapshot.prefix.chars().count().min(8);
+    let embedding_probe_styles = embedding_probe_styles(token_embedding_snapshot);
+
+    rsx! {
+        div { class: "overview-circuit",
+            div { class: "circuit-mainline",
+                div { class: "circuit-node token-node",
+                    {overview_info_button("circuit-tokens", "tokens")}
+                    div { class: "circuit-label", "tokens" }
+                    div { class: "token-matrix",
+                        for row in 0..8 {
+                            span {
+                                class: "{token_slot_class(row, active_token_slots)}",
+                                title: "Prefix token slot {row + 1}. Lit slots reflect the current prefix length, capped at eight visible slots."
+                            }
+                        }
+                    }
+                    div { class: "circuit-dim", "{config.context_window_size} x ids" }
+                }
+                div { class: "circuit-arrow", "→" }
+                div { class: "circuit-node embed-node",
+                    {overview_info_button("circuit-embed", "embed")}
+                    div { class: "circuit-label", "embed" }
+                    div { class: "embedding-probe",
+                        for style in &embedding_probe_styles {
+                            span {
+                                class: "embedding-probe-cell",
+                                style: "{style}",
+                                title: "Sampled token embedding weight from the current table."
+                            }
+                        }
+                    }
+                    div { class: "circuit-dim", "{config.embedding_size} channels" }
+                }
+                div { class: "circuit-arrow", "→" }
+                div { class: "circuit-node attention-node",
+                    {overview_info_button("circuit-attention", "attention")}
+                    div { class: "circuit-label", "attention" }
+                    div { class: "attention-bank",
+                        for _head_index in 0..config.attention_head_count.min(4) {
+                            div { class: "attention-head",
+                                div { class: "attention-head-graph",
+                                    span {}
+                                    span {}
+                                    span {}
+                                    span {}
+                                }
+                                div { class: "attention-projections",
+                                    span { "Q" }
+                                    span { "K" }
+                                    span { "V" }
+                                    span { "O" }
+                                }
+                            }
+                        }
+                    }
+                    div { class: "circuit-dim", "{config.attention_head_count} heads x {config.attention_head_size}" }
+                }
+                div { class: "circuit-arrow", "→" }
+                div { class: "circuit-node mlp-node",
+                    {overview_info_button("circuit-mlp", "mlp")}
+                    div { class: "circuit-label", "mlp" }
+                    svg { class: "mlp-mini-network", view_box: "0 0 160 120",
+                        for y in [22, 48, 72, 98] {
+                            line { x1: "26", y1: "{y}", x2: "80", y2: "22", stroke: "#6f6a5d", stroke_width: "1" }
+                            line { x1: "26", y1: "{y}", x2: "80", y2: "60", stroke: "#6f6a5d", stroke_width: "1" }
+                            line { x1: "26", y1: "{y}", x2: "80", y2: "98", stroke: "#6f6a5d", stroke_width: "1" }
+                        }
+                        for y in [22, 60, 98] {
+                            line { x1: "80", y1: "{y}", x2: "134", y2: "34", stroke: "#6f6a5d", stroke_width: "1" }
+                            line { x1: "80", y1: "{y}", x2: "134", y2: "86", stroke: "#6f6a5d", stroke_width: "1" }
+                        }
+                        for y in [22, 48, 72, 98] {
+                            circle { cx: "26", cy: "{y}", r: "6", fill: "#06090d", stroke: "#f0e8d0", stroke_width: "2" }
+                        }
+                        for y in [22, 60, 98] {
+                            circle { cx: "80", cy: "{y}", r: "7", fill: "#06090d", stroke: "#4fd8ff", stroke_width: "2" }
+                        }
+                        for y in [34, 86] {
+                            circle { cx: "134", cy: "{y}", r: "7", fill: "#06090d", stroke: "#f6d365", stroke_width: "2" }
+                        }
+                    }
+                    div { class: "circuit-dim", "{config.mlp_expansion_factor}x hidden expansion" }
+                }
+                div { class: "circuit-arrow", "→" }
+                div { class: "circuit-node output-node",
+                    {overview_info_button("circuit-logits", "logits")}
+                    div { class: "circuit-label", "logits" }
+                    div { class: "logit-strip",
+                        for row in 0..10 {
+                            span { class: "{logit_probe_class(row)}" }
+                        }
+                    }
+                    div { class: "circuit-dim", "{snapshot.session.as_ref().map(TrainingSession::tokenizer_vocabulary_size).unwrap_or(0)} scores" }
+                }
+            }
+            div { class: "circuit-footer",
+                div { "step {snapshot.completed_step_count()} / {snapshot.training_step_count()}" }
+                div { "train {latest_train_loss}" }
+                div { "validation {latest_validation_loss}" }
+                div { "parameter field {format_percent_style(layer_energy)}" }
+            }
         }
     }
 }
@@ -1784,15 +1920,20 @@ fn layer_visualization_row(
     layer: &LayerInspection,
     max_mean_abs_value: f64,
 ) -> Element {
-    let feed_forward_size = config.embedding_size * 3;
+    let feed_forward_size = config.feed_forward_size();
     let gate_label = if config.features.use_swiglu_feed_forward {
         "Gate"
     } else {
         "Gate off"
     };
+    let gate_class = if config.features.use_swiglu_feed_forward {
+        "mlp-gate"
+    } else {
+        "mlp-gate-off"
+    };
     let gate_detail = if config.features.use_swiglu_feed_forward {
         format!(
-            "{} -> {} | {} params",
+            "{} → {} | {} params",
             config.embedding_size,
             feed_forward_size,
             format_count(layer.mlp_gate.parameter_count)
@@ -1849,16 +1990,16 @@ fn layer_visualization_row(
                         {layer_stage_card(
                             "mlp-expand",
                             "Expand",
-                            format!("{} -> {}", config.embedding_size, feed_forward_size),
+                            format!("{} → {}", config.embedding_size, feed_forward_size),
                             format!("{} params", format_count(layer.mlp_expansion.parameter_count)),
                             layer.mlp_expansion,
                             max_mean_abs_value,
                         )}
                         div { class: "layer-arrow small", "→" }
                         {layer_stage_card(
-                            "mlp-gate",
+                            gate_class,
                             gate_label,
-                            format!("{} -> {}", config.embedding_size, feed_forward_size),
+                            format!("{} → {}", config.embedding_size, feed_forward_size),
                             gate_detail,
                             layer.mlp_gate,
                             max_mean_abs_value,
@@ -1869,7 +2010,7 @@ fn layer_visualization_row(
                         {layer_stage_card(
                             "mlp-project",
                             "Project",
-                            format!("{} -> {}", feed_forward_size, config.embedding_size),
+                            format!("{} → {}", feed_forward_size, config.embedding_size),
                             format!("{} params", format_count(layer.mlp_projection.parameter_count)),
                             layer.mlp_projection,
                             max_mean_abs_value,
@@ -1892,7 +2033,8 @@ fn layer_stage_card(
     rsx! {
         div {
             class: "layer-stage {class_suffix}",
-            style: "{layer_stage_tint_style(stats, max_mean_abs_value)}",
+            style: "{layer_stage_tint_style(class_suffix, stats, max_mean_abs_value)}",
+            {stage_info_button(class_suffix, title)}
             div { class: "stage-copy",
                 div { class: "layer-chunk-title", "{title}" }
                 div { class: "layer-chunk-main", "{main}" }
@@ -1907,51 +2049,149 @@ fn layer_stage_card(
                     }
                 }
             }
-            {neuron_column(stats, max_mean_abs_value)}
         }
     }
 }
 
 fn non_parameter_stage_card(class_suffix: &str, title: &str, main: &str, detail: &str) -> Element {
     rsx! {
-        div { class: "layer-stage {class_suffix} no-params",
+        div {
+            class: "layer-stage {class_suffix} no-params",
+            style: "{non_parameter_stage_tint_style(class_suffix)}",
+            {stage_info_button(class_suffix, title)}
             div { class: "stage-copy",
                 div { class: "layer-chunk-title", "{title}" }
                 div { class: "layer-chunk-main", "{main}" }
                 div { class: "layer-chunk-detail", "{detail}" }
             }
-            div { class: "neuron-column activation-column",
-                span { class: "neuron-dot activation" }
-                span { class: "neuron-dot activation" }
-                span { class: "neuron-dot activation" }
+        }
+    }
+}
+
+fn stage_info_button(class_suffix: &str, title: &str) -> Element {
+    info_button(title, layer_stage_description(class_suffix))
+}
+
+fn overview_info_button(info_key: &str, title: &str) -> Element {
+    info_button(title, overview_chunk_description(info_key))
+}
+
+fn info_button(title: &str, paragraphs: &'static [&'static str]) -> Element {
+    rsx! {
+        div { class: "stage-info-control",
+            button {
+                class: "stage-info-button",
+                r#type: "button",
+                title: "Explain {title}",
+                "i"
+            }
+            div { class: "stage-info-popover", role: "tooltip",
+                div { class: "stage-info-title", "{title}" }
+                for paragraph in paragraphs {
+                    p { "{paragraph}" }
+                }
             }
         }
     }
 }
 
-fn neuron_column(stats: ParameterStats, max_mean_abs_value: f64) -> Element {
-    let intensity = normalized_parameter_stat(stats.mean_abs_value(), max_mean_abs_value);
-    let low_opacity = 0.2 + 0.45 * intensity;
-    let middle_opacity = 0.3 + 0.55 * intensity;
-    let high_opacity = 0.4 + 0.6 * intensity;
+fn overview_chunk_description(info_key: &str) -> &'static [&'static str] {
+    match info_key {
+        "circuit-tokens" => &[
+            "This chunk represents the integer token ids fed into the model. In this app each character maps to a vocabulary id, and a boundary token marks document or sequence edges.",
+            "The visible dots are a compact stand-in for the current context window, not one UI element per possible position. Lit slots reflect how much of the current prefix is present, capped so the overview stays readable as context length grows.",
+            "At this stage the numbers do not yet contain learned meaning. They are discrete lookup keys that will be converted into dense vectors by the embedding table.",
+        ],
+        "circuit-embed" => &[
+            "The embedding table converts each token id into a learned vector with the model's embedding width. Tokens that the model learns to use similarly can develop related vector patterns over training.",
+            "The colored mini-grid samples real values from the current embedding table. Blue and warm cells indicate opposite signs, while stronger color means larger magnitude.",
+            "Position information is combined with these token vectors before the transformer layers read them, so the model can distinguish the same character appearing at different places in the context.",
+        ],
+        "circuit-attention" => &[
+            "Attention is the part of the transformer that lets each token position read from earlier positions. Queries ask what to look for, keys advertise what each position contains, and values carry the information to copy or blend.",
+            "Multiple heads split the embedding channels into smaller views. Each head can specialize in a different pattern, while the output projection recombines those head results back into the residual stream.",
+            "The overview draws only a few heads and projection labels because the useful high-level structure is stable even when the model grows to many heads and millions of parameters.",
+        ],
+        "circuit-mlp" => &[
+            "The MLP works independently at each token position after attention has mixed information across time. It expands the vector into a wider hidden space, applies a nonlinearity or gate, and projects back to the embedding width.",
+            "This block is where many per-token feature transformations happen: sharpening, suppressing, combining, or rewriting features that attention placed in the residual stream.",
+            "The diagram shows representative neuron columns instead of every hidden channel, so it scales with model size while still showing the expand, mix, and project shape.",
+        ],
+        "circuit-logits" => &[
+            "The logits chunk represents the final score assigned to every possible next token. A softmax turns these raw scores into probabilities for sampling or inspection.",
+            "When output embeddings are tied, the same learned token vectors used at input are reused to score output tokens. When untied, a separate output table performs that scoring.",
+            "The vertical strip is a compact vocabulary summary. It does not draw every vocabulary entry, but it shows that the model ends by ranking candidate next tokens.",
+        ],
+        "data-corpus" => &[
+            "The corpus is the source text after sentence extraction, deduplication, and the fixed train/validation split. Training documents are used for gradient updates; validation documents are held out to measure generalization.",
+            "The train and validation counts matter because a model can reduce training loss by memorizing. A separate validation set gives a better signal for whether the learned patterns transfer to unseen examples.",
+            "The max document setting caps how much source material enters the run, which keeps experiments small and repeatable while changing model or optimizer settings.",
+        ],
+        "data-batch-windows" => &[
+            "Each optimizer step samples a batch of documents and cuts them into fixed-length token windows. The context length controls how many preceding tokens the model can use when predicting the next token.",
+            "Deterministic sampling means the run can be reproduced from the same seed and configuration. That makes UI comparisons and checkpoint debugging easier because data order is not an extra hidden variable.",
+            "The document-train count is larger than the step count because one step can include multiple documents. It is a throughput-oriented measure of how many document examples have contributed to updates.",
+        ],
+        "data-validation" => &[
+            "Validation periodically runs the current model on held-out documents without applying optimizer updates. The resulting loss is a checkpoint on model quality, not another training signal.",
+            "Running validation every step would be expensive, so the interval controls how often the app pauses to measure it. The next-step value shows when the next validation pass will happen.",
+            "A falling validation loss usually means the model is learning reusable structure. If training loss falls while validation loss stalls or rises, the model may be overfitting the training documents.",
+        ],
+        "tokens-vocabulary" => &[
+            "The vocabulary is the complete set of token ids the model can receive or generate. This app uses character-level tokens plus a boundary token, so the vocabulary is small and easy to inspect.",
+            "A character tokenizer avoids complex subword tokenization machinery. The tradeoff is that longer text requires more token positions because words are represented one character at a time.",
+            "The boundary id gives the model an explicit marker for sequence edges, helping it learn when one training example ends and another begins.",
+        ],
+        "tokens-positions" => &[
+            "Position encoding tells the model where each token sits in the context. Without it, attention would see a bag of token vectors and would not know their order.",
+            "RoPE rotates query and key channels by position, which makes relative distance information available inside attention scores. Learned absolute positions instead add a trained vector for each slot.",
+            "The configuration can enable either or both mechanisms. This chunk reports the active choice because position handling changes what the attention layers can easily learn.",
+        ],
+        "tokens-input-vectors" => &[
+            "Input vectors are the dense per-position representations that enter the transformer stack. Their shape is context length by embedding width, though this summary reports vocabulary size by embedding width for the token table itself.",
+            "The token table is always active because token ids need learned vectors before the network can process them. Position information is added or applied alongside those token vectors.",
+            "Tied output embeddings reuse the token table at the output side, reducing parameter count and encouraging input and output token geometry to stay aligned.",
+        ],
+        _ => &["This chunk summarizes one concrete part of the training or inference pipeline without expanding it into every token, neuron, or parameter."],
+    }
+}
 
-    rsx! {
-        div {
-            class: "neuron-column",
-            title: "Three example channels; opacity follows this block's mean absolute trained weight.",
-            span {
-                class: "neuron-dot",
-                style: "opacity: {format_rate(low_opacity)};"
-            }
-            span {
-                class: "neuron-dot",
-                style: "opacity: {format_rate(middle_opacity)};"
-            }
-            span {
-                class: "neuron-dot",
-                style: "opacity: {format_rate(high_opacity)};"
-            }
-        }
+fn layer_stage_description(class_suffix: &str) -> &'static [&'static str] {
+    match class_suffix {
+        "norm" => &[
+            "RMSNorm rescales the current residual vector before a sub-block reads it. It divides by the vector's root-mean-square size, then applies learned per-channel gain values when that feature is enabled.",
+            "This model uses pre-norm transformer blocks: normalize first, run attention or the MLP, then add the result back to the residual stream. Pre-norm keeps signal magnitudes steadier, which makes deeper stacks easier to train.",
+            "The two norm passes shown here are the attention norm and the feed-forward norm. They do not mix tokens or channels by themselves; they prepare the vector so the following learned projections operate in a predictable numeric range.",
+        ],
+        "attention" => &[
+            "Attention is the token-mixing part of the layer. It turns each position's vector into queries, keys, and values. Query-key dot products decide which earlier positions this token should read from, and values carry the information being read.",
+            "The heads split the embedding width into smaller subspaces. Each head can learn a different relation, such as nearby punctuation, repeated characters, or boundary tokens. The output projection then recombines all heads into one residual update.",
+            "Causal masking prevents a position from looking into the future during training, so the same block can be used for autoregressive generation one token at a time.",
+        ],
+        "mlp-expand" => &[
+            "The expansion projection is the first learned linear map in the feed-forward block. It maps each token's vector from the model width into a wider hidden space, usually exposing more candidate features than can fit in the residual stream.",
+            "Unlike attention, this projection acts independently at each token position. It does not move information across time; it transforms the features already present at the current position.",
+            "The hidden width is the embedding width multiplied by the configured MLP expansion factor, so the MLP can form a wider set of candidate feature directions before reducing back down.",
+        ],
+        "mlp-gate" => &[
+            "The gate projection is the second parallel linear map used by SwiGLU. It produces context-dependent gate values for the same hidden-width channels produced by the expansion projection.",
+            "During the mix step, the activated expansion stream is multiplied by the gate stream. This lets the model suppress or emphasize candidate features instead of passing every activated feature forward uniformly.",
+            "The gate has learned weights, so training can discover which features should be conditionally opened or closed for different token contexts.",
+        ],
+        "mlp-gate-off" => &[
+            "This model instance is not using the SwiGLU gate path for the active feed-forward computation. The gate parameters still exist in the parameter layout, but the forward pass ignores the gate output when SwiGLU is disabled.",
+            "With the gate off, the MLP behaves like a standard expand, activate, project block. The expansion stream is transformed by the selected activation and then projected back to the model width.",
+        ],
+        "mlp-mix" => &[
+            "The mix step is the nonlinear part of the MLP. For SwiGLU, it applies SiLU to the expansion stream and multiplies that by the gate stream. For non-SwiGLU modes, it applies the selected activation directly to the expansion stream.",
+            "This step has no learned weights, but it matters because without a nonlinearity, stacked linear projections would collapse into one bigger linear projection. The nonlinearity lets the MLP represent conditional feature interactions.",
+        ],
+        "mlp-project" => &[
+            "The output projection maps the wide MLP hidden vector back down to the embedding width so it can be added to the residual stream.",
+            "This is where the feed-forward block converts many candidate hidden features into a single update vector for the token position. In residual form, the projected update edits the current state rather than replacing it outright.",
+            "Because this projection feeds back into the main residual stream, its scale strongly affects how much the MLP changes the layer's output.",
+        ],
+        _ => &["This node summarizes one bounded component of the transformer layer without rendering individual weights or neurons."],
     }
 }
 
@@ -1970,6 +2210,9 @@ fn overview_flow_section(
             div { class: "overview-flow",
                 for (index, step) in steps.iter().enumerate() {
                     div { class: "overview-step",
+                        if let Some(info_key) = step.info_key {
+                            {overview_info_button(info_key, &step.title)}
+                        }
                         div { class: "overview-step-title", "{step.title}" }
                         div { class: "overview-step-status", "{step.status}" }
                         div { class: "overview-step-details",
@@ -2155,18 +2398,103 @@ fn normalized_parameter_stat(value: f64, max_value: f64) -> f64 {
     }
 }
 
+fn network_energy(snapshot: &LayerInspectionSnapshot) -> f64 {
+    if snapshot.layers.is_empty() {
+        return 0.0;
+    }
+    let total = snapshot
+        .layers
+        .iter()
+        .map(|layer| {
+            normalized_parameter_stat(layer_mean_abs_value(layer), snapshot.max_mean_abs_value)
+        })
+        .sum::<f64>();
+    (total / snapshot.layers.len() as f64).clamp(0.0, 1.0)
+}
+
+fn token_slot_class(row: usize, active_token_slots: usize) -> &'static str {
+    if row < active_token_slots {
+        "token-dot active"
+    } else {
+        "token-dot"
+    }
+}
+
+fn embedding_probe_styles(
+    snapshot: Option<&Result<TokenEmbeddingSnapshot, String>>,
+) -> Vec<String> {
+    let Some(Ok(snapshot)) = snapshot else {
+        return (0..8)
+            .map(|_| "background: rgba(79, 216, 255, 0.12);".into())
+            .collect();
+    };
+    if snapshot.rows.is_empty() || snapshot.embedding_size == 0 {
+        return (0..8)
+            .map(|_| "background: rgba(79, 216, 255, 0.12);".into())
+            .collect();
+    }
+
+    (0..8)
+        .map(|index| {
+            let row_index = index * snapshot.rows.len() / 8;
+            let column_index = index * snapshot.embedding_size / 8;
+            let value = snapshot.rows[row_index]
+                .values
+                .get(column_index)
+                .copied()
+                .unwrap_or(0.0);
+            embedding_cell_style(value, snapshot.max_abs_value)
+        })
+        .collect()
+}
+
+fn logit_probe_class(row: usize) -> &'static str {
+    match row {
+        9 => "logit-dot boundary",
+        _ => "logit-dot",
+    }
+}
+
 fn layer_row_tint_style(layer: &LayerInspection, max_mean_abs_value: f64) -> String {
     let intensity = normalized_parameter_stat(layer_mean_abs_value(layer), max_mean_abs_value);
-    let alpha = 0.05 + 0.13 * intensity;
+    let alpha = 0.08 + 0.22 * intensity;
+    let border_alpha = 0.18 + 0.16 * intensity;
     format!(
-        "border-left-color: rgba(31, 111, 235, {alpha:.3}); background: linear-gradient(90deg, rgba(31, 111, 235, {alpha:.3}), rgba(251, 253, 251, 0.92) 42%);"
+        "border-color: rgba(79, 216, 255, {border_alpha:.3}); background: linear-gradient(90deg, rgba(79, 216, 255, {alpha:.3}), rgba(7, 10, 14, 0.94) 46%);"
     )
 }
 
-fn layer_stage_tint_style(stats: ParameterStats, max_mean_abs_value: f64) -> String {
+fn layer_stage_tint_style(
+    class_suffix: &str,
+    stats: ParameterStats,
+    max_mean_abs_value: f64,
+) -> String {
+    let (red, green, blue) = layer_stage_color(class_suffix);
     let intensity = normalized_parameter_stat(stats.mean_abs_value(), max_mean_abs_value);
-    let alpha = 0.04 + 0.16 * intensity;
-    format!("background: linear-gradient(135deg, rgba(31, 111, 235, {alpha:.3}), #fbfdfb 58%);")
+    let alpha = 0.06 + 0.18 * intensity;
+    let border_alpha = 0.26 + 0.22 * intensity;
+    format!(
+        "border-color: rgba({red}, {green}, {blue}, {border_alpha:.3}); background: linear-gradient(135deg, rgba({red}, {green}, {blue}, {alpha:.3}), rgba(9, 13, 18, 0.98) 66%);"
+    )
+}
+
+fn non_parameter_stage_tint_style(class_suffix: &str) -> String {
+    let (red, green, blue) = layer_stage_color(class_suffix);
+    format!(
+        "border-color: rgba({red}, {green}, {blue}, 0.38); background: linear-gradient(135deg, rgba({red}, {green}, {blue}, 0.14), rgba(9, 13, 18, 0.98) 66%);"
+    )
+}
+
+fn layer_stage_color(class_suffix: &str) -> (u8, u8, u8) {
+    match class_suffix {
+        "norm" => (170, 164, 145),
+        "attention" => (79, 216, 255),
+        "mlp-expand" => (116, 214, 168),
+        "mlp-gate" | "mlp-gate-off" => (246, 211, 101),
+        "mlp-mix" => (224, 64, 251),
+        "mlp-project" => (255, 77, 109),
+        _ => (240, 232, 208),
+    }
 }
 
 fn format_enabled(enabled: bool) -> &'static str {
@@ -2253,6 +2581,9 @@ fn config_label_tooltip(label: &str) -> &'static str {
         "Layers" => "Number of repeated Transformer blocks in the model.",
         "Attention heads" => "Number of attention heads used in each Transformer layer.",
         "Embedding size" => "Width of token, hidden, and attention projection vectors.",
+        "MLP expansion factor" => {
+            "Multiplier from embedding width to the feed-forward hidden width inside each MLP."
+        }
         "Learned biases" => {
             "Enable trainable bias vectors in linear projections and output logits."
         }
@@ -2345,16 +2676,16 @@ fn loss_history_chart(progress_history: &[MicrogptTrainingProgress]) -> Element 
         div {
             div { class: "model-summary", "max {format_loss(max_loss)} | min {format_loss(min_loss)} | running mean {format_loss(latest_running_mean)}" }
             svg { class: "chart", view_box: "0 0 1000 220", preserve_aspect_ratio: "none",
-                line { x1: "30", y1: "190", x2: "980", y2: "190", stroke: "#80958a", stroke_width: "1" }
-                line { x1: "30", y1: "20", x2: "30", y2: "190", stroke: "#80958a", stroke_width: "1" }
+                line { x1: "30", y1: "190", x2: "980", y2: "190", stroke: "#8b846f", stroke_width: "1" }
+                line { x1: "30", y1: "20", x2: "30", y2: "190", stroke: "#8b846f", stroke_width: "1" }
                 for y in [20, 62, 105, 147, 190] {
-                    line { x1: "30", y1: "{y}", x2: "980", y2: "{y}", stroke: "#d3ded7", stroke_width: "1" }
+                    line { x1: "30", y1: "{y}", x2: "980", y2: "{y}", stroke: "#26333a", stroke_width: "1" }
                 }
                 polyline {
                     points: "{training_points}",
                     fill: "none",
-                    stroke: "#1f6feb",
-                    stroke_width: "4",
+                    stroke: "#4fd8ff",
+                    stroke_width: "2",
                     stroke_linecap: "round",
                     stroke_linejoin: "round"
                 }
@@ -2362,8 +2693,8 @@ fn loss_history_chart(progress_history: &[MicrogptTrainingProgress]) -> Element 
                     polyline {
                         points: "{validation_points}",
                         fill: "none",
-                        stroke: "#c62828",
-                        stroke_width: "4",
+                        stroke: "#ff4d6d",
+                        stroke_width: "2",
                         stroke_linecap: "round",
                         stroke_linejoin: "round"
                     }
@@ -2371,8 +2702,8 @@ fn loss_history_chart(progress_history: &[MicrogptTrainingProgress]) -> Element 
                 polyline {
                     points: "{running_mean_points}",
                     fill: "none",
-                    stroke: "#b7791f",
-                    stroke_width: "3",
+                    stroke: "#f6d365",
+                    stroke_width: "1.5",
                     stroke_dasharray: "10 8",
                     stroke_linecap: "round",
                     stroke_linejoin: "round"
@@ -2637,17 +2968,17 @@ fn embedding_cell_style(value: f64, max_abs_value: f64) -> String {
     let magnitude = (value.abs() / max_abs_value.max(1e-12)).clamp(0.0, 1.0);
     let alpha = 0.08 + 0.84 * magnitude;
     if value >= 0.0 {
-        format!("background-color: rgba(31, 111, 235, {alpha:.3});")
+        format!("background-color: rgba(79, 216, 255, {alpha:.3});")
     } else {
-        format!("background-color: rgba(198, 40, 40, {alpha:.3});")
+        format!("background-color: rgba(255, 77, 109, {alpha:.3});")
     }
 }
 
 fn confidence_token_style(probability: f64) -> String {
     let confidence = probability.clamp(0.0, 1.0).sqrt();
-    let hue = 8.0 + 142.0 * confidence;
-    let lightness = 88.0 - 34.0 * confidence;
-    format!("background-color: hsl({hue:.1} 72% {lightness:.1}%);")
+    let hue = 345.0 + 62.0 * confidence;
+    let lightness = 82.0 - 18.0 * confidence;
+    format!("background-color: hsl({hue:.1} 86% {lightness:.1}%);")
 }
 
 fn inspection_token_class(is_prefix: bool, is_selected: bool) -> &'static str {

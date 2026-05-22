@@ -58,9 +58,9 @@ pub struct MlxAttentionParameters {
 #[derive(Clone, Debug)]
 pub struct MlxFeedForwardParameters {
     // SwiGLU feed-forward shapes:
-    //   expansion_weights: [3 * embedding_size, embedding_size]
-    //   gate_weights:      [3 * embedding_size, embedding_size]
-    //   projection_weights:[embedding_size, 3 * embedding_size]
+    //   expansion_weights: [mlp_expansion_factor * embedding_size, embedding_size]
+    //   gate_weights:      [mlp_expansion_factor * embedding_size, embedding_size]
+    //   projection_weights:[embedding_size, mlp_expansion_factor * embedding_size]
     pub expansion_weights: Array,
     pub expansion_biases: Array,
     pub gate_weights: Array,
@@ -104,6 +104,7 @@ impl MlxTransformerModelParameters {
         context_window_size: usize,
         embedding_size: usize,
         layer_count: usize,
+        mlp_expansion_factor: usize,
         random_number_generator: &mut impl Rng,
     ) -> Self {
         // The initialization scheme intentionally matches the CPU backend. If
@@ -111,7 +112,7 @@ impl MlxTransformerModelParameters {
         // are mostly from numeric precision and backend execution, not from
         // different model definitions.
         let embedding_std = 0.02;
-        let feed_forward_size = 3 * embedding_size;
+        let feed_forward_size = mlp_expansion_factor * embedding_size;
         let projection_std = (1.0 / embedding_size as f64).sqrt();
         let residual_projection_std = projection_std / (2.0 * layer_count as f64).sqrt();
 
@@ -203,8 +204,9 @@ impl MlxTransformerModelParameters {
         context_window_size: usize,
         embedding_size: usize,
         layer_count: usize,
+        mlp_expansion_factor: usize,
     ) -> Self {
-        let feed_forward_size = 3 * embedding_size;
+        let feed_forward_size = mlp_expansion_factor * embedding_size;
         Self {
             token_embedding: mlx_zero_matrix(vocabulary_size, embedding_size),
             position_embedding: mlx_zero_matrix(context_window_size, embedding_size),
@@ -443,6 +445,7 @@ pub fn import_training_session_checkpoint(
         checkpoint.config.context_window_size,
         checkpoint.config.embedding_size,
         checkpoint.config.layer_count,
+        checkpoint.config.mlp_expansion_factor,
     );
     let expected_tensors = model_template.checkpoint_tensor_shapes();
     let parameter_arrays = checkpoint_tensors_to_arrays(&checkpoint.parameters, &expected_tensors)?;
@@ -595,6 +598,7 @@ pub fn create_mlx_microgpt_training_session_from_splits(
         transformer_config.context_window_size,
         transformer_config.embedding_size,
         transformer_config.layer_count,
+        transformer_config.mlp_expansion_factor,
         random_number_generator,
     );
     let parameters = model.values();
@@ -1619,8 +1623,8 @@ fn run_transformer_layer(
     let normalized_state = rmsnorm(&updated_hidden_state, layer.feed_forward_norm_gain, config)?;
     // Feed-forward tensor shapes:
     //   normalized_state: [embedding_size]
-    //   expanded_output:  [3 * embedding_size]
-    //   gated_output:     [3 * embedding_size]
+    //   expanded_output:  [mlp_expansion_factor * embedding_size]
+    //   gated_output:     [mlp_expansion_factor * embedding_size]
     //   block_output:     [embedding_size] after projection
     let expanded_output = linear(
         &normalized_state,
@@ -2068,6 +2072,7 @@ mod tests {
             layer_count: 1,
             attention_heads: 2,
             embedding_size: 8,
+            mlp_expansion_factor: crate::microgpt::DEFAULT_MLP_EXPANSION_FACTOR,
             transformer_features: TransformerFeatureConfig::optimized_defaults(),
             optimizer_features: OptimizerFeatureConfig::optimized_defaults(),
         }

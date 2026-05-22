@@ -43,6 +43,7 @@ const MAX_GRADIENT_NORM: f64 = 1.0;
 const SAMPLING_TOP_K: usize = 8;
 const MIN_GENERATED_CHARACTER_COUNT: usize = 8;
 pub const RESIDUAL_DROPOUT_PROBABILITY: f64 = 0.05;
+pub const DEFAULT_MLP_EXPANSION_FACTOR: usize = 3;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TransformerFeatureConfig {
@@ -180,6 +181,7 @@ impl TransformerModelParameters {
         context_window_size: usize,
         embedding_size: usize,
         layer_count: usize,
+        mlp_expansion_factor: usize,
         random_number_generator: &mut impl Rng,
     ) -> Self {
         // Good initialization keeps early activations from exploding or
@@ -187,7 +189,7 @@ impl TransformerModelParameters {
         // std scales with hidden size; residual projections shrink as layers grow
         // so many residual additions do not swamp the signal.
         let embedding_std = 0.02;
-        let feed_forward_size = 3 * embedding_size;
+        let feed_forward_size = mlp_expansion_factor * embedding_size;
         let projection_std = (1.0 / embedding_size as f64).sqrt();
         let residual_projection_std = projection_std / (2.0 * layer_count as f64).sqrt();
 
@@ -279,8 +281,9 @@ impl TransformerModelParameters {
         context_window_size: usize,
         embedding_size: usize,
         layer_count: usize,
+        mlp_expansion_factor: usize,
     ) -> Self {
-        let feed_forward_size = 3 * embedding_size;
+        let feed_forward_size = mlp_expansion_factor * embedding_size;
         Self {
             token_embedding: zero_matrix(vocabulary_size, embedding_size),
             position_embedding: zero_matrix(context_window_size, embedding_size),
@@ -539,6 +542,7 @@ pub struct TransformerConfig {
     // vowel pattern".
     pub attention_head_count: usize,
     pub attention_head_size: usize,
+    pub mlp_expansion_factor: usize,
     pub features: TransformerFeatureConfig,
 }
 
@@ -565,6 +569,24 @@ impl TransformerConfig {
         attention_head_count: usize,
         features: TransformerFeatureConfig,
     ) -> Result<Self, String> {
+        Self::new_with_features_and_mlp_expansion_factor(
+            layer_count,
+            embedding_size,
+            context_window_size,
+            attention_head_count,
+            DEFAULT_MLP_EXPANSION_FACTOR,
+            features,
+        )
+    }
+
+    pub fn new_with_features_and_mlp_expansion_factor(
+        layer_count: usize,
+        embedding_size: usize,
+        context_window_size: usize,
+        attention_head_count: usize,
+        mlp_expansion_factor: usize,
+        features: TransformerFeatureConfig,
+    ) -> Result<Self, String> {
         if layer_count == 0 {
             return Err("layer_count must be positive".into());
         }
@@ -576,6 +598,9 @@ impl TransformerConfig {
         }
         if attention_head_count == 0 {
             return Err("attention_head_count must be positive".into());
+        }
+        if mlp_expansion_factor == 0 {
+            return Err("mlp_expansion_factor must be positive".into());
         }
         if embedding_size % attention_head_count != 0 {
             return Err("embedding_size must be divisible by attention_head_count".into());
@@ -591,8 +616,13 @@ impl TransformerConfig {
             context_window_size,
             attention_head_count,
             attention_head_size: embedding_size / attention_head_count,
+            mlp_expansion_factor,
             features,
         })
+    }
+
+    pub fn feed_forward_size(&self) -> usize {
+        self.embedding_size * self.mlp_expansion_factor
     }
 }
 
@@ -807,6 +837,7 @@ pub fn import_training_session_checkpoint(
         checkpoint.config.context_window_size,
         checkpoint.config.embedding_size,
         checkpoint.config.layer_count,
+        checkpoint.config.mlp_expansion_factor,
     );
     let expected_tensors = model_template.checkpoint_tensors();
     let parameter_values = flatten_checkpoint_tensors(&checkpoint.parameters, &expected_tensors)?
@@ -2461,6 +2492,7 @@ pub fn create_microgpt_training_session_from_splits(
         transformer_config.context_window_size,
         transformer_config.embedding_size,
         transformer_config.layer_count,
+        transformer_config.mlp_expansion_factor,
         random_number_generator,
     );
     let parameter_count = model.parameter_count();
@@ -2503,6 +2535,7 @@ mod tests {
             layer_count: 1,
             attention_heads: 2,
             embedding_size: 8,
+            mlp_expansion_factor: DEFAULT_MLP_EXPANSION_FACTOR,
             transformer_features: TransformerFeatureConfig::optimized_defaults(),
             optimizer_features: OptimizerFeatureConfig::optimized_defaults(),
         }
