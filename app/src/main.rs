@@ -22,7 +22,8 @@ use sentence_gpt_rs_mlx_lib::checkpoint::{
     load_checkpoint_from_path, save_checkpoint_to_path, TrainingRunConfig,
 };
 use sentence_gpt_rs_mlx_lib::microgpt::{
-    generate_samples as generate_cpu_samples, MicrogptTrainingProgress, TransformerConfig,
+    generate_samples as generate_cpu_samples, CharacterTokenizer, MicrogptTrainingProgress,
+    TransformerConfig,
 };
 use sentence_gpt_rs_mlx_lib::mlx_microgpt::generate_samples as generate_mlx_samples;
 use std::path::PathBuf;
@@ -117,6 +118,7 @@ struct AppState {
     cached_browser_search_matches: Vec<(usize, String)>,
     training_document_page: usize,
     training_config_expanded: bool,
+    token_embedding_table_expanded: bool,
     temperature: f64,
     samples: Vec<String>,
     initialization_error: Option<String>,
@@ -142,6 +144,21 @@ struct GenerationWork {
 struct GenerationResult {
     samples: Vec<String>,
     sample_rng: ChaCha8Rng,
+}
+
+struct TokenEmbeddingSnapshot {
+    rows: Vec<TokenEmbeddingRow>,
+    embedding_size: usize,
+    min_value: f64,
+    max_value: f64,
+    max_abs_value: f64,
+}
+
+struct TokenEmbeddingRow {
+    label: String,
+    title: String,
+    values: Vec<f64>,
+    l2_norm: f64,
 }
 
 fn main() {
@@ -268,6 +285,11 @@ fn App() -> Element {
     } else {
         "▸"
     };
+    let token_embedding_arrow = if snapshot.token_embedding_table_expanded {
+        "▾"
+    } else {
+        "▸"
+    };
     let is_complete = snapshot
         .session
         .as_ref()
@@ -286,6 +308,16 @@ fn App() -> Element {
         .snapshot_export_directory
         .as_ref()
         .map(|path| path.display().to_string());
+    let token_embedding_snapshot = snapshot
+        .token_embedding_table_expanded
+        .then(|| {
+            snapshot
+                .session
+                .as_ref()
+                .map(token_embedding_snapshot_for_session)
+        })
+        .flatten();
+    let embedding_step = snapshot.completed_step_count();
 
     rsx! {
         style { "{CSS}" }
@@ -616,6 +648,24 @@ fn App() -> Element {
                     }
                 }
 
+                section { class: "panel",
+                    div { class: "model-header",
+                        button {
+                            class: "disclosure-button",
+                            onclick: move |_| state.write().toggle_token_embedding_table_expanded(),
+                            title: "Show or hide the current token embedding heatmap.",
+                            span { class: "disclosure-arrow", "{token_embedding_arrow}" }
+                            span { class: "section-title", "Token embedding table" }
+                        }
+                        div { class: "model-summary",
+                            "Step {embedding_step}"
+                        }
+                    }
+                    if snapshot.token_embedding_table_expanded {
+                        {token_embedding_table(token_embedding_snapshot.as_ref())}
+                    }
+                }
+
             }
         }
     }
@@ -696,6 +746,7 @@ impl AppState {
                                 cached_browser_search_matches: Vec::new(),
                                 training_document_page: 0,
                                 training_config_expanded: true,
+                                token_embedding_table_expanded: false,
                                 temperature: 0.5,
                                 samples: Vec::new(),
                                 initialization_error: None,
@@ -759,6 +810,7 @@ impl AppState {
             cached_browser_search_matches: Vec::new(),
             training_document_page: 0,
             training_config_expanded: true,
+            token_embedding_table_expanded: false,
             temperature: 0.5,
             samples: Vec::new(),
             initialization_error: Some(error),
@@ -918,6 +970,10 @@ impl AppState {
         self.training_config_expanded = !self.training_config_expanded;
     }
 
+    fn toggle_token_embedding_table_expanded(&mut self) {
+        self.token_embedding_table_expanded = !self.token_embedding_table_expanded;
+    }
+
     fn reset_training(&mut self) {
         if self.is_training_busy || self.is_generating_samples {
             return;
@@ -952,6 +1008,7 @@ impl AppState {
         next.document_browser_dataset = self.document_browser_dataset;
         next.training_document_search = self.training_document_search.clone();
         next.training_config_expanded = self.training_config_expanded;
+        next.token_embedding_table_expanded = self.token_embedding_table_expanded;
         next.refresh_cached_browser_search_matches();
         *self = next;
     }
@@ -1572,6 +1629,186 @@ fn loss_history_chart(progress_history: &[MicrogptTrainingProgress]) -> Element 
             }
         }
     }
+}
+
+fn token_embedding_snapshot_for_session(
+    session: &TrainingSession,
+) -> Result<TokenEmbeddingSnapshot, String> {
+    let tokenizer = session.tokenizer();
+    let rows = match session {
+        TrainingSession::Cpu(session) => session
+            .trained_microgpt
+            .model
+            .token_embedding
+            .iter()
+            .map(|row| row.iter().map(|value| value.data()).collect::<Vec<_>>())
+            .collect::<Vec<_>>(),
+        TrainingSession::Mlx(session) => {
+            let embedding = &session.trained_microgpt.model.token_embedding;
+            embedding.eval().map_err(|error| error.to_string())?;
+            let shape = embedding.shape();
+            let row_count = shape.first().copied().unwrap_or(0).max(0) as usize;
+            let column_count = shape.get(1).copied().unwrap_or(0).max(0) as usize;
+            embedding
+                .as_slice::<f32>()
+                .chunks(column_count.max(1))
+                .take(row_count)
+                .map(|row| row.iter().map(|value| *value as f64).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        }
+    };
+
+    let embedding_size = rows.first().map(Vec::len).unwrap_or(0);
+    let mut min_value = f64::INFINITY;
+    let mut max_value = f64::NEG_INFINITY;
+    let mut max_abs_value = 0.0_f64;
+    let rows = rows
+        .into_iter()
+        .enumerate()
+        .map(|(token_id, values)| {
+            for value in &values {
+                min_value = min_value.min(*value);
+                max_value = max_value.max(*value);
+                max_abs_value = max_abs_value.max(value.abs());
+            }
+            let label = token_label(tokenizer, token_id);
+            let title = token_title(tokenizer, token_id);
+            let l2_norm = values.iter().map(|value| value * value).sum::<f64>().sqrt();
+            TokenEmbeddingRow {
+                label,
+                title,
+                values,
+                l2_norm,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if rows.is_empty() || embedding_size == 0 {
+        min_value = 0.0;
+        max_value = 0.0;
+    }
+
+    Ok(TokenEmbeddingSnapshot {
+        rows,
+        embedding_size,
+        min_value,
+        max_value,
+        max_abs_value: max_abs_value.max(1e-12),
+    })
+}
+
+fn token_embedding_table(snapshot: Option<&Result<TokenEmbeddingSnapshot, String>>) -> Element {
+    match snapshot {
+        None => rsx! { div { class: "model-summary", "Waiting for a training session" } },
+        Some(Err(error)) => rsx! {
+            div { class: "model-summary", "Could not read token embeddings: {error}" }
+        },
+        Some(Ok(snapshot)) if snapshot.rows.is_empty() || snapshot.embedding_size == 0 => {
+            rsx! { div { class: "model-summary", "No token embeddings available" } }
+        }
+        Some(Ok(snapshot)) => {
+            let column_ticks = embedding_column_ticks(snapshot.embedding_size);
+            rsx! {
+                div {
+                    div { class: "embedding-summary",
+                        div { "rows {snapshot.rows.len()} tokens" }
+                        div { "columns {snapshot.embedding_size} dimensions" }
+                        div { "range {format_embedding_value(snapshot.min_value)} to {format_embedding_value(snapshot.max_value)}" }
+                    }
+                    div { class: "embedding-legend",
+                        span { "negative" }
+                        div { class: "embedding-legend-ramp" }
+                        span { "positive" }
+                    }
+                    div { class: "embedding-scroll",
+                        div {
+                            class: "embedding-table",
+                            style: "grid-template-columns: 64px repeat({snapshot.embedding_size}, 12px) 56px;",
+                            div { class: "embedding-corner", "token" }
+                            for column_index in 0..snapshot.embedding_size {
+                                div {
+                                    class: "embedding-column-label",
+                                    if column_ticks.contains(&column_index) {
+                                        "{column_index}"
+                                    }
+                                }
+                            }
+                            div { class: "embedding-norm-label", "norm" }
+                            for row in &snapshot.rows {
+                                div {
+                                    class: "embedding-token-label",
+                                    title: "{row.title}",
+                                    "{row.label}"
+                                }
+                                for value in &row.values {
+                                    div {
+                                        class: "embedding-cell",
+                                        title: "{row.title} | {format_embedding_value(*value)}",
+                                        style: "{embedding_cell_style(*value, snapshot.max_abs_value)}"
+                                    }
+                                }
+                                div {
+                                    class: "embedding-norm",
+                                    title: "L2 norm of this token embedding vector.",
+                                    "{format_embedding_value(row.l2_norm)}"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn token_label(tokenizer: &CharacterTokenizer, token_id: usize) -> String {
+    if token_id == tokenizer.sequence_boundary_token_id {
+        return "<B>".into();
+    }
+    match tokenizer.unique_characters.get(token_id).copied() {
+        Some(' ') => "sp".into(),
+        Some('\n') => "\\n".into(),
+        Some('\t') => "\\t".into(),
+        Some(character) => character.to_string(),
+        None => "?".into(),
+    }
+}
+
+fn token_title(tokenizer: &CharacterTokenizer, token_id: usize) -> String {
+    if token_id == tokenizer.sequence_boundary_token_id {
+        return format!("token {token_id}: sequence boundary");
+    }
+    match tokenizer.unique_characters.get(token_id).copied() {
+        Some(' ') => format!("token {token_id}: space"),
+        Some(character) => format!("token {token_id}: '{character}'"),
+        None => format!("token {token_id}: unknown"),
+    }
+}
+
+fn embedding_column_ticks(embedding_size: usize) -> Vec<usize> {
+    if embedding_size <= 16 {
+        return (0..embedding_size).collect();
+    }
+    let step = (embedding_size / 8).max(1);
+    let mut ticks = (0..embedding_size).step_by(step).collect::<Vec<_>>();
+    if !ticks.contains(&(embedding_size - 1)) {
+        ticks.push(embedding_size - 1);
+    }
+    ticks
+}
+
+fn embedding_cell_style(value: f64, max_abs_value: f64) -> String {
+    let magnitude = (value.abs() / max_abs_value.max(1e-12)).clamp(0.0, 1.0);
+    let alpha = 0.08 + 0.84 * magnitude;
+    if value >= 0.0 {
+        format!("background-color: rgba(31, 111, 235, {alpha:.3});")
+    } else {
+        format!("background-color: rgba(198, 40, 40, {alpha:.3});")
+    }
+}
+
+fn format_embedding_value(value: f64) -> String {
+    format!("{value:.3}")
 }
 
 fn running_mean_loss_points(

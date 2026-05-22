@@ -151,6 +151,94 @@ button, input {
     background: #fbfdfb;
 }
 
+.embedding-summary {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 14px;
+    color: #53645c;
+    font-size: 13px;
+    margin-bottom: 10px;
+}
+
+.embedding-legend {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: #53645c;
+    font-size: 12px;
+    margin-bottom: 10px;
+}
+
+.embedding-legend-ramp {
+    width: 160px;
+    height: 10px;
+    border: 1px solid #cfdcd3;
+    border-radius: 999px;
+    background: linear-gradient(90deg, #c62828, #fbfdfb 50%, #1f6feb);
+}
+
+.embedding-scroll {
+    overflow-x: auto;
+    border: 1px solid #d3ded7;
+    border-radius: 6px;
+    background: #fbfdfb;
+}
+
+.embedding-table {
+    display: grid;
+    gap: 1px;
+    min-width: max-content;
+    padding: 8px;
+    align-items: center;
+}
+
+.embedding-corner,
+.embedding-column-label,
+.embedding-norm-label {
+    color: #53645c;
+    font-size: 10px;
+    font-variant-numeric: tabular-nums;
+    min-height: 14px;
+    line-height: 14px;
+}
+
+.embedding-corner,
+.embedding-token-label {
+    position: sticky;
+    left: 0;
+    z-index: 2;
+    background: #fbfdfb;
+}
+
+.embedding-token-label {
+    color: #17202a;
+    font-size: 12px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    min-height: 12px;
+    line-height: 12px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.embedding-cell {
+    width: 12px;
+    height: 12px;
+    border-radius: 2px;
+}
+
+.embedding-norm,
+.embedding-norm-label {
+    text-align: right;
+}
+
+.embedding-norm {
+    color: #53645c;
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+}
+
 .controls {
     display: grid;
     grid-template-columns: minmax(0, 1fr) 220px auto;
