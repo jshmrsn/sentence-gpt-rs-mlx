@@ -120,8 +120,8 @@ struct AppState {
     training_document_search: String,
     cached_browser_search_matches: Vec<(usize, String)>,
     training_document_page: usize,
+    system_overview_expanded: bool,
     training_config_expanded: bool,
-    token_embedding_table_expanded: bool,
     temperature: f64,
     samples: Vec<String>,
     inspected_generation: Option<SampleGenerationTrace>,
@@ -166,6 +166,12 @@ struct TokenEmbeddingRow {
     title: String,
     values: Vec<f64>,
     l2_norm: f64,
+}
+
+struct SystemOverviewStep {
+    title: String,
+    status: String,
+    details: Vec<String>,
 }
 
 fn main() {
@@ -292,7 +298,7 @@ fn App() -> Element {
     } else {
         "▸"
     };
-    let token_embedding_arrow = if snapshot.token_embedding_table_expanded {
+    let system_overview_arrow = if snapshot.system_overview_expanded {
         "▾"
     } else {
         "▸"
@@ -316,7 +322,7 @@ fn App() -> Element {
         .as_ref()
         .map(|path| path.display().to_string());
     let token_embedding_snapshot = snapshot
-        .token_embedding_table_expanded
+        .system_overview_expanded
         .then(|| {
             snapshot
                 .session
@@ -324,7 +330,6 @@ fn App() -> Element {
                 .map(token_embedding_snapshot_for_session)
         })
         .flatten();
-    let embedding_step = snapshot.completed_step_count();
 
     rsx! {
         style { "{CSS}" }
@@ -458,6 +463,24 @@ fn App() -> Element {
                     }
                     div { class: "model-summary",
                         "training docs {training_example_count} | validation docs {validation_example_count} | vocab size {vocabulary_size}"
+                    }
+                }
+
+                section { class: "panel",
+                    div { class: "model-header",
+                        button {
+                            class: "disclosure-button",
+                            onclick: move |_| state.write().toggle_system_overview_expanded(),
+                            title: "Show or hide the high-level training and inference system overview.",
+                            span { class: "disclosure-arrow", "{system_overview_arrow}" }
+                            span { class: "section-title", "System overview" }
+                        }
+                        div { class: "model-summary",
+                            "Aggregated by subsystem"
+                        }
+                    }
+                    if snapshot.system_overview_expanded {
+                        {system_overview_panel(&snapshot, token_embedding_snapshot.as_ref())}
                     }
                 }
 
@@ -672,24 +695,6 @@ fn App() -> Element {
                     }
                 }
 
-                section { class: "panel",
-                    div { class: "model-header",
-                        button {
-                            class: "disclosure-button",
-                            onclick: move |_| state.write().toggle_token_embedding_table_expanded(),
-                            title: "Show or hide the current token embedding heatmap.",
-                            span { class: "disclosure-arrow", "{token_embedding_arrow}" }
-                            span { class: "section-title", "Token embedding table" }
-                        }
-                        div { class: "model-summary",
-                            "Step {embedding_step}"
-                        }
-                    }
-                    if snapshot.token_embedding_table_expanded {
-                        {token_embedding_table(token_embedding_snapshot.as_ref())}
-                    }
-                }
-
             }
         }
     }
@@ -770,8 +775,8 @@ impl AppState {
                                 training_document_search: String::new(),
                                 cached_browser_search_matches: Vec::new(),
                                 training_document_page: 0,
+                                system_overview_expanded: false,
                                 training_config_expanded: true,
-                                token_embedding_table_expanded: false,
                                 temperature: 0.5,
                                 samples: Vec::new(),
                                 inspected_generation: None,
@@ -837,8 +842,8 @@ impl AppState {
             training_document_search: String::new(),
             cached_browser_search_matches: Vec::new(),
             training_document_page: 0,
+            system_overview_expanded: false,
             training_config_expanded: true,
-            token_embedding_table_expanded: false,
             temperature: 0.5,
             samples: Vec::new(),
             inspected_generation: None,
@@ -1000,8 +1005,8 @@ impl AppState {
         self.training_config_expanded = !self.training_config_expanded;
     }
 
-    fn toggle_token_embedding_table_expanded(&mut self) {
-        self.token_embedding_table_expanded = !self.token_embedding_table_expanded;
+    fn toggle_system_overview_expanded(&mut self) {
+        self.system_overview_expanded = !self.system_overview_expanded;
     }
 
     fn reset_training(&mut self) {
@@ -1037,8 +1042,8 @@ impl AppState {
         next.training_document_page_rng = self.training_document_page_rng.clone();
         next.document_browser_dataset = self.document_browser_dataset;
         next.training_document_search = self.training_document_search.clone();
+        next.system_overview_expanded = self.system_overview_expanded;
         next.training_config_expanded = self.training_config_expanded;
-        next.token_embedding_table_expanded = self.token_embedding_table_expanded;
         next.refresh_cached_browser_search_matches();
         *self = next;
     }
@@ -1508,6 +1513,316 @@ fn snapshot_checkpoint_file_name(session: &TrainingSession) -> String {
     format!("sentence-gpt-rs-mlx-{backend}-{timestamp}-step-{step:06}-train-loss-{loss}.bin")
 }
 
+fn system_overview_panel(
+    snapshot: &AppState,
+    token_embedding_snapshot: Option<&Result<TokenEmbeddingSnapshot, String>>,
+) -> Element {
+    let Some(session) = snapshot.session.as_ref() else {
+        return rsx! { div { class: "model-summary", "Waiting for a training session" } };
+    };
+
+    let config = session.config();
+    let features = config.features;
+    let optimizer_features = snapshot.training_run_config.optimizer_features;
+    let overview_training_step = session.completed_step_count();
+    let latest_train_loss = session
+        .latest_loss()
+        .map(format_loss)
+        .unwrap_or_else(|| "pending".into());
+    let latest_validation_loss = session
+        .latest_validation_loss()
+        .map(format_loss)
+        .unwrap_or_else(|| "pending".into());
+    let position_status = match (
+        features.use_rope_position_encoding,
+        features.use_learned_absolute_position_encoding,
+    ) {
+        (true, true) => "RoPE + absolute",
+        (true, false) => "RoPE",
+        (false, true) => "absolute",
+        (false, false) => "none",
+    };
+    let mlp_activation = if features.use_swiglu_feed_forward {
+        "SwiGLU"
+    } else if features.use_gelu_feed_forward {
+        "GELU"
+    } else {
+        "ReLU"
+    };
+    let data_steps = vec![
+        SystemOverviewStep {
+            title: "Corpus".into(),
+            status: format!(
+                "{} train / {} val",
+                session.training_document_count(),
+                session.validation_document_count()
+            ),
+            details: vec![
+                format!(
+                    "batch {}",
+                    snapshot.training_run_config.training_document_batch_size
+                ),
+                format!(
+                    "validation every {} steps",
+                    snapshot.training_run_config.validation_step_interval
+                ),
+                format!(
+                    "max docs {}",
+                    format_count(snapshot.training_run_config.max_document_count)
+                ),
+            ],
+        },
+        SystemOverviewStep {
+            title: "Batch windows".into(),
+            status: format!(
+                "{} docs/step",
+                snapshot.training_run_config.training_document_batch_size
+            ),
+            details: vec![
+                "deterministic sampling".into(),
+                format!("context {}", config.context_window_size),
+                format!(
+                    "document trains {}",
+                    format_count(snapshot.completed_document_train_count())
+                ),
+            ],
+        },
+        SystemOverviewStep {
+            title: "Validation".into(),
+            status: latest_validation_loss.clone(),
+            details: vec![
+                format!(
+                    "every {} steps",
+                    snapshot.training_run_config.validation_step_interval
+                ),
+                format!("next step {}", snapshot.next_validation_step),
+                "held-out documents".into(),
+            ],
+        },
+    ];
+
+    let token_steps = vec![
+        SystemOverviewStep {
+            title: "Vocabulary".into(),
+            status: format!("{} tokens", session.tokenizer_vocabulary_size()),
+            details: vec![
+                "character ids".into(),
+                format!(
+                    "boundary id {}",
+                    session.tokenizer().sequence_boundary_token_id
+                ),
+                format!("context {}", config.context_window_size),
+            ],
+        },
+        SystemOverviewStep {
+            title: "Positions".into(),
+            status: position_status.into(),
+            details: vec![
+                format!("context {}", config.context_window_size),
+                format!(
+                    "RoPE {}",
+                    format_enabled(features.use_rope_position_encoding)
+                ),
+                format!(
+                    "absolute {}",
+                    format_enabled(features.use_learned_absolute_position_encoding)
+                ),
+            ],
+        },
+        SystemOverviewStep {
+            title: "Input vectors".into(),
+            status: format!(
+                "{} x {}",
+                session.tokenizer_vocabulary_size(),
+                config.embedding_size
+            ),
+            details: vec![
+                format!("token table {}", format_enabled(true)),
+                format!("positions {position_status}"),
+                format!(
+                    "tied output {}",
+                    format_enabled(features.use_tied_output_embeddings)
+                ),
+            ],
+        },
+    ];
+
+    let optimizer_steps = vec![
+        SystemOverviewStep {
+            title: "Loss".into(),
+            status: latest_train_loss,
+            details: vec![
+                format!(
+                    "validation {}",
+                    session
+                        .latest_validation_loss()
+                        .map(format_loss)
+                        .unwrap_or_else(|| "pending".into())
+                ),
+                "cross entropy".into(),
+                "masked padding".into(),
+            ],
+        },
+        SystemOverviewStep {
+            title: "Gradients".into(),
+            status: format!(
+                "clip {}",
+                format_enabled(optimizer_features.use_gradient_clipping)
+            ),
+            details: vec![
+                "reverse-mode autodiff".into(),
+                format!("params {}", format_count(session.parameter_count())),
+                format!(
+                    "batch {}",
+                    snapshot.training_run_config.training_document_batch_size
+                ),
+            ],
+        },
+        SystemOverviewStep {
+            title: "AdamW".into(),
+            status: format_learning_rate(session.current_learning_rate()),
+            details: vec![
+                format!(
+                    "decay {}",
+                    format_enabled(optimizer_features.use_weight_decay)
+                ),
+                format!(
+                    "schedule {}",
+                    format_enabled(optimizer_features.use_warmup_cosine_learning_rate)
+                ),
+                format!(
+                    "step {} / {}",
+                    session.completed_step_count(),
+                    session.training_step_count()
+                ),
+            ],
+        },
+    ];
+
+    rsx! {
+        div { class: "overview-sections",
+            {overview_flow_section("Data", "Corpus selection, batching, and validation split.", &data_steps, false)}
+            {overview_flow_section("Tokens", "Character ids become fixed-width vectors with position information.", &token_steps, false)}
+            div { class: "overview-section",
+                div { class: "layer-overview-header",
+                    div { class: "overview-step-title", "Embedding table" }
+                    div { class: "model-summary",
+                        "Step {overview_training_step} | one row per token, one column per embedding dimension"
+                    }
+                }
+                {token_embedding_table(token_embedding_snapshot)}
+            }
+            div { class: "overview-section",
+                div { class: "layer-overview-header",
+                    div { class: "overview-step-title", "Layer stack" }
+                    div { class: "model-summary",
+                        "{config.layer_count} repeated blocks | each block summarizes parameters by role, not individual weights"
+                    }
+                }
+                for layer_index in 0..config.layer_count {
+                    div { class: "layer-row",
+                        div { class: "layer-label", "L{layer_index + 1}" }
+                        div { class: "layer-chunk norm",
+                            div { class: "layer-chunk-title", "Norm" }
+                            div { class: "layer-chunk-main", "pre-attn + pre-MLP" }
+                            div { class: "layer-chunk-detail",
+                                "{format_count(layer_norm_parameter_count(config))} gain params"
+                            }
+                        }
+                        div { class: "layer-arrow", "→" }
+                        div { class: "layer-chunk attention",
+                            div { class: "layer-chunk-title", "Attention" }
+                            div { class: "layer-chunk-main", "{config.attention_head_count} heads x {config.attention_head_size}" }
+                            div { class: "layer-chunk-detail",
+                                "{format_count(attention_parameter_count(config))} Q/K/V/O params"
+                            }
+                        }
+                        div { class: "layer-arrow", "→" }
+                        div { class: "layer-chunk mlp",
+                            div { class: "layer-chunk-title", "MLP" }
+                            div { class: "layer-chunk-main", "{mlp_activation} hidden {config.embedding_size * 3}" }
+                            div { class: "layer-chunk-detail",
+                                "{format_count(mlp_parameter_count(config))} expansion/gate/proj params"
+                            }
+                        }
+                        if layer_index + 1 < config.layer_count {
+                            div { class: "layer-next-arrow", "↓" }
+                        }
+                    }
+                }
+            }
+            {overview_flow_section("Optimizer", "Loss, gradients, and AdamW update state.", &optimizer_steps, true)}
+        }
+    }
+}
+
+fn overview_flow_section(
+    title: &str,
+    summary: &str,
+    steps: &[SystemOverviewStep],
+    show_flow_arrows: bool,
+) -> Element {
+    rsx! {
+        div { class: "overview-section",
+            div { class: "layer-overview-header",
+                div { class: "overview-step-title", "{title}" }
+                div { class: "model-summary", "{summary}" }
+            }
+            div { class: "overview-flow",
+                for (index, step) in steps.iter().enumerate() {
+                    div { class: "overview-step",
+                        div { class: "overview-step-title", "{step.title}" }
+                        div { class: "overview-step-status", "{step.status}" }
+                        div { class: "overview-step-details",
+                            for detail in &step.details {
+                                div { "{detail}" }
+                            }
+                        }
+                    }
+                    if show_flow_arrows && index + 1 < steps.len() {
+                        div { class: "overview-arrow", "→" }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn format_enabled(enabled: bool) -> &'static str {
+    if enabled {
+        "on"
+    } else {
+        "off"
+    }
+}
+
+fn attention_parameter_count(config: &TransformerConfig) -> usize {
+    let bias_count = if config.features.use_learned_biases {
+        4 * config.embedding_size
+    } else {
+        0
+    };
+    4 * config.embedding_size * config.embedding_size + bias_count
+}
+
+fn mlp_parameter_count(config: &TransformerConfig) -> usize {
+    let feed_forward_size = config.embedding_size * 3;
+    let bias_count = if config.features.use_learned_biases {
+        feed_forward_size * 2 + config.embedding_size
+    } else {
+        0
+    };
+    config.embedding_size * feed_forward_size * 3 + bias_count
+}
+
+fn layer_norm_parameter_count(config: &TransformerConfig) -> usize {
+    if config.features.use_learned_rmsnorm_gain {
+        config.embedding_size * 2
+    } else {
+        0
+    }
+}
+
 fn metric(label: &str, tooltip: &str, value: String) -> Element {
     rsx! {
         div { class: "metric",
@@ -1877,7 +2192,7 @@ fn token_embedding_table(snapshot: Option<&Result<TokenEmbeddingSnapshot, String
         Some(Ok(snapshot)) => {
             let column_ticks = embedding_column_ticks(snapshot.embedding_size);
             rsx! {
-                div {
+                div { class: "embedding-panel",
                     div { class: "embedding-summary",
                         div { "rows {snapshot.rows.len()} tokens" }
                         div { "columns {snapshot.embedding_size} dimensions" }

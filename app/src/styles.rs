@@ -151,6 +151,161 @@ button, input {
     background: #fbfdfb;
 }
 
+.overview-sections {
+    display: grid;
+    gap: 14px;
+    min-width: 0;
+}
+
+.overview-section {
+    border-top: 1px solid #d3ded7;
+    padding-top: 12px;
+    min-width: 0;
+}
+
+.overview-section:first-child {
+    border-top: 0;
+    padding-top: 0;
+}
+
+.overview-flow {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: stretch;
+    gap: 8px;
+}
+
+.overview-step {
+    flex: 1 1 170px;
+    min-width: 160px;
+    background: #fbfdfb;
+    border: 1px solid #d3ded7;
+    border-radius: 6px;
+    padding: 10px;
+}
+
+.overview-step-title {
+    color: #53645c;
+    font-size: 12px;
+    font-weight: 800;
+    text-transform: uppercase;
+}
+
+.overview-step-status {
+    margin-top: 4px;
+    color: #17202a;
+    font-size: 16px;
+    font-weight: 760;
+}
+
+.overview-step-details {
+    display: grid;
+    gap: 3px;
+    margin-top: 8px;
+    color: #53645c;
+    font-size: 12px;
+    line-height: 1.25;
+}
+
+.overview-arrow {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #28533f;
+    font-size: 18px;
+    font-weight: 800;
+    min-width: 18px;
+}
+
+.layer-overview {
+    margin-top: 14px;
+    border-top: 1px solid #d3ded7;
+    padding-top: 12px;
+}
+
+.layer-overview-header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 10px;
+    margin-bottom: 8px;
+}
+
+.layer-row {
+    display: grid;
+    grid-template-columns: 42px minmax(150px, 1fr) 18px minmax(150px, 1.2fr) 18px minmax(150px, 1.2fr) 22px;
+    gap: 6px;
+    align-items: stretch;
+    margin-bottom: 7px;
+}
+
+.layer-label {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #e0ebe4;
+    border: 1px solid #c8d8ce;
+    border-radius: 6px;
+    color: #17202a;
+    font-size: 12px;
+    font-weight: 800;
+    font-variant-numeric: tabular-nums;
+}
+
+.layer-chunk {
+    border: 1px solid #d3ded7;
+    border-radius: 6px;
+    padding: 8px;
+    background: #fbfdfb;
+}
+
+.layer-chunk.norm {
+    border-left: 4px solid #6b7280;
+}
+
+.layer-chunk.attention {
+    border-left: 4px solid #1f6feb;
+}
+
+.layer-chunk.mlp {
+    border-left: 4px solid #b7791f;
+}
+
+.layer-chunk-title {
+    color: #53645c;
+    font-size: 11px;
+    font-weight: 800;
+    text-transform: uppercase;
+}
+
+.layer-chunk-main {
+    margin-top: 3px;
+    color: #17202a;
+    font-size: 13px;
+    font-weight: 760;
+}
+
+.layer-chunk-detail {
+    margin-top: 4px;
+    color: #53645c;
+    font-size: 11px;
+    line-height: 1.25;
+}
+
+.layer-arrow,
+.layer-next-arrow {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #28533f;
+    font-weight: 800;
+}
+
+.embedding-panel {
+    min-width: 0;
+}
+
 .embedding-summary {
     display: flex;
     flex-wrap: wrap;
@@ -178,16 +333,21 @@ button, input {
 }
 
 .embedding-scroll {
-    overflow-x: auto;
+    width: 100%;
+    max-width: 100%;
+    max-height: min(520px, 62vh);
+    overflow: auto;
     border: 1px solid #d3ded7;
     border-radius: 6px;
     background: #fbfdfb;
+    box-sizing: border-box;
 }
 
 .embedding-table {
     display: grid;
     gap: 1px;
-    min-width: max-content;
+    width: max-content;
+    min-width: 100%;
     padding: 8px;
     align-items: center;
 }
@@ -208,6 +368,20 @@ button, input {
     left: 0;
     z-index: 2;
     background: #fbfdfb;
+}
+
+.embedding-corner,
+.embedding-column-label,
+.embedding-norm-label {
+    position: sticky;
+    top: 0;
+    z-index: 3;
+    background: #fbfdfb;
+}
+
+.embedding-corner {
+    left: 0;
+    z-index: 5;
 }
 
 .embedding-token-label {
@@ -231,12 +405,20 @@ button, input {
 .embedding-norm,
 .embedding-norm-label {
     text-align: right;
+    position: sticky;
+    right: 0;
+    background: #fbfdfb;
+    z-index: 2;
 }
 
 .embedding-norm {
     color: #53645c;
     font-size: 11px;
     font-variant-numeric: tabular-nums;
+}
+
+.embedding-norm-label {
+    z-index: 5;
 }
 
 .controls {
@@ -527,6 +709,29 @@ button, input {
 
     .search-row, .sample {
         grid-template-columns: 1fr;
+    }
+
+    .overview-flow {
+        display: grid;
+        grid-template-columns: 1fr;
+    }
+
+    .overview-arrow {
+        min-height: 14px;
+        transform: rotate(90deg);
+    }
+
+    .layer-row {
+        grid-template-columns: 1fr;
+    }
+
+    .layer-arrow {
+        min-height: 12px;
+        transform: rotate(90deg);
+    }
+
+    .layer-next-arrow {
+        min-height: 14px;
     }
 
     .field {
