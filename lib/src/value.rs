@@ -29,6 +29,10 @@ pub struct Value(Arc<Node>);
 
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
+        // Pointer identity is the right equality here. Two independent leaves can
+        // both contain 0.0, but their gradients must remain separate if one is a
+        // query bias and the other is a feed-forward bias. Treating equal numeric
+        // data as the same node would merge unrelated parameters during backward.
         Arc::ptr_eq(&self.0, &other.0)
     }
 }
@@ -44,6 +48,10 @@ impl Hash for Value {
 impl Value {
     // A leaf value has no children. Model parameters and constants start here.
     pub fn new(data: f64) -> Self {
+        // Leaf nodes are the "inputs" of the computation graph. A model weight,
+        // a bias, or a literal constant such as 1.0 all begin as a node with no
+        // parents. Later operations build new nodes that point back to these
+        // leaves, allowing the final loss to trace how each leaf contributed.
         Self(Arc::new(Node {
             data,
             children: Vec::new(),
@@ -54,6 +62,10 @@ impl Value {
     // Internal constructor for operations. `local_gradients[i]` must correspond
     // to `children[i]`.
     fn with_children(data: f64, children: Vec<Value>, local_gradients: Vec<f64>) -> Self {
+        // Each operation stores only local information: its output value, the
+        // input nodes, and the derivative of this output with respect to each
+        // input. The global derivative of the final loss is not known yet. The
+        // backward pass combines these local slopes later using the chain rule.
         Self(Arc::new(Node {
             data,
             children,
@@ -100,6 +112,9 @@ impl Value {
     // Power, log, and exp provide enough calculus to build softmax,
     // cross-entropy, normalization, and optimizer math.
     pub fn powf(&self, exponent: f64) -> Value {
+        // d(x^n)/dx = n*x^(n-1). In this project powers appear in RMSNorm
+        // (`x^2` and inverse square root), Adam (`sqrt` can be expressed as a
+        // power in the scalar backend), and division (`x^-1` in `div` below).
         Value::with_children(
             self.data().powf(exponent),
             vec![self.clone()],
@@ -108,6 +123,9 @@ impl Value {
     }
 
     pub fn log(&self) -> Value {
+        // Log shows up in cross-entropy. Its derivative, 1/x, is large when x is
+        // small, which matches the learning signal we want: assigning tiny
+        // probability to the correct token should produce a strong correction.
         Value::with_children(
             self.data().ln(),
             vec![self.clone()],
@@ -117,10 +135,16 @@ impl Value {
 
     pub fn exp(&self) -> Value {
         let exponential = self.data().exp();
+        // exp is its own derivative. Softmax uses exp to turn relative logits
+        // into positive unnormalized probabilities before dividing by their sum.
         Value::with_children(exponential, vec![self.clone()], vec![exponential])
     }
 
     pub fn relu(&self) -> Value {
+        // ReLU is piecewise linear: it passes positive values and zeros negative
+        // values. The local derivative is therefore 1 on the positive side and 0
+        // on the negative side, so negative activations stop sending gradient
+        // backward through this path.
         Value::with_children(
             self.data().max(0.0),
             vec![self.clone()],
@@ -150,6 +174,10 @@ impl Value {
     fn topological_order(&self) -> Vec<Value> {
         fn visit(node: &Value, visited: &mut HashSet<usize>, order: &mut Vec<Value>) {
             if !visited.insert(node.id()) {
+                // A node can feed into the loss through multiple later paths.
+                // Visiting it once prevents exponential work and keeps the
+                // topological list unique; the backward pass still accumulates
+                // all path contributions with `+=`.
                 return;
             }
             for child in &node.0.children {
@@ -176,6 +204,14 @@ impl Value {
         let mut gradients = HashMap::from([(self.id(), 1.0)]);
 
         for node in order.iter().rev() {
+            // `node_gradient` is the derivative of the final output (`self`)
+            // with respect to this node. For each child edge, multiply by the
+            // local derivative stored during the forward operation:
+            //
+            // d(loss)/d(child) += d(loss)/d(node) * d(node)/d(child)
+            //
+            // The map is sparse because many constants or intermediates may not
+            // influence the final scalar in a particular path.
             let node_gradient = *gradients.get(&node.id()).unwrap_or(&0.0);
             for (child, local_gradient) in node.0.children.iter().zip(node.0.local_gradients.iter())
             {

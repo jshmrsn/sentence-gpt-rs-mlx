@@ -240,6 +240,11 @@ impl MlxTransformerModelParameters {
     pub fn values(&self) -> Vec<Array> {
         // MLX's gradient transform works over a flat slice of Array arguments.
         // This order must match `with_values` and `params_from_arrays`.
+        //
+        // Think of this as the tensor backend's ABI. The optimizer, checkpoint
+        // code, and autodiff closure all speak in "parameter number 0, parameter
+        // number 1, ..." while the model code wants named fields. A single stable
+        // order is what lets those layers communicate without reflection.
         let mut values = vec![
             self.token_embedding.clone(),
             self.position_embedding.clone(),
@@ -315,6 +320,9 @@ impl MlxTransformerModelParameters {
     }
 
     fn checkpoint_tensor_shapes(&self) -> Vec<CheckpointTensor> {
+        // Shape-only checkpoint tensors are used as templates during import.
+        // The values are zeros because only the shape and element count matter
+        // for validation; real values come from the checkpoint being loaded.
         self.values()
             .iter()
             .map(|array| {
@@ -422,6 +430,9 @@ pub fn export_training_session_checkpoint(
 pub fn import_training_session_checkpoint(
     checkpoint: &MicrogptCheckpoint,
 ) -> Result<MlxMicrogptTrainingSession, String> {
+    // Import mirrors CPU import, but rebuilds MLX Arrays instead of scalar
+    // `Value` nodes. The saved f64 values are converted to f32 because MLX model
+    // tensors in this demo use f32 for speed and device compatibility.
     let tokenizer = CharacterTokenizer::new(
         checkpoint.tokenizer.unique_characters.clone(),
         checkpoint.tokenizer.sequence_boundary_token_id,
@@ -674,6 +685,10 @@ pub fn train_mlx_microgpt_step(
         // MLX closures receive a flat parameter list. Convert it back into a
         // named view, compute scalar batch loss, and return it as a one-element
         // vector because the transform API is vector-valued.
+        //
+        // The closure must be a pure description of loss from its input tensors.
+        // Capturing mutable model state here would make gradients harder to
+        // reason about and could hide stale tensors from MLX's transform.
         let params = params_from_arrays(inputs, layer_count, &rotary_position_matrices);
         let loss = batch_loss(&params, &config, &batch_windows, dropout_masks.as_ref())?;
         Ok(vec![loss])
@@ -1037,6 +1052,10 @@ fn batch_loss(
     let target_logits = flat_logits
         .take_along_axis(&target_tokens, 1)?
         .reshape(&[-1])?;
+    // Masking happens after computing per-token losses. Padded positions still
+    // exist in tensors so the batch has one rectangular shape, but multiplying
+    // by zero removes their contribution to the numerator. Dividing by the mask
+    // sum gives an average over real prediction targets only.
     let token_losses = (log_normalizer.reshape(&[-1])? - target_logits) * &loss_mask;
     ops::sum(&token_losses, None)
         .and_then(|loss_sum| Ok(loss_sum / (ops::sum(&loss_mask, None)? + Array::from_f32(1e-6))))
@@ -1054,6 +1073,9 @@ fn run_transformer_batch(
     // token-by-token embedding lookup loop used by the reference backend.
     let mut hidden_state = params.token_embedding.take_axis(input_tokens, 0)?;
     if config.features.use_learned_absolute_position_encoding {
+        // Position ids are shared across the batch: every row has sequence
+        // positions 0..context_window_size. `expand_dims(0)` makes the position
+        // table broadcast across batch items before adding it to token vectors.
         let position_ids = Array::from_slice(
             &(0..config.context_window_size as i32).collect::<Vec<_>>(),
             &[config.context_window_size as i32],
@@ -1213,6 +1235,10 @@ fn run_multi_head_attention_batch(
     let key_transposed = key.transpose_axes(&[0, 1, 3, 2])?;
     let mut attention_scores = query.matmul(&key_transposed)?
         / Array::from_f32((config.attention_head_size as f32).sqrt());
+    // The batch path processes the whole sequence at once, so without a mask
+    // token 3 could attend to token 8 during training. The causal mask restores
+    // the same rule as step-by-step generation: each position only sees itself
+    // and earlier positions.
     attention_scores += causal_attention_mask(sequence_len as usize);
     let attention_weights = ops::softmax_axis(&attention_scores, -1, None)?;
     attention_weights
@@ -1282,6 +1308,11 @@ fn linear_last_axis(
     // Apply the same dense layer independently at every [batch, sequence]
     // location. `input` is [..., input_size], weights are [output_size,
     // input_size], so transposing weights lets MLX produce [..., output_size].
+    //
+    // This is one of the main tensorization patterns in the file: preserve all
+    // leading dimensions (`batch`, `sequence`, or both) and only transform the
+    // last feature dimension. MLX broadcasts the bias across those leading
+    // dimensions when learned biases are enabled.
     let output = input.matmul(&weights.transpose()?)?;
     if config.features.use_learned_biases {
         Ok(output + biases)
@@ -1911,6 +1942,10 @@ fn checkpoint_tensors_to_arrays(
     tensors: &[CheckpointTensor],
     expected_tensors: &[CheckpointTensor],
 ) -> Result<Vec<Array>, String> {
+    // Loading is intentionally strict. Tensor count, shape, and value count must
+    // match the current model config before any Array is created. That protects
+    // the flat parameter order used by `with_values`: one missing tensor would
+    // otherwise shift every following parameter into the wrong field.
     if tensors.len() != expected_tensors.len() {
         return Err(format!(
             "checkpoint has {} tensors, expected {}",

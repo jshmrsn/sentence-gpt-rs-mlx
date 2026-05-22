@@ -34,6 +34,10 @@ pub use sentence_gpt_rs_mlx_lib::microgpt::AdamOptimizerConfig;
 pub const TRAINING_FRAME_BUDGET: Duration = Duration::from_millis(500);
 pub const MAX_TRAINING_STEP_COUNT: usize = 1_000_000;
 pub const RUNNING_MEAN_LOSS_RECENT_WEIGHT: f64 = 0.35;
+// The MLX defaults are sized for the accelerated tensor backend: larger batches,
+// a wider model, a longer context window, and more training data. These values
+// would be painfully slow in the scalar CPU reference backend because every
+// arithmetic operation builds an explicit autodiff node.
 pub const MLX_DEFAULT_TRAINING_RUN_CONFIG: TrainingRunConfig = TrainingRunConfig {
     validation_step_interval: 100,
     training_document_batch_size: 32,
@@ -47,6 +51,10 @@ pub const MLX_DEFAULT_TRAINING_RUN_CONFIG: TrainingRunConfig = TrainingRunConfig
     transformer_features: TransformerFeatureConfig::optimized_defaults(),
     optimizer_features: OptimizerFeatureConfig::optimized_defaults(),
 };
+// The CPU defaults are intentionally tiny. The point of the CPU backend is
+// inspectability and correctness, not throughput. Keeping the context, model
+// width, layer count, and dataset small lets a user run the scalar autodiff path
+// interactively and compare it to the MLX path.
 pub const CPU_DEFAULT_TRAINING_RUN_CONFIG: TrainingRunConfig = TrainingRunConfig {
     validation_step_interval: 25,
     training_document_batch_size: 8,
@@ -62,6 +70,11 @@ pub const CPU_DEFAULT_TRAINING_RUN_CONFIG: TrainingRunConfig = TrainingRunConfig
 };
 
 pub fn get_optimizer_config() -> AdamOptimizerConfig {
+    // These optimizer values are chosen for a small character-level model rather
+    // than a large production LLM. The lower beta values make moving averages
+    // adapt quickly to tiny batches; warmup avoids taking the full step size
+    // before Adam's moment estimates have useful scale; weight decay keeps
+    // weights from drifting larger than the toy dataset can justify.
     AdamOptimizerConfig {
         learning_rate: 0.003,
         first_moment_decay: 0.85,
@@ -105,6 +118,9 @@ impl Backend {
     }
 
     pub fn default_training_run_config(self) -> TrainingRunConfig {
+        // Backend choice affects the practical training budget. Returning the
+        // config from the enum keeps UI code from needing to know why MLX and CPU
+        // use different defaults; it can just ask the selected backend.
         match self {
             Backend::Mlx => MLX_DEFAULT_TRAINING_RUN_CONFIG,
             Backend::Cpu => CPU_DEFAULT_TRAINING_RUN_CONFIG,
@@ -114,6 +130,11 @@ impl Backend {
 
 #[derive(Clone)]
 pub enum TrainingSession {
+    // The app treats "a training session" as one concept, but the two backends
+    // have different concrete state types. Wrapping them in an enum lets shared
+    // UI/status code ask common questions such as latest loss, parameter count,
+    // and checkpoint export without forcing the CPU and MLX implementations into
+    // one oversized trait object.
     Mlx(MlxMicrogptTrainingSession),
     Cpu(MicrogptTrainingSession),
 }
@@ -215,6 +236,10 @@ impl TrainingSession {
                 .values()
                 .iter()
                 .map(|array| {
+                    // MLX parameters are tensors, so count scalars by multiplying
+                    // their dimensions. This makes the displayed parameter count
+                    // comparable to the CPU backend, where each scalar is one
+                    // `Value` in the flattened parameter vector.
                     array
                         .shape()
                         .iter()
@@ -296,6 +321,10 @@ pub fn create_training_session(
     optimizer_config: AdamOptimizerConfig,
     training_run_config: TrainingRunConfig,
 ) -> Result<TrainingSession, String> {
+    // Training creation happens above the backend-specific libraries because the
+    // app wants one consistent data split no matter which backend is selected.
+    // We first turn story groups into training/validation sentences, then call
+    // the matching backend constructor with those fixed splits.
     let (documents, validation_documents) =
         split_fixed_validation_documents(input_stories, training_run_config, rng);
 
@@ -320,6 +349,10 @@ pub fn create_training_session(
                 transformer_config,
                 optimizer_config,
             );
+            // CPU baseline loss is computed explicitly here because the CPU
+            // constructor is synchronous and infallible. MLX does the same work
+            // inside `with_initial_progress`, where tensor execution can fail
+            // and therefore returns a Result.
             let train_loss = calculate_cpu_training_loss_baseline(&session);
             let validation_loss = calculate_cpu_validation_loss(
                 &session,
@@ -343,6 +376,10 @@ pub fn train_session_until_budget(
     mut next_validation_step: usize,
     training_run_config: TrainingRunConfig,
 ) -> Result<TrainingBudgetResult, String> {
+    // Desktop UI code should not block indefinitely while training. This helper
+    // advances the model for a small time budget, then returns control with an
+    // updated session. Repeated calls create a cooperative training loop that can
+    // keep charts and controls responsive while still doing real optimization.
     let chunk_start = Instant::now();
     let frame_start = Instant::now();
     let session = match session {
@@ -385,6 +422,10 @@ fn train_mlx_until_budget(
 
         let mut validation_was_attached = false;
         if result.session.completed_step_count >= *next_validation_step {
+            // Validation is intentionally less frequent than training because it
+            // runs extra forward passes over held-out documents. Attaching it to
+            // the latest progress entry keeps the chart timeline simple: one
+            // training step may or may not also carry a validation loss.
             let validation_loss = calculate_mlx_validation_loss(
                 &result.session,
                 result.session.completed_step_count,
@@ -400,6 +441,9 @@ fn train_mlx_until_budget(
             || validation_was_attached
             || result.session.completed_step_count >= *next_validation_step
             || frame_start.elapsed() >= TRAINING_FRAME_BUDGET;
+        // Stop after validation even if time remains. That gives the caller a
+        // chance to display the new validation point promptly instead of hiding
+        // it behind additional training work in the same UI tick.
         session = result.session;
 
         if should_stop {
@@ -427,6 +471,10 @@ fn train_cpu_until_budget(
 
         let mut validation_was_attached = false;
         if result.session.completed_step_count >= *next_validation_step {
+            // The CPU path mirrors the MLX control flow so progress semantics are
+            // backend-independent. The difference is only error handling: the
+            // scalar CPU validation code returns Option<f64>, while MLX can also
+            // return backend execution errors.
             let validation_loss = calculate_cpu_validation_loss(
                 &result.session,
                 result.session.completed_step_count,
@@ -463,6 +511,11 @@ pub fn running_mean_loss(progress_history: &[MicrogptTrainingProgress]) -> Optio
 }
 
 pub fn running_mean_loss_values(progress_history: &[MicrogptTrainingProgress]) -> Vec<f64> {
+    // Raw training loss is noisy because every step uses a mini-batch. The
+    // running mean is an exponential moving average: each new point contributes
+    // `RUNNING_MEAN_LOSS_RECENT_WEIGHT`, and older history fades but never
+    // disappears abruptly. This is for display only; it does not feed back into
+    // training.
     let mut smoothed_losses = Vec::new();
     let mut smoothed_loss = None;
     for progress in progress_history {
@@ -525,6 +578,10 @@ pub struct TrainingStoryDocuments {
 pub fn load_input_documents(
     training_run_config: TrainingRunConfig,
 ) -> Result<Vec<TrainingStoryDocuments>, String> {
+    // The bundled dataset is a JSON file with full stories. The backend trains
+    // on sentence-sized documents instead of full stories so the tiny context
+    // window can cover each example. This loader keeps IO, parsing, filtering,
+    // and max-document limiting in one place before session creation.
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
     let stories_path = root.join("data/input-stories-00.json");
     let stories_json = std::fs::read_to_string(&stories_path).map_err(|error| {
@@ -558,6 +615,10 @@ fn split_fixed_validation_documents(
     training_run_config: TrainingRunConfig,
     rng: &mut ChaCha8Rng,
 ) -> (Vec<String>, Vec<String>) {
+    // Validation uses the first fixed slice of documents and training uses the
+    // shuffled remainder. The fixed validation slice makes loss comparisons
+    // stable across runs and across backends: changing the RNG affects training
+    // order, but not which sentences are held out.
     let documents = flatten_story_sentences(&stories);
     let validation_document_count = (documents.len() / training_run_config.validation_set_divisor)
         .min(training_run_config.validation_set_max_document_count);
@@ -570,6 +631,11 @@ fn stories_to_sentence_groups(
     stories: Vec<Story>,
     training_run_config: TrainingRunConfig,
 ) -> Vec<TrainingStoryDocuments> {
+    // The character model has a deliberately small vocabulary. Filtering
+    // sentences here avoids spending capacity on digits, uncommon punctuation,
+    // and Unicode variants that the UI demo is not trying to teach. It also
+    // keeps each sentence shorter than the context window so every document can
+    // be learned as a complete next-character sequence.
     const SENTENCE_DISQUALIFYING_CHARACTERS: &[char] = &[
         '$', '&', '"', '“', '”', '(', ')', '*', '\'', '_', '-', '–', '…', '%', '~', '`', '[', ']',
         '{', '}', '\\', ';', '|', '—', 'é', '/', '’', '‘', ':', '0', '1', '2', '3', '4', '5', '6',
@@ -598,6 +664,10 @@ fn stories_to_sentence_groups(
                     && sentence.contains(' ')
                     && sentence.chars().count() < training_run_config.context_window_size
             })
+            // Deduplicate globally, not just within one story. Repeated training
+            // sentences would overweight memorized phrases and make validation
+            // look better if the same sentence appears on both sides of the
+            // split.
             .filter(|sentence| seen_sentences.insert(sentence.clone()))
             .take(remaining_document_count)
             .collect::<Vec<_>>();
@@ -611,6 +681,10 @@ fn stories_to_sentence_groups(
 }
 
 fn split_sentences_keep_punctuation(story: &str) -> Vec<String> {
+    // The tokenizer is character-level, so punctuation is meaningful training
+    // signal. Keeping '.', '?', and '!' attached to the preceding sentence lets
+    // the model learn both ordinary letters and sentence-ending behavior. The
+    // later trim step removes leading whitespace introduced by splitting.
     let mut sentences = Vec::new();
     let mut sentence_start = 0;
     for (index, character) in story.char_indices() {

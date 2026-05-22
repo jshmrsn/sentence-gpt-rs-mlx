@@ -59,6 +59,10 @@ pub struct TransformerFeatureConfig {
 
 impl TransformerFeatureConfig {
     pub const fn optimized_defaults() -> Self {
+        // These defaults describe the "modern tiny Transformer" variant used by
+        // the app. The feature flags are kept explicit so the teaching backend
+        // can demonstrate what each architectural choice contributes without
+        // maintaining many separate model implementations.
         Self {
             use_learned_biases: true,
             use_rope_position_encoding: true,
@@ -88,6 +92,10 @@ pub struct OptimizerFeatureConfig {
 
 impl OptimizerFeatureConfig {
     pub const fn optimized_defaults() -> Self {
+        // The optimizer toggles are separated from architecture toggles because
+        // they affect how parameters move, not what the forward model computes.
+        // This makes it possible to compare the same network with or without
+        // clipping, decay, and scheduling.
         Self {
             use_gradient_clipping: true,
             use_weight_decay: true,
@@ -572,6 +580,11 @@ impl TransformerConfig {
         if embedding_size % attention_head_count != 0 {
             return Err("embedding_size must be divisible by attention_head_count".into());
         }
+        // Every attention head receives an equal contiguous slice of the hidden
+        // vector. That is why divisibility is required: with embedding_size 128
+        // and 8 heads, each head works on 16 channels. The code later computes
+        // head_start_index = head_index * attention_head_size, so uneven heads
+        // would make indexing ambiguous and break the concatenate-back step.
         Ok(Self {
             layer_count,
             embedding_size,
@@ -610,12 +623,20 @@ impl CharacterTokenizer {
     }
 
     pub fn vocabulary_size(&self) -> usize {
+        // The special boundary token is not stored in `unique_characters`. Its
+        // id is exactly one past the last character id, so the full vocabulary is
+        // all observed characters plus that one control token.
         self.unique_characters.len() + 1
     }
 
     pub fn encode_document(&self, document: &str) -> Vec<usize> {
         // The boundary token at the start teaches the model how sentences begin.
         // The boundary token at the end teaches it when to stop generating.
+        //
+        // Characters not in the vocabulary are skipped. In normal training this
+        // should be rare because the vocabulary is built from the documents, but
+        // the behavior is useful for user-provided prefixes during generation:
+        // unsupported characters simply do not enter the model context.
         let mut encoded = Vec::with_capacity(document.chars().count() + 2);
         encoded.push(self.sequence_boundary_token_id);
         encoded.extend(
@@ -756,6 +777,11 @@ pub fn export_training_session_checkpoint(
 pub fn import_training_session_checkpoint(
     checkpoint: &MicrogptCheckpoint,
 ) -> Result<MicrogptTrainingSession, String> {
+    // Import reconstructs the model in two phases. First create a zero-valued
+    // template with the exact shapes implied by the checkpoint config. Then
+    // flatten and validate the saved tensors against that template before
+    // replacing every parameter. This avoids trusting the file's shape metadata
+    // blindly and keeps old/corrupt checkpoints from silently scrambling fields.
     let tokenizer = CharacterTokenizer::new(
         checkpoint.tokenizer.unique_characters.clone(),
         checkpoint.tokenizer.sequence_boundary_token_id,
@@ -920,6 +946,11 @@ fn flatten_checkpoint_tensors(
     tensors: &[CheckpointTensor],
     expected_tensors: &[CheckpointTensor],
 ) -> Result<Vec<f64>, String> {
+    // The model and optimizer both use a flat parameter order internally. A
+    // checkpoint stores groups of values with shape metadata for readability and
+    // validation, but training wants one long vector again. This function is the
+    // gatekeeper that says "the grouped checkpoint tensors match the exact model
+    // we are about to rebuild."
     if tensors.len() != expected_tensors.len() {
         return Err(format!(
             "checkpoint has {} parameter tensors, expected {}",
@@ -1095,6 +1126,11 @@ pub fn softmax(logits: &[Value]) -> Vec<Value> {
     // exp(score_i) / sum(exp(all scores)). Subtracting the max score first keeps
     // `exp` from overflowing; it does not change the final probabilities because
     // the same constant is subtracted from every score.
+    //
+    // The returned `Value`s are still connected to the original logits through
+    // the autodiff graph. If a later loss says "the target probability should
+    // have been higher", gradients will flow through the division, exponentials,
+    // and additions back into every logit and from there into model parameters.
     let max_logit_value = logits
         .iter()
         .map(Value::data)
@@ -1117,6 +1153,15 @@ pub fn cross_entropy_loss(logits: &[Value], target_token_id: usize) -> Value {
     // If the model assigned probability 1.0 to the target, loss is 0. If it
     // assigned probability near 0, loss is large. This log-sum-exp form is the
     // numerically stable equivalent of `-log(softmax(logits)[target])`.
+    //
+    // Why this formula works:
+    //
+    // - softmax(target) = exp(target_logit) / sum(exp(all_logits))
+    // - -log(softmax(target)) =
+    //   log(sum(exp(all_logits))) - target_logit
+    //
+    // The implementation subtracts the max logit inside the exponential sum to
+    // avoid huge exponentials, then adds that max back after the log.
     let max_logit_value = logits
         .iter()
         .map(Value::data)
@@ -1135,6 +1180,12 @@ pub fn rmsnorm(input_vector: &[Value], gain: &[Value]) -> Vec<Value> {
     // It does not change direction much; it mainly keeps layer inputs in a
     // predictable numeric range, which makes deep residual networks easier to
     // train.
+    //
+    // Unlike LayerNorm, RMSNorm does not subtract the mean. It only divides by
+    // the root mean square. That makes the operation smaller and easier to read:
+    // square each channel, average those squares, add epsilon, take inverse
+    // square root, then multiply every channel by the same scale and its learned
+    // per-channel gain.
     let mean_square = input_vector
         .iter()
         .fold(Value::new(0.0), |sum, value| sum.add(&value.mul(value)))
@@ -1201,6 +1252,13 @@ fn run_transformer_model_with_dropout(
     // Forward pass for one time step. The model sees the current token and the
     // current position, updates the KV cache, then returns logits for the next
     // token. Training calls this repeatedly over a sentence.
+    //
+    // The hidden state is sometimes called the residual stream: a vector of
+    // learned features that every layer reads and edits. The first version comes
+    // from the token embedding table, optionally plus an absolute position row.
+    // Each Transformer layer then makes two edits to that stream: one attention
+    // edit that can look backward in context, and one feed-forward edit that
+    // transforms features at the current position.
     let mut hidden_state = model.token_embedding[token_id].clone();
     if config.features.use_learned_absolute_position_encoding {
         hidden_state = hidden_state
@@ -1255,6 +1313,11 @@ fn run_transformer_layer(
     //
     // Residual additions let each block make an incremental edit instead of
     // relearning the whole representation from scratch.
+    //
+    // "Pre-norm" means RMSNorm happens before attention and feed-forward work,
+    // not after the residual addition. That layout is common in modern LLMs
+    // because the residual path remains close to an identity function, giving
+    // gradients a clean route through many layers.
     let residual_state = hidden_state.to_vec();
     let normalized_state =
         rmsnorm_with_optional_gain(hidden_state, &layer.attention_norm_gain, config);
@@ -1283,6 +1346,9 @@ fn run_transformer_layer(
     );
 
     // Store this step's key/value so future positions can attend to it.
+    // The query is only needed for the current prediction, but keys and values
+    // are reusable. Caching them is the autoregressive inference trick: at
+    // position 30 we do not need to recompute keys/values for positions 0..29.
     keys[layer_context.layer_index].push(key);
     values[layer_context.layer_index].push(value);
 
@@ -1376,6 +1442,12 @@ pub fn run_multi_head_attention(
     // Multi-head attention is the same attention operation repeated over slices
     // of the vector. With embedding 64 and 16 heads, each head sees 4 numbers.
     // Concatenating the head outputs restores the full embedding width.
+    //
+    // A single head has one attention distribution over previous time steps.
+    // Multiple heads let the model maintain several different distributions at
+    // once. One head might focus on punctuation, another on recent letters, and
+    // another on sentence-start clues. The code does not hard-code those roles;
+    // they emerge from the learned projection matrices.
     (0..config.attention_head_count)
         .flat_map(|head_index| {
             let head_start_index = head_index * config.attention_head_size;
@@ -1455,6 +1527,12 @@ pub fn apply_rotary_position_embedding(
     // Nearby positions get similar rotations; farther positions get different
     // rotations. Because the same rotation rule is applied to queries and keys,
     // their dot product can express relative distance between characters.
+    //
+    // The rotation happens independently inside each attention head. Pair 0 uses
+    // the highest frequency, so it changes quickly with position. Later pairs
+    // use lower frequencies, so they vary more slowly. Together those pairs give
+    // attention a range of distance-sensitive signals without adding a separate
+    // learned position vector to every hidden state.
     let mut rotated = vector.to_vec();
     let pair_count = config.attention_head_size / 2;
     for head_index in 0..config.attention_head_count {
@@ -1608,6 +1686,10 @@ fn token_window_from_tokens(
     // model fake examples.
     let prediction_count = tokens.len().saturating_sub(1).min(context_window_size);
     let max_start = tokens.len().saturating_sub(context_window_size + 1);
+    // `max_start` is the last starting index that still leaves one following
+    // target token for every input position in the window. If the document is
+    // shorter than the context window, the start is forced to zero and the mask
+    // below prevents padded positions from contributing loss.
     let start = if max_start == 0 {
         0
     } else {
@@ -1635,6 +1717,10 @@ fn deterministic_index(step: usize, batch_offset: usize, salt: u64, upper_bound:
     if upper_bound <= 1 {
         return 0;
     }
+    // SplitMix64 is used as a tiny deterministic mixer. It is not a training RNG
+    // with mutable state; the same inputs always produce the same index. The
+    // salt separates different choices made at the same step and batch offset,
+    // such as choosing a document versus choosing a start position.
     let mixed = splitmix64(
         (step as u64)
             .wrapping_mul(0xa076_1d64_78bd_642f)
@@ -1840,6 +1926,11 @@ fn train_on_token_window_with_dropout(
         let mask = token_window.loss_mask[position_id];
         let token_id = token_window.input_tokens[position_id];
         let target_token_id = token_window.target_tokens[position_id];
+        // Feed the true input token at each position, even if the model would
+        // have sampled a different previous character. This "teacher forcing"
+        // keeps training stable: every position gets the real context from the
+        // document, so mistakes at early positions do not corrupt the rest of the
+        // training example.
         let model_run = run_transformer_model_with_dropout(
             model,
             config,
@@ -1989,6 +2080,11 @@ pub fn apply_adam_update(
             let adam_update = bias_corrected_first_moment
                 / (bias_corrected_second_moment.sqrt() + optimizer_config.epsilon);
             let decay_update = if optimizer_config.features.use_weight_decay {
+                // AdamW decouples weight decay from the gradient. Instead of
+                // adding L2 regularization into the gradient before Adam's
+                // adaptive scaling, it adds a direct shrinkage term based on the
+                // current parameter value. That keeps the regularization strength
+                // easier to reason about.
                 optimizer_config.weight_decay * parameter.data()
             } else {
                 0.0
@@ -2029,6 +2125,9 @@ pub fn scheduled_learning_rate(
     training_step_count: usize,
 ) -> f64 {
     if !optimizer_config.features.use_warmup_cosine_learning_rate {
+        // The fallback still decays to zero linearly. That keeps long runs from
+        // taking full-size steps forever, but it removes the warmup and cosine
+        // shape so the optimizer feature toggle has an obvious behavioral effect.
         return optimizer_config.learning_rate
             * (1.0 - step as f64 / training_step_count.max(1) as f64).max(0.0);
     }
@@ -2136,6 +2235,10 @@ pub fn generate_sample(
             .collect();
         let probabilities = softmax(&scaled_logits);
         let mut probability_data: Vec<_> = probabilities.iter().map(Value::data).collect();
+        // Once we leave training and start sampling, gradients no longer matter.
+        // We copy probabilities out of `Value` wrappers as plain f64 weights so
+        // decoding rules can zero out invalid choices before `weighted_choice`
+        // draws the next character.
         apply_sampling_constraints(
             &mut probability_data,
             tokenizer,
@@ -2271,6 +2374,10 @@ pub fn create_microgpt_training_session_from_splits(
         .chain(validation_documents.iter())
         .flat_map(|document| document.chars())
         .collect();
+    // Character ids are deterministic because the vocabulary is sorted before
+    // deduplication. That matters for checkpoints and reproducible training:
+    // token id 0 should always mean the same character for the same dataset,
+    // regardless of HashMap iteration order or document traversal details.
     unique_characters.sort_unstable();
     unique_characters.dedup();
 
