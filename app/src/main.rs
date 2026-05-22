@@ -1050,9 +1050,7 @@ impl AppState {
             return;
         }
         match load_checkpoint_from_path(&path).and_then(|checkpoint| {
-            let training_run_config = checkpoint.training_run_config.unwrap_or_else(|| {
-                Backend::from_checkpoint_backend(checkpoint.backend).default_training_run_config()
-            });
+            let training_run_config = checkpoint.training_run_config;
             TrainingSession::import_checkpoint(&checkpoint)
                 .map(|session| (session, training_run_config))
         }) {

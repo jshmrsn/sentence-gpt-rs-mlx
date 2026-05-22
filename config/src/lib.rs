@@ -110,13 +110,6 @@ impl Backend {
             Backend::Cpu => CPU_DEFAULT_TRAINING_RUN_CONFIG,
         }
     }
-
-    pub fn from_checkpoint_backend(backend: CheckpointBackend) -> Self {
-        match backend {
-            CheckpointBackend::Mlx => Backend::Mlx,
-            CheckpointBackend::Cpu => Backend::Cpu,
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -277,12 +270,15 @@ impl TrainingSession {
         &self,
         training_run_config: TrainingRunConfig,
     ) -> Result<MicrogptCheckpoint, String> {
-        let mut checkpoint = match self {
-            TrainingSession::Mlx(session) => export_mlx_training_session_checkpoint(session),
-            TrainingSession::Cpu(session) => Ok(export_cpu_training_session_checkpoint(session)),
-        }?;
-        checkpoint.training_run_config = Some(training_run_config);
-        Ok(checkpoint)
+        match self {
+            TrainingSession::Mlx(session) => {
+                export_mlx_training_session_checkpoint(session, training_run_config)
+            }
+            TrainingSession::Cpu(session) => Ok(export_cpu_training_session_checkpoint(
+                session,
+                training_run_config,
+            )),
+        }
     }
 
     pub fn import_checkpoint(checkpoint: &MicrogptCheckpoint) -> Result<Self, String> {

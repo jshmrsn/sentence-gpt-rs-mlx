@@ -51,7 +51,7 @@ pub struct TrainingRunConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MicrogptCheckpoint {
     pub backend: CheckpointBackend,
-    pub training_run_config: Option<TrainingRunConfig>,
+    pub training_run_config: TrainingRunConfig,
     pub config: TransformerConfig,
     pub tokenizer: CharacterTokenizer,
     pub documents: Vec<String>,

@@ -15,7 +15,9 @@
 //! weight decay, warmup, cosine learning-rate decay, validation loss, and
 //! constrained sampling.
 
-use crate::checkpoint::{CheckpointBackend, CheckpointTensor, MicrogptCheckpoint};
+use crate::checkpoint::{
+    CheckpointBackend, CheckpointTensor, MicrogptCheckpoint, TrainingRunConfig,
+};
 use crate::value::Value;
 use rand::Rng;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
@@ -148,15 +150,11 @@ pub struct TransformerLayerParameters {
 pub struct TransformerModelParameters {
     // Token embeddings answer: "what character is this?"
     pub token_embedding: Matrix,
-    // Kept for checkpoint/UI compatibility, but the active model is now RoPE
-    // only. Character models get cleaner extrapolation from relative rotary
-    // positions than from also learning a tiny absolute position table. In
-    // other words: the model now learns "how far apart are these characters?"
-    // through attention rotations instead of memorizing "position 17 means..."
+    // Optional learned absolute positions. RoPE is usually the better default,
+    // but this table is active when the corresponding feature toggle is enabled.
     pub position_embedding: Matrix,
-    // Kept for checkpoint/UI compatibility. The active logits are tied to
-    // `token_embedding`, a common LM trick that improves sample efficiency for
-    // small vocabularies by sharing input and output character representations.
+    // Optional untied output head. The default ties logits to `token_embedding`,
+    // but this matrix is active when the corresponding feature toggle is enabled.
     pub language_model_head: Matrix,
     pub language_model_head_biases: Vector,
     // Final learned RMSNorm scale before tied output logits. This is the last
@@ -716,11 +714,14 @@ impl MicrogptTrainingSession {
     }
 }
 
-pub fn export_training_session_checkpoint(session: &MicrogptTrainingSession) -> MicrogptCheckpoint {
+pub fn export_training_session_checkpoint(
+    session: &MicrogptTrainingSession,
+    training_run_config: TrainingRunConfig,
+) -> MicrogptCheckpoint {
     let parameter_tensors = session.trained_microgpt.model.checkpoint_tensors();
     MicrogptCheckpoint {
         backend: CheckpointBackend::Cpu,
-        training_run_config: None,
+        training_run_config,
         config: session.trained_microgpt.config.clone(),
         tokenizer: session.trained_microgpt.tokenizer.clone(),
         documents: session.documents.clone(),
@@ -760,33 +761,15 @@ pub fn import_training_session_checkpoint(
         checkpoint.config.layer_count,
     );
     let expected_tensors = model_template.checkpoint_tensors();
-    let parameter_tensors = upgrade_legacy_checkpoint_tensors_for_norm_gains(
-        &checkpoint.parameters,
-        &expected_tensors,
-        checkpoint.config.layer_count,
-        1.0,
-    )?;
-    let first_moment_tensors = upgrade_legacy_checkpoint_tensors_for_norm_gains(
-        &checkpoint.first_moment_estimates,
-        &expected_tensors,
-        checkpoint.config.layer_count,
-        0.0,
-    )?;
-    let second_moment_tensors = upgrade_legacy_checkpoint_tensors_for_norm_gains(
-        &checkpoint.second_moment_estimates,
-        &expected_tensors,
-        checkpoint.config.layer_count,
-        0.0,
-    )?;
-    let parameter_values = flatten_checkpoint_tensors(&parameter_tensors, &expected_tensors)?
+    let parameter_values = flatten_checkpoint_tensors(&checkpoint.parameters, &expected_tensors)?
         .into_iter()
         .map(Value::new)
         .collect();
     let model = model_template.with_values(parameter_values);
     let first_moment_estimates =
-        flatten_checkpoint_tensors(&first_moment_tensors, &expected_tensors)?;
+        flatten_checkpoint_tensors(&checkpoint.first_moment_estimates, &expected_tensors)?;
     let second_moment_estimates =
-        flatten_checkpoint_tensors(&second_moment_tensors, &expected_tensors)?;
+        flatten_checkpoint_tensors(&checkpoint.second_moment_estimates, &expected_tensors)?;
 
     Ok(MicrogptTrainingSession {
         trained_microgpt: TrainedMicrogpt {
@@ -960,77 +943,6 @@ fn flatten_checkpoint_tensors(
         values.extend(tensor.values.iter().copied());
     }
     Ok(values)
-}
-
-pub(crate) fn upgrade_legacy_checkpoint_tensors_for_norm_gains(
-    tensors: &[CheckpointTensor],
-    expected_tensors: &[CheckpointTensor],
-    layer_count: usize,
-    inserted_value: f64,
-) -> Result<Vec<CheckpointTensor>, String> {
-    if tensors.len() == expected_tensors.len() {
-        return Ok(tensors.to_vec());
-    }
-
-    let legacy_tensor_count = 4 + layer_count * 14;
-    if tensors.len() != legacy_tensor_count {
-        return Err(format!(
-            "checkpoint has {} parameter tensors, expected {}",
-            tensors.len(),
-            expected_tensors.len()
-        ));
-    }
-
-    let mut upgraded = Vec::with_capacity(expected_tensors.len());
-    let mut legacy_index = 0;
-    let mut expected_index = 0;
-
-    for _ in 0..4 {
-        upgraded.push(tensors[legacy_index].clone());
-        legacy_index += 1;
-        expected_index += 1;
-    }
-
-    upgraded.push(filled_checkpoint_tensor(
-        &expected_tensors[expected_index],
-        inserted_value,
-    ));
-    expected_index += 1;
-
-    for _ in 0..layer_count {
-        upgraded.push(filled_checkpoint_tensor(
-            &expected_tensors[expected_index],
-            inserted_value,
-        ));
-        expected_index += 1;
-
-        for _ in 0..8 {
-            upgraded.push(tensors[legacy_index].clone());
-            legacy_index += 1;
-            expected_index += 1;
-        }
-
-        upgraded.push(filled_checkpoint_tensor(
-            &expected_tensors[expected_index],
-            inserted_value,
-        ));
-        expected_index += 1;
-
-        for _ in 0..6 {
-            upgraded.push(tensors[legacy_index].clone());
-            legacy_index += 1;
-            expected_index += 1;
-        }
-    }
-
-    Ok(upgraded)
-}
-
-fn filled_checkpoint_tensor(expected_tensor: &CheckpointTensor, value: f64) -> CheckpointTensor {
-    CheckpointTensor {
-        shape: expected_tensor.shape.clone(),
-        values: vec![value; expected_tensor.values.len()],
-    }
 }
 
 pub fn random_gaussian(
@@ -2390,6 +2302,22 @@ mod tests {
     use rand::SeedableRng;
     use rand_chacha::ChaCha8Rng;
 
+    fn test_training_run_config() -> TrainingRunConfig {
+        TrainingRunConfig {
+            validation_step_interval: 1,
+            training_document_batch_size: 1,
+            max_document_count: 4,
+            validation_set_divisor: 4,
+            validation_evaluation_document_count: 1,
+            context_window_size: 12,
+            layer_count: 1,
+            attention_heads: 2,
+            embedding_size: 8,
+            transformer_features: TransformerFeatureConfig::optimized_defaults(),
+            optimizer_features: OptimizerFeatureConfig::optimized_defaults(),
+        }
+    }
+
     #[test]
     fn linear_adds_learned_bias() {
         let input = vec![Value::new(2.0), Value::new(3.0)];
@@ -2534,7 +2462,7 @@ mod tests {
             .expect("first training step should run")
             .session;
 
-        let checkpoint = export_training_session_checkpoint(&session);
+        let checkpoint = export_training_session_checkpoint(&session, test_training_run_config());
         let restored =
             import_training_session_checkpoint(&checkpoint).expect("checkpoint should restore");
 

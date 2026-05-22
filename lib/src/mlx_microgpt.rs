@@ -20,12 +20,14 @@
 //! it later. Calls such as `eval`, `item`, and `as_slice` force materialization
 //! because they need concrete values on the Rust side.
 
-use crate::checkpoint::{CheckpointBackend, CheckpointTensor, MicrogptCheckpoint};
+use crate::checkpoint::{
+    CheckpointBackend, CheckpointTensor, MicrogptCheckpoint, TrainingRunConfig,
+};
 use crate::microgpt::{
     apply_sampling_constraints, document_prediction_count, normalize_training_document,
     random_gaussian, scheduled_learning_rate, shuffled_by, training_batch_token_windows,
-    upgrade_legacy_checkpoint_tensors_for_norm_gains, AdamOptimizerConfig, CharacterTokenizer,
-    MicrogptTrainingProgress, TrainingTokenWindow, TransformerConfig,
+    AdamOptimizerConfig, CharacterTokenizer, MicrogptTrainingProgress, TrainingTokenWindow,
+    TransformerConfig,
 };
 // `ops` contains tensor operations such as softmax, reductions, stacking, and
 // elementwise math. `transforms` contains autodiff transforms such as
@@ -83,11 +85,11 @@ pub struct MlxTransformerModelParameters {
     // single MLX tensor. Keeping the shapes and names aligned makes it easier to
     // compare CPU and MLX behavior.
     pub token_embedding: Array,
-    // Retained for checkpoint/UI compatibility. The active MLX forward pass is
-    // RoPE-only and does not add this learned absolute position table.
+    // Optional learned absolute positions, active when the corresponding
+    // feature toggle is enabled.
     pub position_embedding: Array,
-    // Retained for checkpoint/UI compatibility. Active output logits use tied
-    // token embeddings instead of this independent head matrix.
+    // Optional untied output head, active when the corresponding feature toggle
+    // is enabled.
     pub language_model_head: Array,
     pub language_model_head_biases: Array,
     // Shape: [embedding_size]. Applied before tied output logits.
@@ -392,11 +394,12 @@ impl MlxMicrogptTrainingSession {
 
 pub fn export_training_session_checkpoint(
     session: &MlxMicrogptTrainingSession,
+    training_run_config: TrainingRunConfig,
 ) -> Result<MicrogptCheckpoint, String> {
     let parameter_arrays = session.trained_microgpt.model.values();
     Ok(MicrogptCheckpoint {
         backend: CheckpointBackend::Mlx,
-        training_run_config: None,
+        training_run_config,
         config: session.trained_microgpt.config.clone(),
         tokenizer: session.trained_microgpt.tokenizer.clone(),
         documents: session.documents.clone(),
@@ -432,29 +435,11 @@ pub fn import_training_session_checkpoint(
         checkpoint.config.layer_count,
     );
     let expected_tensors = model_template.checkpoint_tensor_shapes();
-    let parameter_tensors = upgrade_legacy_checkpoint_tensors_for_norm_gains(
-        &checkpoint.parameters,
-        &expected_tensors,
-        checkpoint.config.layer_count,
-        1.0,
-    )?;
-    let first_moment_tensors = upgrade_legacy_checkpoint_tensors_for_norm_gains(
-        &checkpoint.first_moment_estimates,
-        &expected_tensors,
-        checkpoint.config.layer_count,
-        0.0,
-    )?;
-    let second_moment_tensors = upgrade_legacy_checkpoint_tensors_for_norm_gains(
-        &checkpoint.second_moment_estimates,
-        &expected_tensors,
-        checkpoint.config.layer_count,
-        0.0,
-    )?;
-    let parameter_arrays = checkpoint_tensors_to_arrays(&parameter_tensors, &expected_tensors)?;
+    let parameter_arrays = checkpoint_tensors_to_arrays(&checkpoint.parameters, &expected_tensors)?;
     let first_moment_estimates =
-        checkpoint_tensors_to_arrays(&first_moment_tensors, &expected_tensors)?;
+        checkpoint_tensors_to_arrays(&checkpoint.first_moment_estimates, &expected_tensors)?;
     let second_moment_estimates =
-        checkpoint_tensors_to_arrays(&second_moment_tensors, &expected_tensors)?;
+        checkpoint_tensors_to_arrays(&checkpoint.second_moment_estimates, &expected_tensors)?;
     let model = model_template.with_values(&parameter_arrays);
 
     Ok(MlxMicrogptTrainingSession {
@@ -1762,7 +1747,7 @@ fn silu(input: &Array) -> MlxResult<Array> {
 }
 
 fn relu(input: &Array) -> MlxResult<Array> {
-    ops::maximum(input, &Array::from_f32(0.0))
+    ops::maximum(input, Array::from_f32(0.0))
 }
 
 fn apply_adam_update(
@@ -1981,7 +1966,7 @@ fn weighted_choice(weights: &[f64], random_number_generator: &mut impl Rng) -> u
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::microgpt::OptimizerFeatureConfig;
+    use crate::microgpt::{OptimizerFeatureConfig, TransformerFeatureConfig};
     use rand::SeedableRng;
     use rand_chacha::ChaCha8Rng;
     use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -1991,6 +1976,22 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
             .lock()
             .expect("MLX test lock should not be poisoned")
+    }
+
+    fn test_training_run_config() -> TrainingRunConfig {
+        TrainingRunConfig {
+            validation_step_interval: 1,
+            training_document_batch_size: 1,
+            max_document_count: 4,
+            validation_set_divisor: 4,
+            validation_evaluation_document_count: 1,
+            context_window_size: 12,
+            layer_count: 1,
+            attention_heads: 2,
+            embedding_size: 8,
+            transformer_features: TransformerFeatureConfig::optimized_defaults(),
+            optimizer_features: OptimizerFeatureConfig::optimized_defaults(),
+        }
     }
 
     #[test]
@@ -2105,7 +2106,7 @@ mod tests {
             .expect("training step should run")
             .session;
 
-        let checkpoint = export_training_session_checkpoint(&session)
+        let checkpoint = export_training_session_checkpoint(&session, test_training_run_config())
             .expect("checkpoint export should read MLX tensors");
         let restored =
             import_training_session_checkpoint(&checkpoint).expect("checkpoint should restore");
