@@ -5,3 +5,7 @@ out_dir = "dist"
 
 [web.app]
 title = "sentence-gpt-rs-mlx"
+
+[bundle]
+identifier = "jshmrsn.sentencegptapp"
+publisher = "jshmrsn"

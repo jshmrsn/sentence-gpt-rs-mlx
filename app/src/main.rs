@@ -426,10 +426,10 @@ fn App() -> Element {
                         {config_number_input("Max total docs", snapshot.training_run_config.max_document_count, can_configure_training_run, TrainingRunConfigField::MaxDocumentCount, state)}
                         {config_number_input("Validation docs divisor", snapshot.training_run_config.validation_set_divisor, can_configure_training_run, TrainingRunConfigField::ValidationSetDivisor, state)}
                         {config_number_input("Docs per validation eval", snapshot.training_run_config.validation_evaluation_document_count, can_configure_training_run, TrainingRunConfigField::ValidationEvaluationDocumentCount, state)}
-                        {config_number_input("Context", snapshot.training_run_config.context_window_size, can_configure_training_run, TrainingRunConfigField::ContextWindowSize, state)}
+                        {config_number_input("Context size", snapshot.training_run_config.context_window_size, can_configure_training_run, TrainingRunConfigField::ContextWindowSize, state)}
                         {config_number_input("Layers", snapshot.training_run_config.layer_count, can_configure_training_run, TrainingRunConfigField::LayerCount, state)}
-                        {config_number_input("Heads", snapshot.training_run_config.attention_heads, can_configure_training_run, TrainingRunConfigField::AttentionHeads, state)}
-                        {config_number_input("Embedding", snapshot.training_run_config.embedding_size, can_configure_training_run, TrainingRunConfigField::EmbeddingSize, state)}
+                        {config_number_input("Attention heads", snapshot.training_run_config.attention_heads, can_configure_training_run, TrainingRunConfigField::AttentionHeads, state)}
+                        {config_number_input("Embedding size", snapshot.training_run_config.embedding_size, can_configure_training_run, TrainingRunConfigField::EmbeddingSize, state)}
                     }
                 }
 

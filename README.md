@@ -1,6 +1,6 @@
 # sentence-gpt-rs-mlx
 
-GPT training demo based on microgpt, but targeting full simple sentences, accelerated on Apple Silicon with MLX (via mlx-rs) and additional optimizations relative to microgpt, written in Rust, with both Dioxus GUI and ratatui TUI frontends.
+GPT training demo based on Andrej Karpathy's [microgpt](https://karpathy.github.io/2026/02/12/microgpt/), but targeting full simple sentences, accelerated on Apple Silicon with MLX (via mlx-rs) and additional optimizations relative to microgpt, written in Rust, with both Dioxus GUI and ratatui TUI frontends.
 
 The alternative CPU backend is more closely derived from the original microgpt, but refactored to a functional/immutable style, and to use structures over dictionaries. Switching to the CPU backend will automatically use a smaller default model size, and therefore the output quality will be reduced. 
 
@@ -14,7 +14,7 @@ The model code includes many LLM-generated inline comments to describe the machi
 
 The project trains a tiny GPT-style character model on short story sentences. It keeps per-character tokens instead of using BPE or sentencepiece-style tokenization, so model behavior remains easy to inspect while still training toward full simple-sentence generation.
 
-Stories are originally sourced from https://huggingface.co/datasets/roneneldan/TinyStories
+Stories are originally sourced from [roneneldan/TinyStories](https://huggingface.co/datasets/roneneldan/TinyStories)
 
 Stories are split into sentence-like examples on `.`, `?`, and `!` while keeping the punctuation, and then builds train/validation splits during session creation.
 
@@ -53,26 +53,27 @@ xcodebuild -downloadComponent MetalToolchain
 
 ## Build & Run
 
-Desktop GUI app:
+#### Run Desktop GUI app:
 
 ```sh
 cargo run --release -p sentence-gpt-rs-mlx-app
 ```
 
-TUI:
+#### Run TUI app:
 
 ```sh
 cargo run --release -p sentence-gpt-rs-mlx-tui
 ```
 
-#### Build
+#### Build standalone macOS app
+
+Install the Dioxus CLI (dx) according to the instructions here: https://dioxuslabs.com/learn/0.7/getting_started/#install-the-dioxus-cli
 
 ```sh
-cargo build --release -p sentence-gpt-rs-mlx-app
-cargo build --release -p sentence-gpt-rs-mlx-tui
+dx bundle --release --platform desktop --package-types macos --package sentence-gpt-rs-mlx-app
 ```
 
-The binaries land under `target/release/`.
+The macOS app will be located at `app/dist/SentenceGptRsMlxApp.app`.
 
 ## Project Layout
 
