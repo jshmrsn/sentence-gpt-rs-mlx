@@ -272,7 +272,7 @@ fn App() -> Element {
                 div { class: "topbar",
                     div {
                         h1 { class: "title", "sentence-gpt-rs-mlx" }
-                        p { class: "subtitle", "GPT training demo based on microgpt, but targeting full simple sentences, accelerated on Apple Silicon with MLX (via mlx-rs) with additional optimizations, written in Rust, with both Dioxus GUI and ratatui TUI frontends." }
+                        p { class: "subtitle", "GPT training demo based on microgpt, but targeting full simple sentences, accelerated on Apple Silicon with MLX (via mlx-rs) with additional optimizations, written in Rust, with a Dioxus desktop GUI." }
                     }
                     div { class: "actions",
                         button {

@@ -1,6 +1,6 @@
 # sentence-gpt-rs-mlx
 
-GPT training demo based on Andrej Karpathy's [microgpt](https://karpathy.github.io/2026/02/12/microgpt/), but targeting full simple sentences, accelerated on Apple Silicon with MLX (via mlx-rs) and additional optimizations relative to microgpt, written in Rust, with both Dioxus GUI and ratatui TUI frontends.
+GPT training demo based on Andrej Karpathy's [microgpt](https://karpathy.github.io/2026/02/12/microgpt/), but targeting full simple sentences, accelerated on Apple Silicon with MLX (via [mlx-rs](https://github.com/oxiglade/mlx-rs)) and additional optimizations relative to microgpt, written in Rust with a [Dioxus](https://dioxuslabs.com/) desktop GUI.
 
 The alternative CPU backend is more closely derived from the original microgpt, but refactored to a functional/immutable style, and to use structures over dictionaries. Switching to the CPU backend will automatically use a smaller default model size, and therefore the output quality will be reduced. 
 
@@ -35,10 +35,6 @@ Current architecture features include:
 - sample allows specifying a prefix
 - GUI allows for most similar training example for a selected generated sample
 
-Currently, the GUI frontend is more feature-rich and tested than the TUI frontend.
-The project started as a Kotlin port of Andrej Karpathy's microgpt, but then I ported a second time to Rust so I could leverage MLX via mlx-rs.
-https://github.com/oxiglade/mlx-rs
-
 ## Prerequisites
 
 The MLX backend needs native Apple build tooling:
@@ -50,7 +46,7 @@ xcodebuild -downloadComponent MetalToolchain
 
 `mlx-rs` is enabled by default for `sentence-gpt-rs-mlx-lib`.
 
-## Build & Run
+## Build & run
 
 #### Run Desktop GUI app:
 
@@ -58,13 +54,7 @@ xcodebuild -downloadComponent MetalToolchain
 cargo run --release -p sentence-gpt-rs-mlx-app
 ```
 
-#### Run TUI app:
-
-```sh
-cargo run --release -p sentence-gpt-rs-mlx-tui
-```
-
-#### Build standalone macOS app
+#### Build standalone macOS app (optional, for distribution):
 
 Install the Dioxus CLI (dx) according to the instructions here: https://dioxuslabs.com/learn/0.7/getting_started/#install-the-dioxus-cli
 
@@ -77,7 +67,6 @@ The macOS app will be located at `app/dist/SentenceGptRsMlxApp.app`.
 ## Project Layout
 
 - `lib/` contains the core character-level Transformer training code, checkpoint format, dry Rust CPU backend, and MLX backend.
-- `config/` contains shared app/TUI configuration, story loading, backend/session orchestration, training chunk scheduling, and display formatting.
+- `config/` contains shared app configuration, story loading, backend/session orchestration, training chunk scheduling, and display formatting.
 - `app/` contains the Dioxus desktop GUI.
-- `terminal/` contains the ratatui terminal UI.
 - `data/input-stories-00.json` contains the training data.

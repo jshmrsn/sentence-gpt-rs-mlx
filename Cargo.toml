@@ -1,12 +1,12 @@
 [workspace]
-members = ["lib", "config", "app", "terminal"]
+members = ["lib", "config", "app"]
 resolver = "2"
 
 [workspace.package]
 edition = "2021"
 license = "MIT"
 version = "0.1.0"
-description = "GPT training demo based on microgpt, targeting full simple sentences with Rust, MLX acceleration on Apple Silicon, and Dioxus plus ratatui frontends."
+description = "GPT training demo based on microgpt, targeting full simple sentences with Rust, MLX acceleration on Apple Silicon, and a Dioxus desktop app."
 
 [workspace.dependencies]
 rand = "0.8"
