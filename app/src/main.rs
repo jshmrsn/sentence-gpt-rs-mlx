@@ -23,7 +23,8 @@ use sentence_gpt_rs_mlx_lib::checkpoint::{
 };
 use sentence_gpt_rs_mlx_lib::microgpt::{
     generate_sample_trace as generate_cpu_sample_trace, generate_samples as generate_cpu_samples,
-    CharacterTokenizer, MicrogptTrainingProgress, SampleGenerationTrace, TransformerConfig,
+    CharacterTokenizer, Matrix, MicrogptTrainingProgress, SampleGenerationTrace, TransformerConfig,
+    Vector,
 };
 use sentence_gpt_rs_mlx_lib::mlx_microgpt::{
     generate_sample_trace as generate_mlx_sample_trace, generate_samples as generate_mlx_samples,
@@ -172,6 +173,26 @@ struct SystemOverviewStep {
     title: String,
     status: String,
     details: Vec<String>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct ParameterStats {
+    parameter_count: usize,
+    sum_abs_value: f64,
+    max_abs_value: f64,
+}
+
+struct LayerInspectionSnapshot {
+    layers: Vec<LayerInspection>,
+    max_mean_abs_value: f64,
+}
+
+struct LayerInspection {
+    norm: ParameterStats,
+    attention: ParameterStats,
+    mlp_expansion: ParameterStats,
+    mlp_gate: ParameterStats,
+    mlp_projection: ParameterStats,
 }
 
 fn main() {
@@ -1525,6 +1546,7 @@ fn system_overview_panel(
     let features = config.features;
     let optimizer_features = snapshot.training_run_config.optimizer_features;
     let overview_training_step = session.completed_step_count();
+    let layer_inspection_snapshot = layer_inspection_snapshot_for_session(session);
     let latest_train_loss = session
         .latest_loss()
         .map(format_loss)
@@ -1650,7 +1672,7 @@ fn system_overview_panel(
     let optimizer_steps = vec![
         SystemOverviewStep {
             title: "Loss".into(),
-            status: latest_train_loss,
+            status: latest_train_loss.clone(),
             details: vec![
                 format!(
                     "validation {}",
@@ -1712,46 +1734,223 @@ fn system_overview_panel(
                 }
                 {token_embedding_table(token_embedding_snapshot)}
             }
-            div { class: "overview-section",
-                div { class: "layer-overview-header",
-                    div { class: "overview-step-title", "Layer stack" }
-                    div { class: "model-summary",
-                        "{config.layer_count} repeated blocks | each block summarizes parameters by role, not individual weights"
-                    }
+            {layer_stack_section(config, mlp_activation, &latest_train_loss, &latest_validation_loss, &layer_inspection_snapshot)}
+            {overview_flow_section("Optimizer", "Loss, gradients, and AdamW update state.", &optimizer_steps, true)}
+        }
+    }
+}
+
+fn layer_stack_section(
+    config: &TransformerConfig,
+    mlp_activation: &str,
+    latest_train_loss: &str,
+    latest_validation_loss: &str,
+    layer_inspection_snapshot: &Result<LayerInspectionSnapshot, String>,
+) -> Element {
+    rsx! {
+        div { class: "overview-section",
+            div { class: "layer-overview-header",
+                div { class: "overview-step-title", "Layer stack" }
+                div { class: "model-summary",
+                    "train {latest_train_loss} | val {latest_validation_loss} | tint follows mean absolute trained weight"
                 }
-                for layer_index in 0..config.layer_count {
-                    div { class: "layer-row",
-                        div { class: "layer-label", "L{layer_index + 1}" }
-                        div { class: "layer-chunk norm",
-                            div { class: "layer-chunk-title", "Norm" }
-                            div { class: "layer-chunk-main", "pre-attn + pre-MLP" }
-                            div { class: "layer-chunk-detail",
-                                "{format_count(layer_norm_parameter_count(config))} gain params"
-                            }
+            }
+            match layer_inspection_snapshot {
+                Ok(layer_inspection_snapshot) => rsx! {
+                    div { class: "layer-stack",
+                        for (layer_index, layer) in layer_inspection_snapshot.layers.iter().enumerate() {
+                            {layer_visualization_row(
+                                layer_index,
+                                config,
+                                mlp_activation,
+                                layer,
+                                layer_inspection_snapshot.max_mean_abs_value,
+                            )}
                         }
-                        div { class: "layer-arrow", "→" }
-                        div { class: "layer-chunk attention",
-                            div { class: "layer-chunk-title", "Attention" }
-                            div { class: "layer-chunk-main", "{config.attention_head_count} heads x {config.attention_head_size}" }
-                            div { class: "layer-chunk-detail",
-                                "{format_count(attention_parameter_count(config))} Q/K/V/O params"
-                            }
-                        }
-                        div { class: "layer-arrow", "→" }
-                        div { class: "layer-chunk mlp",
-                            div { class: "layer-chunk-title", "MLP" }
-                            div { class: "layer-chunk-main", "{mlp_activation} hidden {config.embedding_size * 3}" }
-                            div { class: "layer-chunk-detail",
-                                "{format_count(mlp_parameter_count(config))} expansion/gate/proj params"
-                            }
-                        }
-                        if layer_index + 1 < config.layer_count {
-                            div { class: "layer-next-arrow", "↓" }
-                        }
+                    }
+                },
+                Err(error) => rsx! {
+                    div { class: "model-summary", "Could not inspect layer parameters: {error}" }
+                },
+            }
+        }
+    }
+}
+
+fn layer_visualization_row(
+    layer_index: usize,
+    config: &TransformerConfig,
+    mlp_activation: &str,
+    layer: &LayerInspection,
+    max_mean_abs_value: f64,
+) -> Element {
+    let feed_forward_size = config.embedding_size * 3;
+    let gate_label = if config.features.use_swiglu_feed_forward {
+        "Gate"
+    } else {
+        "Gate off"
+    };
+    let gate_detail = if config.features.use_swiglu_feed_forward {
+        format!(
+            "{} -> {} | {} params",
+            config.embedding_size,
+            feed_forward_size,
+            format_count(layer.mlp_gate.parameter_count)
+        )
+    } else {
+        "unused when SwiGLU is off".into()
+    };
+    let mixer_label = if config.features.use_swiglu_feed_forward {
+        "SiLU x gate"
+    } else {
+        mlp_activation
+    };
+    let mixer_detail = if config.features.use_swiglu_feed_forward {
+        "candidate features are multiplied by gate features"
+    } else {
+        "activation has no learned weights"
+    };
+
+    rsx! {
+        div {
+            class: "layer-visual-row",
+            style: "{layer_row_tint_style(layer, max_mean_abs_value)}",
+            div { class: "layer-visual-label",
+                div { class: "layer-label", "L{layer_index + 1}" }
+                div { class: "layer-mini-stat",
+                    "avg |w| {format_embedding_value(layer_mean_abs_value(layer))}"
+                }
+            }
+            div { class: "layer-pipeline",
+                {layer_stage_card(
+                    "norm",
+                    "Norm",
+                    "RMSNorm x2".into(),
+                    format!("2 x {} channel gains", config.embedding_size),
+                    layer.norm,
+                    max_mean_abs_value,
+                )}
+                div { class: "layer-arrow", "→" }
+                {layer_stage_card(
+                    "attention",
+                    "Attention",
+                    format!("{} heads x {}", config.attention_head_count, config.attention_head_size),
+                    format!(
+                        "Q/K/V/O | {} params",
+                        format_count(layer.attention.parameter_count)
+                    ),
+                    layer.attention,
+                    max_mean_abs_value,
+                )}
+                div { class: "layer-arrow", "→" }
+                div { class: "mlp-visual-group",
+                    div { class: "mlp-group-title", "MLP" }
+                    div { class: "mlp-subpipeline",
+                        {layer_stage_card(
+                            "mlp-expand",
+                            "Expand",
+                            format!("{} -> {}", config.embedding_size, feed_forward_size),
+                            format!("{} params", format_count(layer.mlp_expansion.parameter_count)),
+                            layer.mlp_expansion,
+                            max_mean_abs_value,
+                        )}
+                        div { class: "layer-arrow small", "→" }
+                        {layer_stage_card(
+                            "mlp-gate",
+                            gate_label,
+                            format!("{} -> {}", config.embedding_size, feed_forward_size),
+                            gate_detail,
+                            layer.mlp_gate,
+                            max_mean_abs_value,
+                        )}
+                        div { class: "layer-arrow small", "→" }
+                        {non_parameter_stage_card("mlp-mix", "Mix", mixer_label, mixer_detail)}
+                        div { class: "layer-arrow small", "→" }
+                        {layer_stage_card(
+                            "mlp-project",
+                            "Project",
+                            format!("{} -> {}", feed_forward_size, config.embedding_size),
+                            format!("{} params", format_count(layer.mlp_projection.parameter_count)),
+                            layer.mlp_projection,
+                            max_mean_abs_value,
+                        )}
                     }
                 }
             }
-            {overview_flow_section("Optimizer", "Loss, gradients, and AdamW update state.", &optimizer_steps, true)}
+        }
+    }
+}
+
+fn layer_stage_card(
+    class_suffix: &str,
+    title: &str,
+    main: String,
+    detail: String,
+    stats: ParameterStats,
+    max_mean_abs_value: f64,
+) -> Element {
+    rsx! {
+        div {
+            class: "layer-stage {class_suffix}",
+            style: "{layer_stage_tint_style(stats, max_mean_abs_value)}",
+            div { class: "stage-copy",
+                div { class: "layer-chunk-title", "{title}" }
+                div { class: "layer-chunk-main", "{main}" }
+                div { class: "layer-chunk-detail", "{detail}" }
+                div { class: "layer-chunk-detail",
+                    "mean |w| {format_embedding_value(stats.mean_abs_value())} | max {format_embedding_value(stats.max_abs_value)}"
+                }
+                div { class: "stage-meter",
+                    div {
+                        class: "stage-meter-fill",
+                        style: "width: {format_percent_style(normalized_parameter_stat(stats.mean_abs_value(), max_mean_abs_value))};"
+                    }
+                }
+            }
+            {neuron_column(stats, max_mean_abs_value)}
+        }
+    }
+}
+
+fn non_parameter_stage_card(class_suffix: &str, title: &str, main: &str, detail: &str) -> Element {
+    rsx! {
+        div { class: "layer-stage {class_suffix} no-params",
+            div { class: "stage-copy",
+                div { class: "layer-chunk-title", "{title}" }
+                div { class: "layer-chunk-main", "{main}" }
+                div { class: "layer-chunk-detail", "{detail}" }
+            }
+            div { class: "neuron-column activation-column",
+                span { class: "neuron-dot activation" }
+                span { class: "neuron-dot activation" }
+                span { class: "neuron-dot activation" }
+            }
+        }
+    }
+}
+
+fn neuron_column(stats: ParameterStats, max_mean_abs_value: f64) -> Element {
+    let intensity = normalized_parameter_stat(stats.mean_abs_value(), max_mean_abs_value);
+    let low_opacity = 0.2 + 0.45 * intensity;
+    let middle_opacity = 0.3 + 0.55 * intensity;
+    let high_opacity = 0.4 + 0.6 * intensity;
+
+    rsx! {
+        div {
+            class: "neuron-column",
+            title: "Three example channels; opacity follows this block's mean absolute trained weight.",
+            span {
+                class: "neuron-dot",
+                style: "opacity: {format_rate(low_opacity)};"
+            }
+            span {
+                class: "neuron-dot",
+                style: "opacity: {format_rate(middle_opacity)};"
+            }
+            span {
+                class: "neuron-dot",
+                style: "opacity: {format_rate(high_opacity)};"
+            }
         }
     }
 }
@@ -1788,38 +1987,193 @@ fn overview_flow_section(
     }
 }
 
+impl ParameterStats {
+    fn add_value(&mut self, value: f64) {
+        let abs_value = value.abs();
+        self.parameter_count += 1;
+        self.sum_abs_value += abs_value;
+        self.max_abs_value = self.max_abs_value.max(abs_value);
+    }
+
+    fn merge(&mut self, other: ParameterStats) {
+        self.parameter_count += other.parameter_count;
+        self.sum_abs_value += other.sum_abs_value;
+        self.max_abs_value = self.max_abs_value.max(other.max_abs_value);
+    }
+
+    fn mean_abs_value(self) -> f64 {
+        if self.parameter_count == 0 {
+            0.0
+        } else {
+            self.sum_abs_value / self.parameter_count as f64
+        }
+    }
+}
+
+fn layer_inspection_snapshot_for_session(
+    session: &TrainingSession,
+) -> Result<LayerInspectionSnapshot, String> {
+    let layers = match session {
+        TrainingSession::Cpu(session) => session
+            .trained_microgpt
+            .model
+            .layers
+            .iter()
+            .map(|layer| {
+                let mut norm = ParameterStats::default();
+                add_vector_stats(&mut norm, &layer.attention_norm_gain);
+                add_vector_stats(&mut norm, &layer.feed_forward_norm_gain);
+
+                let mut attention = ParameterStats::default();
+                add_matrix_stats(&mut attention, &layer.attention.query_weights);
+                add_vector_stats(&mut attention, &layer.attention.query_biases);
+                add_matrix_stats(&mut attention, &layer.attention.key_weights);
+                add_vector_stats(&mut attention, &layer.attention.key_biases);
+                add_matrix_stats(&mut attention, &layer.attention.value_weights);
+                add_vector_stats(&mut attention, &layer.attention.value_biases);
+                add_matrix_stats(&mut attention, &layer.attention.output_projection_weights);
+                add_vector_stats(&mut attention, &layer.attention.output_projection_biases);
+
+                let mut mlp_expansion = ParameterStats::default();
+                add_matrix_stats(&mut mlp_expansion, &layer.feed_forward.expansion_weights);
+                add_vector_stats(&mut mlp_expansion, &layer.feed_forward.expansion_biases);
+
+                let mut mlp_gate = ParameterStats::default();
+                add_matrix_stats(&mut mlp_gate, &layer.feed_forward.gate_weights);
+                add_vector_stats(&mut mlp_gate, &layer.feed_forward.gate_biases);
+
+                let mut mlp_projection = ParameterStats::default();
+                add_matrix_stats(&mut mlp_projection, &layer.feed_forward.projection_weights);
+                add_vector_stats(&mut mlp_projection, &layer.feed_forward.projection_biases);
+
+                LayerInspection {
+                    norm,
+                    attention,
+                    mlp_expansion,
+                    mlp_gate,
+                    mlp_projection,
+                }
+            })
+            .collect::<Vec<_>>(),
+        TrainingSession::Mlx(session) => {
+            let mut layers = Vec::new();
+            for layer in &session.trained_microgpt.model.layers {
+                macro_rules! add_array_stats {
+                    ($stats:expr, $array:expr) => {{
+                        $array.eval().map_err(|error| error.to_string())?;
+                        for value in $array.as_slice::<f32>() {
+                            $stats.add_value(*value as f64);
+                        }
+                        Ok::<(), String>(())
+                    }};
+                }
+
+                let mut norm = ParameterStats::default();
+                add_array_stats!(&mut norm, &layer.attention_norm_gain)?;
+                add_array_stats!(&mut norm, &layer.feed_forward_norm_gain)?;
+
+                let mut attention = ParameterStats::default();
+                add_array_stats!(&mut attention, &layer.attention.query_weights)?;
+                add_array_stats!(&mut attention, &layer.attention.query_biases)?;
+                add_array_stats!(&mut attention, &layer.attention.key_weights)?;
+                add_array_stats!(&mut attention, &layer.attention.key_biases)?;
+                add_array_stats!(&mut attention, &layer.attention.value_weights)?;
+                add_array_stats!(&mut attention, &layer.attention.value_biases)?;
+                add_array_stats!(&mut attention, &layer.attention.output_projection_weights)?;
+                add_array_stats!(&mut attention, &layer.attention.output_projection_biases)?;
+
+                let mut mlp_expansion = ParameterStats::default();
+                add_array_stats!(&mut mlp_expansion, &layer.feed_forward.expansion_weights)?;
+                add_array_stats!(&mut mlp_expansion, &layer.feed_forward.expansion_biases)?;
+
+                let mut mlp_gate = ParameterStats::default();
+                add_array_stats!(&mut mlp_gate, &layer.feed_forward.gate_weights)?;
+                add_array_stats!(&mut mlp_gate, &layer.feed_forward.gate_biases)?;
+
+                let mut mlp_projection = ParameterStats::default();
+                add_array_stats!(&mut mlp_projection, &layer.feed_forward.projection_weights)?;
+                add_array_stats!(&mut mlp_projection, &layer.feed_forward.projection_biases)?;
+
+                layers.push(LayerInspection {
+                    norm,
+                    attention,
+                    mlp_expansion,
+                    mlp_gate,
+                    mlp_projection,
+                });
+            }
+            layers
+        }
+    };
+
+    let max_mean_abs_value = layers
+        .iter()
+        .flat_map(|layer| {
+            [
+                layer.norm.mean_abs_value(),
+                layer.attention.mean_abs_value(),
+                layer.mlp_expansion.mean_abs_value(),
+                layer.mlp_gate.mean_abs_value(),
+                layer.mlp_projection.mean_abs_value(),
+            ]
+        })
+        .fold(1e-12_f64, f64::max);
+
+    Ok(LayerInspectionSnapshot {
+        layers,
+        max_mean_abs_value,
+    })
+}
+
+fn add_matrix_stats(stats: &mut ParameterStats, matrix: &Matrix) {
+    for row in matrix {
+        add_vector_stats(stats, row);
+    }
+}
+
+fn add_vector_stats(stats: &mut ParameterStats, vector: &Vector) {
+    for value in vector {
+        stats.add_value(value.data());
+    }
+}
+
+fn layer_mean_abs_value(layer: &LayerInspection) -> f64 {
+    let mut combined = ParameterStats::default();
+    combined.merge(layer.norm);
+    combined.merge(layer.attention);
+    combined.merge(layer.mlp_expansion);
+    combined.merge(layer.mlp_gate);
+    combined.merge(layer.mlp_projection);
+    combined.mean_abs_value()
+}
+
+fn normalized_parameter_stat(value: f64, max_value: f64) -> f64 {
+    if max_value <= 0.0 {
+        0.0
+    } else {
+        (value / max_value).clamp(0.0, 1.0)
+    }
+}
+
+fn layer_row_tint_style(layer: &LayerInspection, max_mean_abs_value: f64) -> String {
+    let intensity = normalized_parameter_stat(layer_mean_abs_value(layer), max_mean_abs_value);
+    let alpha = 0.05 + 0.13 * intensity;
+    format!(
+        "border-left-color: rgba(31, 111, 235, {alpha:.3}); background: linear-gradient(90deg, rgba(31, 111, 235, {alpha:.3}), rgba(251, 253, 251, 0.92) 42%);"
+    )
+}
+
+fn layer_stage_tint_style(stats: ParameterStats, max_mean_abs_value: f64) -> String {
+    let intensity = normalized_parameter_stat(stats.mean_abs_value(), max_mean_abs_value);
+    let alpha = 0.04 + 0.16 * intensity;
+    format!("background: linear-gradient(135deg, rgba(31, 111, 235, {alpha:.3}), #fbfdfb 58%);")
+}
+
 fn format_enabled(enabled: bool) -> &'static str {
     if enabled {
         "on"
     } else {
         "off"
-    }
-}
-
-fn attention_parameter_count(config: &TransformerConfig) -> usize {
-    let bias_count = if config.features.use_learned_biases {
-        4 * config.embedding_size
-    } else {
-        0
-    };
-    4 * config.embedding_size * config.embedding_size + bias_count
-}
-
-fn mlp_parameter_count(config: &TransformerConfig) -> usize {
-    let feed_forward_size = config.embedding_size * 3;
-    let bias_count = if config.features.use_learned_biases {
-        feed_forward_size * 2 + config.embedding_size
-    } else {
-        0
-    };
-    config.embedding_size * feed_forward_size * 3 + bias_count
-}
-
-fn layer_norm_parameter_count(config: &TransformerConfig) -> usize {
-    if config.features.use_learned_rmsnorm_gain {
-        config.embedding_size * 2
-    } else {
-        0
     }
 }
 

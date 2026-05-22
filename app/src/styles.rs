@@ -302,6 +302,152 @@ button, input {
     font-weight: 800;
 }
 
+.layer-stack {
+    display: grid;
+    gap: 10px;
+}
+
+.layer-visual-row {
+    display: grid;
+    grid-template-columns: 86px minmax(0, 1fr);
+    gap: 10px;
+    align-items: stretch;
+    border: 1px solid #d3ded7;
+    border-left: 5px solid #1f6feb;
+    border-radius: 6px;
+    padding: 10px;
+    min-width: 0;
+}
+
+.layer-visual-label {
+    display: grid;
+    gap: 8px;
+    align-content: start;
+}
+
+.layer-mini-stat {
+    color: #53645c;
+    font-size: 10px;
+    line-height: 1.25;
+    font-variant-numeric: tabular-nums;
+}
+
+.layer-pipeline {
+    display: grid;
+    grid-template-columns: minmax(130px, 0.75fr) 18px minmax(160px, 1fr) 18px minmax(430px, 2.2fr);
+    gap: 6px;
+    align-items: stretch;
+    min-width: 0;
+}
+
+.layer-stage,
+.mlp-visual-group {
+    border: 1px solid #d3ded7;
+    border-radius: 6px;
+    background: #fbfdfb;
+}
+
+.layer-stage {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 28px;
+    gap: 8px;
+    align-items: center;
+    min-width: 0;
+    padding: 8px;
+}
+
+.layer-stage.norm {
+    border-left: 4px solid #6b7280;
+}
+
+.layer-stage.attention {
+    border-left: 4px solid #1f6feb;
+}
+
+.layer-stage.mlp-expand {
+    border-left: 4px solid #64748b;
+}
+
+.layer-stage.mlp-gate {
+    border-left: 4px solid #b7791f;
+}
+
+.layer-stage.mlp-mix {
+    border-left: 4px solid #28533f;
+}
+
+.layer-stage.mlp-project {
+    border-left: 4px solid #7c3aed;
+}
+
+.layer-stage.no-params {
+    background: #eef5f0;
+}
+
+.stage-copy {
+    min-width: 0;
+}
+
+.stage-meter {
+    height: 5px;
+    background: #dfe9e2;
+    border-radius: 999px;
+    overflow: hidden;
+    margin-top: 6px;
+}
+
+.stage-meter-fill {
+    height: 100%;
+    background: #1f6feb;
+}
+
+.neuron-column {
+    display: grid;
+    gap: 4px;
+    justify-items: center;
+    align-content: center;
+}
+
+.neuron-dot {
+    width: 14px;
+    height: 14px;
+    border-radius: 999px;
+    background: #1f6feb;
+    border: 1px solid rgba(23, 32, 42, 0.16);
+}
+
+.neuron-dot.activation {
+    background: #28533f;
+}
+
+.mlp-visual-group {
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr);
+    gap: 7px;
+    padding: 8px;
+    min-width: 0;
+}
+
+.mlp-group-title {
+    color: #53645c;
+    font-size: 11px;
+    font-weight: 800;
+    text-transform: uppercase;
+}
+
+.mlp-subpipeline {
+    display: grid;
+    grid-template-columns: minmax(112px, 1fr) 14px minmax(112px, 1fr) 14px minmax(112px, 0.85fr) 14px minmax(112px, 1fr);
+    gap: 5px;
+    align-items: stretch;
+    min-width: 0;
+}
+
+.layer-arrow.small {
+    min-width: 14px;
+    font-size: 12px;
+}
+
 .embedding-panel {
     min-width: 0;
 }
@@ -721,7 +867,10 @@ button, input {
         transform: rotate(90deg);
     }
 
-    .layer-row {
+    .layer-row,
+    .layer-visual-row,
+    .layer-pipeline,
+    .mlp-subpipeline {
         grid-template-columns: 1fr;
     }
 
