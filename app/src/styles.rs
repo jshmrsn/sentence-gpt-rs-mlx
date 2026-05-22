@@ -241,7 +241,7 @@ button, input {
 
 .controls {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) 220px auto;
+    grid-template-columns: minmax(0, 1fr) 220px auto auto;
     gap: 12px;
     align-items: end;
 }
@@ -346,6 +346,102 @@ button, input {
     border-radius: 6px;
     padding: 5px 8px;
     white-space: nowrap;
+}
+
+.inspection-panel {
+    margin-top: 12px;
+    border-top: 1px solid #d3ded7;
+    padding-top: 12px;
+}
+
+.inspection-token-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+    margin-bottom: 12px;
+}
+
+.inspection-token {
+    position: relative;
+    min-width: 28px;
+    min-height: 30px;
+    border: 1px solid rgba(23, 32, 42, 0.18);
+    border-radius: 6px;
+    color: #17202a;
+    padding: 5px 7px 7px;
+    cursor: pointer;
+    font-weight: 750;
+    font-variant-numeric: tabular-nums;
+}
+
+.inspection-token.selected {
+    border-color: #17202a;
+    box-shadow: 0 0 0 2px rgba(23, 32, 42, 0.12);
+}
+
+.inspection-token-text {
+    display: block;
+    line-height: 1;
+}
+
+.inspection-prefix-marker {
+    position: absolute;
+    left: 7px;
+    right: 7px;
+    bottom: 1px;
+    color: #17202a;
+    font-size: 11px;
+    line-height: 1;
+    text-align: center;
+}
+
+.inspection-summary {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 14px;
+    color: #53645c;
+    font-size: 13px;
+    margin-bottom: 10px;
+}
+
+.distribution-list {
+    display: grid;
+    gap: 5px;
+}
+
+.distribution-row {
+    display: grid;
+    grid-template-columns: 48px minmax(0, 1fr) 58px;
+    gap: 8px;
+    align-items: center;
+}
+
+.distribution-row.chosen .distribution-token {
+    color: #17202a;
+    font-weight: 800;
+}
+
+.distribution-token,
+.distribution-value {
+    color: #53645c;
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+}
+
+.distribution-track {
+    height: 12px;
+    background: #dfe9e2;
+    border-radius: 999px;
+    overflow: hidden;
+}
+
+.distribution-fill {
+    height: 100%;
+    background: #1f6feb;
+}
+
+.distribution-value {
+    text-align: right;
 }
 
 .document-list {

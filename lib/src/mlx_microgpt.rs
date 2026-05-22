@@ -25,9 +25,10 @@ use crate::checkpoint::{
 };
 use crate::microgpt::{
     apply_sampling_constraints, document_prediction_count, normalize_training_document,
-    random_gaussian, scheduled_learning_rate, shuffled_by, training_batch_token_windows,
-    AdamOptimizerConfig, CharacterTokenizer, MicrogptTrainingProgress, TrainingTokenWindow,
-    TransformerConfig, ValidationSplitConfig,
+    normalized_probability_distribution, probability_entropy, random_gaussian,
+    scheduled_learning_rate, shuffled_by, training_batch_token_windows, AdamOptimizerConfig,
+    CharacterTokenizer, GeneratedTokenInspection, MicrogptTrainingProgress, SampleGenerationTrace,
+    TrainingTokenWindow, TransformerConfig, ValidationSplitConfig,
 };
 // `ops` contains tensor operations such as softmax, reductions, stacking, and
 // elementwise math. `transforms` contains autodiff transforms such as
@@ -875,6 +876,25 @@ pub fn generate_sample(
     temperature: f64,
     random_number_generator: &mut impl Rng,
 ) -> MlxResult<String> {
+    Ok(generate_sample_trace(
+        model,
+        config,
+        tokenizer,
+        prefix,
+        temperature,
+        random_number_generator,
+    )?
+    .sample)
+}
+
+pub fn generate_sample_trace(
+    model: &MlxTransformerModelParameters,
+    config: &TransformerConfig,
+    tokenizer: &CharacterTokenizer,
+    prefix: &str,
+    temperature: f64,
+    random_number_generator: &mut impl Rng,
+) -> MlxResult<SampleGenerationTrace> {
     // Sampling uses MLX for the forward pass and softmax, then copies the small
     // probability vector back to Rust so the CPU-side sampling constraints and
     // RNG behavior stay shared with the reference backend.
@@ -891,17 +911,13 @@ pub fn generate_sample(
         .take(config.context_window_size - 1)
         .collect::<String>();
     let prefix_characters = normalized_prefix.chars().collect::<Vec<_>>();
-    let mut sample = normalized_prefix.clone();
+    let mut sample = String::new();
+    let mut tokens = Vec::new();
 
     for position_id in 0..config.context_window_size {
         let run = run_transformer_model(&params, config, token_id, position_id, keys, values)?;
         keys = run.keys;
         values = run.values;
-
-        if let Some(prefix_character) = prefix_characters.get(position_id) {
-            token_id = tokenizer.character_to_token_id[prefix_character];
-            continue;
-        }
 
         let scaled_logits = &run.logits / Array::from_f32(temperature as f32);
         let probabilities = ops::softmax_axis(&scaled_logits, 0, None)?;
@@ -914,15 +930,39 @@ pub fn generate_sample(
             .iter()
             .map(|probability| *probability as f64)
             .collect::<Vec<_>>();
+
+        if let Some(prefix_character) = prefix_characters.get(position_id) {
+            token_id = tokenizer.character_to_token_id[prefix_character];
+            tokens.push(GeneratedTokenInspection {
+                token_id,
+                position_id,
+                is_prefix: true,
+                probability: weights[token_id],
+                entropy: probability_entropy(&weights),
+                probabilities: weights,
+            });
+            sample.push(*prefix_character);
+            continue;
+        }
+
         apply_sampling_constraints(&mut weights, tokenizer, &sample, prefix_characters.len());
+        let sampling_distribution = normalized_probability_distribution(&weights);
         token_id = weighted_choice(&weights, random_number_generator);
         if token_id == tokenizer.sequence_boundary_token_id {
             break;
         }
+        tokens.push(GeneratedTokenInspection {
+            token_id,
+            position_id,
+            is_prefix: false,
+            probability: sampling_distribution[token_id],
+            entropy: probability_entropy(&sampling_distribution),
+            probabilities: sampling_distribution,
+        });
         sample.push(tokenizer.unique_characters[token_id]);
     }
 
-    Ok(sample)
+    Ok(SampleGenerationTrace { sample, tokens })
 }
 
 struct TransformerRun {

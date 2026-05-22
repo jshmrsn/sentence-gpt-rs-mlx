@@ -702,6 +702,22 @@ pub struct MicrogptTrainingProgress {
 }
 
 #[derive(Clone, Debug)]
+pub struct GeneratedTokenInspection {
+    pub token_id: usize,
+    pub position_id: usize,
+    pub is_prefix: bool,
+    pub probability: f64,
+    pub entropy: f64,
+    pub probabilities: Vec<f64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SampleGenerationTrace {
+    pub sample: String,
+    pub tokens: Vec<GeneratedTokenInspection>,
+}
+
+#[derive(Clone, Debug)]
 pub struct MicrogptTrainingSession {
     pub trained_microgpt: TrainedMicrogpt,
     pub documents: Vec<String>,
@@ -2197,6 +2213,25 @@ pub fn generate_sample(
     temperature: f64,
     random_number_generator: &mut impl Rng,
 ) -> String {
+    generate_sample_trace(
+        model,
+        config,
+        tokenizer,
+        prefix,
+        temperature,
+        random_number_generator,
+    )
+    .sample
+}
+
+pub fn generate_sample_trace(
+    model: &TransformerModelParameters,
+    config: &TransformerConfig,
+    tokenizer: &CharacterTokenizer,
+    prefix: &str,
+    temperature: f64,
+    random_number_generator: &mut impl Rng,
+) -> SampleGenerationTrace {
     // Generation is autoregressive: start from a boundary token, repeatedly ask
     // for next-token probabilities, sample one token, append it, and feed it
     // back in. The same KV cache idea used during training avoids recomputing
@@ -2211,19 +2246,13 @@ pub fn generate_sample(
         .take(config.context_window_size - 1)
         .collect();
     let prefix_characters = normalized_prefix.chars().collect::<Vec<_>>();
-    let mut sample = normalized_prefix.clone();
+    let mut sample = String::new();
+    let mut tokens = Vec::new();
 
     for position_id in 0..config.context_window_size {
         let model_run = run_transformer_model(model, config, token_id, position_id, keys, values);
         keys = model_run.keys;
         values = model_run.values;
-
-        if let Some(prefix_character) = prefix_characters.get(position_id) {
-            // A prefix is forced into the context. The model consumes those
-            // characters before it is allowed to sample freely.
-            token_id = tokenizer.character_to_token_id[prefix_character];
-            continue;
-        }
 
         // Temperature changes confidence. Lower than 1 sharpens probabilities
         // and makes output more predictable; higher than 1 flattens them and
@@ -2234,7 +2263,25 @@ pub fn generate_sample(
             .map(|logit| logit.div_f64(temperature))
             .collect();
         let probabilities = softmax(&scaled_logits);
-        let mut probability_data: Vec<_> = probabilities.iter().map(Value::data).collect();
+        let probability_data: Vec<_> = probabilities.iter().map(Value::data).collect();
+
+        if let Some(prefix_character) = prefix_characters.get(position_id) {
+            // A prefix is forced into the context. The model consumes those
+            // characters before it is allowed to sample freely.
+            token_id = tokenizer.character_to_token_id[prefix_character];
+            tokens.push(GeneratedTokenInspection {
+                token_id,
+                position_id,
+                is_prefix: true,
+                probability: probability_data[token_id],
+                entropy: probability_entropy(&probability_data),
+                probabilities: probability_data,
+            });
+            sample.push(*prefix_character);
+            continue;
+        }
+
+        let mut probability_data = probability_data;
         // Once we leave training and start sampling, gradients no longer matter.
         // We copy probabilities out of `Value` wrappers as plain f64 weights so
         // decoding rules can zero out invalid choices before `weighted_choice`
@@ -2245,16 +2292,25 @@ pub fn generate_sample(
             &sample,
             prefix_characters.len(),
         );
+        let sampling_distribution = normalized_probability_distribution(&probability_data);
 
         token_id = weighted_choice(&probability_data, random_number_generator);
         if token_id == tokenizer.sequence_boundary_token_id {
             break;
         }
+        tokens.push(GeneratedTokenInspection {
+            token_id,
+            position_id,
+            is_prefix: false,
+            probability: sampling_distribution[token_id],
+            entropy: probability_entropy(&sampling_distribution),
+            probabilities: sampling_distribution,
+        });
 
         sample.push(tokenizer.unique_characters[token_id]);
     }
 
-    sample
+    SampleGenerationTrace { sample, tokens }
 }
 
 pub fn apply_sampling_constraints(
@@ -2292,6 +2348,22 @@ pub fn apply_sampling_constraints(
             *probability = 1.0;
         }
     }
+}
+
+pub fn normalized_probability_distribution(weights: &[f64]) -> Vec<f64> {
+    let total = weights.iter().sum::<f64>();
+    if total <= 0.0 {
+        return vec![0.0; weights.len()];
+    }
+    weights.iter().map(|weight| weight / total).collect()
+}
+
+pub fn probability_entropy(probabilities: &[f64]) -> f64 {
+    probabilities
+        .iter()
+        .filter(|probability| **probability > 0.0)
+        .map(|probability| -probability * probability.log2())
+        .sum()
 }
 
 fn keep_top_k(probabilities: &mut [f64], top_k: usize) {

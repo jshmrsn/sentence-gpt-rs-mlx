@@ -22,10 +22,12 @@ use sentence_gpt_rs_mlx_lib::checkpoint::{
     load_checkpoint_from_path, save_checkpoint_to_path, TrainingRunConfig,
 };
 use sentence_gpt_rs_mlx_lib::microgpt::{
-    generate_samples as generate_cpu_samples, CharacterTokenizer, MicrogptTrainingProgress,
-    TransformerConfig,
+    generate_sample_trace as generate_cpu_sample_trace, generate_samples as generate_cpu_samples,
+    CharacterTokenizer, MicrogptTrainingProgress, SampleGenerationTrace, TransformerConfig,
 };
-use sentence_gpt_rs_mlx_lib::mlx_microgpt::generate_samples as generate_mlx_samples;
+use sentence_gpt_rs_mlx_lib::mlx_microgpt::{
+    generate_sample_trace as generate_mlx_sample_trace, generate_samples as generate_mlx_samples,
+};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -108,6 +110,7 @@ struct AppState {
     // Generation is queued behind training so MLX is not asked to train and
     // sample from the same model concurrently.
     generation_requested: bool,
+    inspect_generation_requested: bool,
     is_generating_samples: bool,
     next_validation_step: usize,
     accumulated_training_millis: u128,
@@ -121,6 +124,8 @@ struct AppState {
     token_embedding_table_expanded: bool,
     temperature: f64,
     samples: Vec<String>,
+    inspected_generation: Option<SampleGenerationTrace>,
+    selected_inspection_token_index: usize,
     initialization_error: Option<String>,
     checkpoint_message: Option<String>,
     snapshot_export_directory: Option<PathBuf>,
@@ -139,10 +144,12 @@ struct GenerationWork {
     prefix: String,
     temperature: f64,
     sample_rng: ChaCha8Rng,
+    inspect: bool,
 }
 
 struct GenerationResult {
     samples: Vec<String>,
+    inspected_generation: Option<SampleGenerationTrace>,
     sample_rng: ChaCha8Rng,
 }
 
@@ -630,6 +637,12 @@ fn App() -> Element {
                             onclick: move |_| state.write().generate(),
                             if snapshot.is_generating_samples { "Generating" } else { "Generate" }
                         }
+                        button {
+                            class: "button secondary",
+                            disabled: snapshot.session.is_none() || snapshot.is_generating_samples,
+                            onclick: move |_| state.write().generate_one_and_inspect(),
+                            if snapshot.is_generating_samples { "Generating" } else { "Generate one and inspect" }
+                        }
                     }
                     div { class: "samples",
                         for sample in snapshot.samples.iter().cloned() {
@@ -645,6 +658,17 @@ fn App() -> Element {
                                 }
                             }
                         }
+                    }
+                    if let (Some(trace), Some(session)) = (
+                        snapshot.inspected_generation.as_ref(),
+                        snapshot.session.as_ref(),
+                    ) {
+                        {generation_inspection_panel(
+                            trace,
+                            session.tokenizer(),
+                            snapshot.selected_inspection_token_index,
+                            state,
+                        )}
                     }
                 }
 
@@ -736,6 +760,7 @@ impl AppState {
                                 is_training_busy: false,
                                 manual_training_chunk_requested: false,
                                 generation_requested: false,
+                                inspect_generation_requested: false,
                                 is_generating_samples: false,
                                 next_validation_step: training_run_config.validation_step_interval,
                                 accumulated_training_millis: 0,
@@ -749,6 +774,8 @@ impl AppState {
                                 token_embedding_table_expanded: false,
                                 temperature: 0.5,
                                 samples: Vec::new(),
+                                inspected_generation: None,
+                                selected_inspection_token_index: 0,
                                 initialization_error: None,
                                 checkpoint_message: None,
                                 snapshot_export_directory: None,
@@ -800,6 +827,7 @@ impl AppState {
             is_training_busy: false,
             manual_training_chunk_requested: false,
             generation_requested: false,
+            inspect_generation_requested: false,
             is_generating_samples: false,
             next_validation_step: training_run_config.validation_step_interval,
             accumulated_training_millis: 0,
@@ -813,6 +841,8 @@ impl AppState {
             token_embedding_table_expanded: false,
             temperature: 0.5,
             samples: Vec::new(),
+            inspected_generation: None,
+            selected_inspection_token_index: 0,
             initialization_error: Some(error),
             checkpoint_message: None,
             snapshot_export_directory: None,
@@ -1175,6 +1205,7 @@ impl AppState {
                 self.is_training_active = false;
                 self.manual_training_chunk_requested = false;
                 self.generation_requested = false;
+                self.inspect_generation_requested = false;
                 self.is_generating_samples = false;
                 self.training_document_page = 0;
                 self.initialization_error = None;
@@ -1277,8 +1308,25 @@ impl AppState {
             return;
         }
         self.generation_requested = true;
+        self.inspect_generation_requested = false;
+        self.inspected_generation = None;
         self.is_generating_samples = true;
         self.initialization_error = None;
+    }
+
+    fn generate_one_and_inspect(&mut self) {
+        if self.session.is_none() {
+            return;
+        }
+        self.generation_requested = true;
+        self.inspect_generation_requested = true;
+        self.selected_inspection_token_index = 0;
+        self.is_generating_samples = true;
+        self.initialization_error = None;
+    }
+
+    fn select_inspection_token(&mut self, token_index: usize) {
+        self.selected_inspection_token_index = token_index;
     }
 
     fn take_generation_work(&mut self) -> Option<GenerationWork> {
@@ -1287,16 +1335,25 @@ impl AppState {
         }
         let session = self.session.as_ref()?;
         self.generation_requested = false;
+        let inspect = self.inspect_generation_requested;
+        self.inspect_generation_requested = false;
         Some(GenerationWork {
             trained_microgpt: session.trained_snapshot(),
             prefix: self.prefix.clone(),
             temperature: self.temperature,
             sample_rng: self.sample_rng.clone(),
+            inspect,
         })
     }
 
     fn apply_generation_result(&mut self, generation_result: GenerationResult) {
         self.samples = generation_result.samples;
+        self.inspected_generation = generation_result.inspected_generation;
+        if let Some(trace) = &self.inspected_generation {
+            self.selected_inspection_token_index = self
+                .selected_inspection_token_index
+                .min(trace.tokens.len().saturating_sub(1));
+        }
         self.sample_rng = generation_result.sample_rng;
         self.is_generating_samples = false;
         self.initialization_error = None;
@@ -1384,6 +1441,33 @@ fn train_session_until_budget(
 }
 
 fn generate_samples_from_work(mut work: GenerationWork) -> Result<GenerationResult, String> {
+    if work.inspect {
+        let inspected_generation = match &work.trained_microgpt {
+            TrainedSnapshot::Mlx(trained_microgpt) => generate_mlx_sample_trace(
+                &trained_microgpt.model,
+                &trained_microgpt.config,
+                &trained_microgpt.tokenizer,
+                &work.prefix,
+                work.temperature,
+                &mut work.sample_rng,
+            )
+            .map_err(|error| error.to_string())?,
+            TrainedSnapshot::Cpu(trained_microgpt) => generate_cpu_sample_trace(
+                &trained_microgpt.model,
+                &trained_microgpt.config,
+                &trained_microgpt.tokenizer,
+                &work.prefix,
+                work.temperature,
+                &mut work.sample_rng,
+            ),
+        };
+        return Ok(GenerationResult {
+            samples: vec![inspected_generation.sample.clone()],
+            inspected_generation: Some(inspected_generation),
+            sample_rng: work.sample_rng,
+        });
+    }
+
     let samples = match &work.trained_microgpt {
         TrainedSnapshot::Mlx(trained_microgpt) => generate_mlx_samples(
             &trained_microgpt.model,
@@ -1408,6 +1492,7 @@ fn generate_samples_from_work(mut work: GenerationWork) -> Result<GenerationResu
 
     Ok(GenerationResult {
         samples,
+        inspected_generation: None,
         sample_rng: work.sample_rng,
     })
 }
@@ -1631,6 +1716,89 @@ fn loss_history_chart(progress_history: &[MicrogptTrainingProgress]) -> Element 
     }
 }
 
+fn generation_inspection_panel(
+    trace: &SampleGenerationTrace,
+    tokenizer: &CharacterTokenizer,
+    selected_token_index: usize,
+    mut state: Signal<AppState>,
+) -> Element {
+    if trace.tokens.is_empty() {
+        return rsx! {
+            div { class: "inspection-panel",
+                div { class: "model-summary", "No generated tokens to inspect" }
+            }
+        };
+    }
+
+    let selected_token_index = selected_token_index.min(trace.tokens.len().saturating_sub(1));
+    let selected_token = &trace.tokens[selected_token_index];
+    let selected_label = token_label(tokenizer, selected_token.token_id);
+    let selected_source = if selected_token.is_prefix {
+        "prefix"
+    } else {
+        "sampled"
+    };
+    let mut distribution = selected_token
+        .probabilities
+        .iter()
+        .copied()
+        .enumerate()
+        .collect::<Vec<_>>();
+    distribution.sort_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    let max_probability = distribution
+        .first()
+        .map(|(_, probability)| *probability)
+        .unwrap_or(1.0)
+        .max(1e-12);
+
+    rsx! {
+        div { class: "inspection-panel",
+            div { class: "inspection-token-row",
+                for (token_index, token) in trace.tokens.iter().enumerate() {
+                    button {
+                        class: "{inspection_token_class(token.is_prefix, token_index == selected_token_index)}",
+                        style: "{confidence_token_style(token.probability)}",
+                        title: "position {token.position_id} | probability {format_probability(token.probability)} | entropy {format_rate(token.entropy)} bits",
+                        onclick: move |_| state.write().select_inspection_token(token_index),
+                        span { class: "inspection-token-text", "{token_label(tokenizer, token.token_id)}" }
+                        if token.is_prefix {
+                            span { class: "inspection-prefix-marker", "_" }
+                        }
+                    }
+                }
+            }
+            div { class: "inspection-summary",
+                div { "selected {selected_label}" }
+                div { "source {selected_source}" }
+                div { "position {selected_token.position_id}" }
+                div { "confidence {format_probability(selected_token.probability)}" }
+                div { "entropy {format_rate(selected_token.entropy)} bits" }
+            }
+            div { class: "distribution-list",
+                for (token_id, probability) in distribution {
+                    div {
+                        class: "{distribution_row_class(token_id == selected_token.token_id)}",
+                        title: "{token_title(tokenizer, token_id)}",
+                        div { class: "distribution-token", "{token_label(tokenizer, token_id)}" }
+                        div { class: "distribution-track",
+                            div {
+                                class: "distribution-fill",
+                                style: "width: {format_percent_style(probability / max_probability)};"
+                            }
+                        }
+                        div { class: "distribution-value", "{format_probability(probability)}" }
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn token_embedding_snapshot_for_session(
     session: &TrainingSession,
 ) -> Result<TokenEmbeddingSnapshot, String> {
@@ -1766,7 +1934,6 @@ fn token_label(tokenizer: &CharacterTokenizer, token_id: usize) -> String {
         return "<B>".into();
     }
     match tokenizer.unique_characters.get(token_id).copied() {
-        Some(' ') => "sp".into(),
         Some('\n') => "\\n".into(),
         Some('\t') => "\\t".into(),
         Some(character) => character.to_string(),
@@ -1805,6 +1972,34 @@ fn embedding_cell_style(value: f64, max_abs_value: f64) -> String {
     } else {
         format!("background-color: rgba(198, 40, 40, {alpha:.3});")
     }
+}
+
+fn confidence_token_style(probability: f64) -> String {
+    let confidence = probability.clamp(0.0, 1.0).sqrt();
+    let hue = 8.0 + 142.0 * confidence;
+    let lightness = 88.0 - 34.0 * confidence;
+    format!("background-color: hsl({hue:.1} 72% {lightness:.1}%);")
+}
+
+fn inspection_token_class(is_prefix: bool, is_selected: bool) -> &'static str {
+    match (is_prefix, is_selected) {
+        (true, true) => "inspection-token prefix-token selected",
+        (true, false) => "inspection-token prefix-token",
+        (false, true) => "inspection-token selected",
+        (false, false) => "inspection-token",
+    }
+}
+
+fn distribution_row_class(is_chosen: bool) -> &'static str {
+    if is_chosen {
+        "distribution-row chosen"
+    } else {
+        "distribution-row"
+    }
+}
+
+fn format_probability(probability: f64) -> String {
+    format!("{:.1}%", probability.clamp(0.0, 1.0) * 100.0)
 }
 
 fn format_embedding_value(value: f64) -> String {
