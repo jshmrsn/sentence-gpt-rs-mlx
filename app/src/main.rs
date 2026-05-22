@@ -44,7 +44,7 @@ enum TrainingRunConfigField {
     TrainingDocumentBatchSize,
     MaxDocumentCount,
     ValidationSetDivisor,
-    ValidationEvaluationDocumentCount,
+    ValidationSetMaxDocumentCount,
     ContextWindowSize,
     LayerCount,
     AttentionHeads,
@@ -242,11 +242,6 @@ fn App() -> Element {
         .as_ref()
         .map(TrainingSession::validation_document_count)
         .unwrap_or(0);
-    let validation_batch_count = snapshot
-        .session
-        .as_ref()
-        .map(TrainingSession::validation_evaluation_document_count)
-        .unwrap_or(0);
     let latest_loss = snapshot
         .session
         .as_ref()
@@ -278,8 +273,7 @@ fn App() -> Element {
     let snapshot_export_directory_label = snapshot
         .snapshot_export_directory
         .as_ref()
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|| "not selected".into());
+        .map(|path| path.display().to_string());
 
     rsx! {
         style { "{CSS}" }
@@ -291,77 +285,85 @@ fn App() -> Element {
                         p { class: "subtitle", "GPT training demo based on microgpt, but targeting full simple sentences, accelerated on Apple Silicon with MLX (via mlx-rs) with additional optimizations, written in Rust, with a Dioxus desktop GUI." }
                     }
                     div { class: "actions",
-                        button {
-                            class: "button",
-                            disabled: !snapshot.is_training_active
-                                && (snapshot.is_training_busy
-                                    || snapshot.is_generating_samples
-                                    || is_complete),
-                            onclick: move |_| state.write().toggle_training(),
-                            if snapshot.is_training_active { "Pause" } else { "Start" }
+                        div { class: "primary-actions",
+                            button {
+                                class: "button",
+                                disabled: !snapshot.is_training_active
+                                    && (snapshot.is_training_busy
+                                        || snapshot.is_generating_samples
+                                        || is_complete),
+                                onclick: move |_| state.write().toggle_training(),
+                                if snapshot.is_training_active { "Pause" } else { "Start" }
+                            }
+                            button {
+                                class: "button secondary",
+                                disabled: snapshot.is_training_busy || snapshot.is_generating_samples,
+                                onclick: move |_| state.write().toggle_backend(),
+                                "Backend: {backend_label}"
+                            }
+                            button {
+                                class: "button secondary",
+                                disabled: snapshot.is_training_busy || snapshot.is_generating_samples,
+                                onclick: move |_| state.write().reset_training(),
+                                "Reset"
+                            }
                         }
-                        button {
-                            class: "button secondary",
-                            disabled: snapshot.is_training_busy || snapshot.is_generating_samples,
-                            onclick: move |_| state.write().toggle_backend(),
-                            "Backend: {backend_label}"
-                        }
-                        button {
-                            class: "button secondary",
-                            disabled: snapshot.session.is_none() || snapshot.is_training_busy || snapshot.is_generating_samples,
-                            onclick: move |_| {
-                                let selected_directory = {
-                                    state.read().snapshot_export_directory.clone()
-                                };
-                                let directory = selected_directory.or_else(|| {
-                                    FileDialog::new()
+                        div { class: "snapshot-actions",
+                            span { class: "action-label", "Snapshot" }
+                            button {
+                                class: "button secondary",
+                                disabled: snapshot.session.is_none() || snapshot.is_training_busy || snapshot.is_generating_samples,
+                                onclick: move |_| {
+                                    let selected_directory = {
+                                        state.read().snapshot_export_directory.clone()
+                                    };
+                                    let directory = selected_directory.or_else(|| {
+                                        FileDialog::new()
+                                            .set_title("Select snapshot export directory")
+                                            .pick_folder()
+                                    });
+                                    if let Some(directory) = directory {
+                                        state.write().export_checkpoint_to_directory(directory);
+                                    }
+                                },
+                                "Export"
+                            }
+                            button {
+                                class: "button secondary",
+                                disabled: snapshot.is_training_busy || snapshot.is_generating_samples,
+                                onclick: move |_| {
+                                    // Open the native file dialog before borrowing state. On macOS
+                                    // the dialog runs a nested event loop, so holding a Dioxus
+                                    // signal borrow here can conflict with background task wakeups.
+                                    if let Some(path) = FileDialog::new()
+                                        .set_title("Import sentence-gpt-rs-mlx checkpoint")
+                                        .add_filter("sentence-gpt-rs-mlx checkpoint", &["bin"])
+                                        .pick_file()
+                                    {
+                                        state.write().import_checkpoint_from_path(path);
+                                    }
+                                },
+                                "Import"
+                            }
+                            button {
+                                class: "button secondary",
+                                disabled: snapshot.is_training_busy || snapshot.is_generating_samples,
+                                onclick: move |_| {
+                                    // The native macOS dialog runs a nested event loop. Do not hold
+                                    // a Dioxus signal borrow while it is open, or the background
+                                    // `use_future` task can wake up and hit `AlreadyBorrowed`.
+                                    if let Some(directory) = FileDialog::new()
                                         .set_title("Select snapshot export directory")
                                         .pick_folder()
-                                });
-                                if let Some(directory) = directory {
-                                    state.write().export_checkpoint_to_directory(directory);
-                                }
-                            },
-                            "Export"
-                        }
-                        button {
-                            class: "button secondary",
-                            disabled: snapshot.is_training_busy || snapshot.is_generating_samples,
-                            onclick: move |_| {
-                                // Open the native file dialog before borrowing state. On macOS
-                                // the dialog runs a nested event loop, so holding a Dioxus
-                                // signal borrow here can conflict with background task wakeups.
-                                if let Some(path) = FileDialog::new()
-                                    .set_title("Import sentence-gpt-rs-mlx checkpoint")
-                                    .add_filter("sentence-gpt-rs-mlx checkpoint", &["bin"])
-                                    .pick_file()
-                                {
-                                    state.write().import_checkpoint_from_path(path);
-                                }
-                            },
-                            "Import"
-                        }
-                        button {
-                            class: "button secondary",
-                            disabled: snapshot.is_training_busy || snapshot.is_generating_samples,
-                            onclick: move |_| {
-                                // The native macOS dialog runs a nested event loop. Do not hold
-                                // a Dioxus signal borrow while it is open, or the background
-                                // `use_future` task can wake up and hit `AlreadyBorrowed`.
-                                if let Some(directory) = FileDialog::new()
-                                    .set_title("Select snapshot export directory")
-                                    .pick_folder()
-                                {
-                                    state.write().set_snapshot_export_directory(directory);
-                                }
-                            },
-                            "Set snapshot dir"
-                        }
-                        button {
-                            class: "button secondary",
-                            disabled: snapshot.is_training_busy || snapshot.is_generating_samples,
-                            onclick: move |_| state.write().reset_training(),
-                            "Reset"
+                                    {
+                                        state.write().set_snapshot_export_directory(directory);
+                                    }
+                                },
+                                "Set Directory"
+                            }
+                            if let Some(directory_label) = &snapshot_export_directory_label {
+                                span { class: "directory-label", "{directory_label}" }
+                            }
                         }
                     }
                 }
@@ -390,10 +392,7 @@ fn App() -> Element {
                         "Document trains {completed_document_train_count} / {total_document_train_count} | running avg {format_rate(document_trains_per_minute)}/min | elapsed {format_elapsed_training_time(snapshot.accumulated_training_millis)}"
                     }
                     div { class: "model-summary",
-                        "Train examples {training_example_count} | validation examples {validation_example_count} | validation batch {validation_batch_count} | train batch {selected_training_run_config.training_document_batch_size}"
-                    }
-                    div { class: "model-summary",
-                        "Snapshot export: {snapshot_export_directory_label}"
+                        "Train examples {training_example_count} | validation examples {validation_example_count} | train batch {selected_training_run_config.training_document_batch_size}"
                     }
                     if let Some(loss) = latest_loss {
                         {loss_metric_text("Train loss", loss, vocabulary_size)}
@@ -425,7 +424,7 @@ fn App() -> Element {
                         {config_number_input("Docs per batch", selected_training_run_config.training_document_batch_size, can_configure_training_run, TrainingRunConfigField::TrainingDocumentBatchSize, state)}
                         {config_number_input("Max total docs", selected_training_run_config.max_document_count, can_configure_training_run, TrainingRunConfigField::MaxDocumentCount, state)}
                         {config_number_input("Validation docs divisor", selected_training_run_config.validation_set_divisor, can_configure_training_run, TrainingRunConfigField::ValidationSetDivisor, state)}
-                        {config_number_input("Docs per validation eval", selected_training_run_config.validation_evaluation_document_count, can_configure_training_run, TrainingRunConfigField::ValidationEvaluationDocumentCount, state)}
+                        {config_number_input("Validation docs cap", selected_training_run_config.validation_set_max_document_count, can_configure_training_run, TrainingRunConfigField::ValidationSetMaxDocumentCount, state)}
                         {config_number_input("Context size", selected_training_run_config.context_window_size, can_configure_training_run, TrainingRunConfigField::ContextWindowSize, state)}
                         {config_number_input("Layers", selected_training_run_config.layer_count, can_configure_training_run, TrainingRunConfigField::LayerCount, state)}
                         {config_number_input("Attention heads", selected_training_run_config.attention_heads, can_configure_training_run, TrainingRunConfigField::AttentionHeads, state)}
@@ -786,8 +785,8 @@ impl AppState {
             TrainingRunConfigField::ValidationSetDivisor => {
                 training_run_config.validation_set_divisor = value;
             }
-            TrainingRunConfigField::ValidationEvaluationDocumentCount => {
-                training_run_config.validation_evaluation_document_count = value;
+            TrainingRunConfigField::ValidationSetMaxDocumentCount => {
+                training_run_config.validation_set_max_document_count = value;
             }
             TrainingRunConfigField::ContextWindowSize => {
                 training_run_config.context_window_size = value;

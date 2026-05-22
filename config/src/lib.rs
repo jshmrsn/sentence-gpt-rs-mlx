@@ -35,11 +35,11 @@ pub const TRAINING_FRAME_BUDGET: Duration = Duration::from_millis(500);
 pub const MAX_TRAINING_STEP_COUNT: usize = 1_000_000;
 pub const RUNNING_MEAN_LOSS_RECENT_WEIGHT: f64 = 0.35;
 pub const MLX_DEFAULT_TRAINING_RUN_CONFIG: TrainingRunConfig = TrainingRunConfig {
-    validation_step_interval: 25,
+    validation_step_interval: 30,
     training_document_batch_size: 32,
     max_document_count: 5_000_000,
     validation_set_divisor: 50,
-    validation_evaluation_document_count: 12,
+    validation_set_max_document_count: 50,
     context_window_size: 128,
     layer_count: 6,
     attention_heads: 8,
@@ -52,7 +52,7 @@ pub const CPU_DEFAULT_TRAINING_RUN_CONFIG: TrainingRunConfig = TrainingRunConfig
     training_document_batch_size: 8,
     max_document_count: 100,
     validation_set_divisor: 20,
-    validation_evaluation_document_count: 4,
+    validation_set_max_document_count: 5,
     context_window_size: 32,
     layer_count: 2,
     attention_heads: 4,
@@ -189,17 +189,6 @@ impl TrainingSession {
         }
     }
 
-    pub fn validation_evaluation_document_count(&self) -> usize {
-        match self {
-            TrainingSession::Mlx(session) => session
-                .validation_evaluation_document_count
-                .min(session.validation_documents.len()),
-            TrainingSession::Cpu(session) => session
-                .validation_evaluation_document_count
-                .min(session.validation_documents.len()),
-        }
-    }
-
     pub fn tokenizer(&self) -> &CharacterTokenizer {
         match self {
             TrainingSession::Mlx(session) => &session.trained_microgpt.tokenizer,
@@ -307,11 +296,8 @@ pub fn create_training_session(
     optimizer_config: AdamOptimizerConfig,
     training_run_config: TrainingRunConfig,
 ) -> Result<TrainingSession, String> {
-    let shuffled_stories = shuffled_by(&input_stories, rng);
-    let validation_story_count =
-        shuffled_stories.len() / training_run_config.validation_set_divisor;
-    let validation_documents = flatten_story_sentences(&shuffled_stories[..validation_story_count]);
-    let documents = flatten_story_sentences(&shuffled_stories[validation_story_count..]);
+    let (documents, validation_documents) =
+        split_fixed_validation_documents(input_stories, training_run_config, rng);
 
     match backend {
         Backend::Mlx => create_mlx_microgpt_training_session_from_splits(
@@ -319,7 +305,6 @@ pub fn create_training_session(
             validation_documents,
             rng,
             MAX_TRAINING_STEP_COUNT,
-            training_run_config.validation_evaluation_document_count,
             transformer_config,
             optimizer_config,
         )
@@ -332,7 +317,6 @@ pub fn create_training_session(
                 validation_documents,
                 rng,
                 MAX_TRAINING_STEP_COUNT,
-                training_run_config.validation_evaluation_document_count,
                 transformer_config,
                 optimizer_config,
             );
@@ -580,6 +564,19 @@ fn flatten_story_sentences(stories: &[TrainingStoryDocuments]) -> Vec<String> {
         .collect()
 }
 
+fn split_fixed_validation_documents(
+    stories: Vec<TrainingStoryDocuments>,
+    training_run_config: TrainingRunConfig,
+    rng: &mut ChaCha8Rng,
+) -> (Vec<String>, Vec<String>) {
+    let documents = flatten_story_sentences(&stories);
+    let validation_document_count = (documents.len() / training_run_config.validation_set_divisor)
+        .min(training_run_config.validation_set_max_document_count);
+    let validation_documents = documents[..validation_document_count].to_vec();
+    let training_documents = shuffled_by(&documents[validation_document_count..], rng);
+    (training_documents, validation_documents)
+}
+
 fn stories_to_sentence_groups(
     stories: Vec<Story>,
     training_run_config: TrainingRunConfig,
@@ -643,8 +640,9 @@ fn split_sentences_keep_punctuation(story: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        create_training_session, get_optimizer_config, split_sentences_keep_punctuation,
-        stories_to_sentence_groups, Backend, OptimizerFeatureConfig, Story, TrainingRunConfig,
+        create_training_session, get_optimizer_config, split_fixed_validation_documents,
+        split_sentences_keep_punctuation, stories_to_sentence_groups, Backend,
+        OptimizerFeatureConfig, Story, TrainingRunConfig, TrainingStoryDocuments,
         TransformerConfig, TransformerFeatureConfig,
     };
     use rand_chacha::rand_core::SeedableRng;
@@ -665,7 +663,7 @@ mod tests {
             training_document_batch_size: 2,
             max_document_count: 10,
             validation_set_divisor: 2,
-            validation_evaluation_document_count: 2,
+            validation_set_max_document_count: 20,
             context_window_size: 64,
             layer_count: 1,
             attention_heads: 2,
@@ -730,13 +728,66 @@ mod tests {
     }
 
     #[test]
+    fn validation_split_is_fixed_and_capped() {
+        let training_run_config = TrainingRunConfig {
+            validation_step_interval: 25,
+            training_document_batch_size: 2,
+            max_document_count: 10,
+            validation_set_divisor: 2,
+            validation_set_max_document_count: 2,
+            context_window_size: 64,
+            layer_count: 1,
+            attention_heads: 2,
+            embedding_size: 8,
+            transformer_features: TransformerFeatureConfig::optimized_defaults(),
+            optimizer_features: OptimizerFeatureConfig::optimized_defaults(),
+        };
+        let stories = vec![
+            TrainingStoryDocuments {
+                sentences: vec!["First fixed validation sentence.".into()],
+            },
+            TrainingStoryDocuments {
+                sentences: vec!["Second fixed validation sentence.".into()],
+            },
+            TrainingStoryDocuments {
+                sentences: vec!["Third candidate validation sentence.".into()],
+            },
+            TrainingStoryDocuments {
+                sentences: vec!["Fourth training sentence.".into()],
+            },
+            TrainingStoryDocuments {
+                sentences: vec!["Fifth training sentence.".into()],
+            },
+            TrainingStoryDocuments {
+                sentences: vec!["Sixth training sentence.".into()],
+            },
+        ];
+        let mut first_rng = ChaCha8Rng::seed_from_u64(1);
+        let mut second_rng = ChaCha8Rng::seed_from_u64(99);
+
+        let (_, first_validation_documents) =
+            split_fixed_validation_documents(stories.clone(), training_run_config, &mut first_rng);
+        let (_, second_validation_documents) =
+            split_fixed_validation_documents(stories, training_run_config, &mut second_rng);
+
+        assert_eq!(
+            first_validation_documents,
+            vec![
+                "First fixed validation sentence.",
+                "Second fixed validation sentence."
+            ]
+        );
+        assert_eq!(second_validation_documents, first_validation_documents);
+    }
+
+    #[test]
     fn duplicate_sentences_are_filtered_globally() {
         let training_run_config = TrainingRunConfig {
             validation_step_interval: 25,
             training_document_batch_size: 2,
             max_document_count: 10,
             validation_set_divisor: 2,
-            validation_evaluation_document_count: 2,
+            validation_set_max_document_count: 20,
             context_window_size: 64,
             layer_count: 1,
             attention_heads: 2,

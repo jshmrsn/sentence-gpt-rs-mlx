@@ -27,7 +27,7 @@ use crate::microgpt::{
     apply_sampling_constraints, document_prediction_count, normalize_training_document,
     random_gaussian, scheduled_learning_rate, shuffled_by, training_batch_token_windows,
     AdamOptimizerConfig, CharacterTokenizer, MicrogptTrainingProgress, TrainingTokenWindow,
-    TransformerConfig,
+    TransformerConfig, ValidationSplitConfig,
 };
 // `ops` contains tensor operations such as softmax, reductions, stacking, and
 // elementwise math. `transforms` contains autodiff transforms such as
@@ -358,7 +358,6 @@ pub struct MlxMicrogptTrainingSession {
     pub documents: Vec<String>,
     pub validation_documents: Vec<String>,
     pub training_step_count: usize,
-    pub validation_evaluation_document_count: usize,
     pub optimizer_config: AdamOptimizerConfig,
     pub optimizer_state: MlxAdamOptimizerState,
     pub completed_step_count: usize,
@@ -405,7 +404,6 @@ pub fn export_training_session_checkpoint(
         documents: session.documents.clone(),
         validation_documents: session.validation_documents.clone(),
         training_step_count: session.training_step_count,
-        validation_evaluation_document_count: session.validation_evaluation_document_count,
         optimizer_config: session.optimizer_config.clone(),
         completed_step_count: session.completed_step_count,
         latest_loss: session.latest_loss,
@@ -451,7 +449,6 @@ pub fn import_training_session_checkpoint(
         documents: checkpoint.documents.clone(),
         validation_documents: checkpoint.validation_documents.clone(),
         training_step_count: checkpoint.training_step_count,
-        validation_evaluation_document_count: checkpoint.validation_evaluation_document_count,
         optimizer_config: checkpoint.optimizer_config.clone(),
         optimizer_state: MlxAdamOptimizerState {
             first_moment_estimates,
@@ -522,8 +519,7 @@ pub fn create_mlx_microgpt_training_session(
     input_documents: Vec<String>,
     random_number_generator: &mut impl Rng,
     training_step_count: usize,
-    validation_set_divisor: usize,
-    validation_evaluation_document_count: usize,
+    validation_config: ValidationSplitConfig,
     transformer_config: TransformerConfig,
     optimizer_config: AdamOptimizerConfig,
 ) -> MlxMicrogptTrainingSession {
@@ -535,17 +531,19 @@ pub fn create_mlx_microgpt_training_session(
         .map(|document| normalize_training_document(&document))
         .filter(|document| !document.is_empty())
         .collect();
-    let shuffled_documents = shuffled_by(&trimmed_documents, random_number_generator);
-    let validation_document_count = shuffled_documents.len() / validation_set_divisor;
-    let validation_documents = shuffled_documents[..validation_document_count].to_vec();
-    let documents = shuffled_documents[validation_document_count..].to_vec();
+    let validation_document_count = (trimmed_documents.len() / validation_config.set_divisor)
+        .min(validation_config.set_max_document_count);
+    let validation_documents = trimmed_documents[..validation_document_count].to_vec();
+    let documents = shuffled_by(
+        &trimmed_documents[validation_document_count..],
+        random_number_generator,
+    );
 
     create_mlx_microgpt_training_session_from_splits(
         documents,
         validation_documents,
         random_number_generator,
         training_step_count,
-        validation_evaluation_document_count,
         transformer_config,
         optimizer_config,
     )
@@ -556,7 +554,6 @@ pub fn create_mlx_microgpt_training_session_from_splits(
     input_validation_documents: Vec<String>,
     random_number_generator: &mut impl Rng,
     training_step_count: usize,
-    validation_evaluation_document_count: usize,
     transformer_config: TransformerConfig,
     optimizer_config: AdamOptimizerConfig,
 ) -> MlxMicrogptTrainingSession {
@@ -616,7 +613,6 @@ pub fn create_mlx_microgpt_training_session_from_splits(
         documents,
         validation_documents,
         training_step_count,
-        validation_evaluation_document_count,
         optimizer_config,
         optimizer_state: MlxAdamOptimizerState {
             first_moment_estimates: zeros,
@@ -777,23 +773,15 @@ pub fn calculate_training_loss_baseline(
 
 pub fn calculate_validation_loss(
     session: &MlxMicrogptTrainingSession,
-    completed_step_count: usize,
-    validation_step_interval: usize,
+    _completed_step_count: usize,
+    _validation_step_interval: usize,
 ) -> MlxResult<Option<f64>> {
     if session.validation_documents.is_empty() {
         return Ok(None);
     }
-    let validation_document_count = session
-        .validation_evaluation_document_count
-        .min(session.validation_documents.len());
-    let validation_batch_index = completed_step_count / validation_step_interval;
     let mut weighted_loss_sum = 0.0;
     let mut token_count = 0usize;
-    for validation_offset in 0..validation_document_count {
-        let validation_index = (validation_batch_index * validation_document_count
-            + validation_offset)
-            % session.validation_documents.len();
-        let document = &session.validation_documents[validation_index];
+    for document in &session.validation_documents {
         let document_token_count = document_prediction_count(
             &session.trained_microgpt.tokenizer,
             document,
@@ -2000,7 +1988,7 @@ mod tests {
             training_document_batch_size: 1,
             max_document_count: 4,
             validation_set_divisor: 4,
-            validation_evaluation_document_count: 1,
+            validation_set_max_document_count: 20,
             context_window_size: 12,
             layer_count: 1,
             attention_heads: 2,
@@ -2029,8 +2017,10 @@ mod tests {
             vec!["anna".into(), "anne".into(), "emma".into(), "ella".into()],
             &mut rng,
             2,
-            4,
-            1,
+            ValidationSplitConfig {
+                set_divisor: 4,
+                set_max_document_count: 20,
+            },
             config,
             optimizer,
         )
@@ -2077,8 +2067,10 @@ mod tests {
             ],
             &mut rng,
             1,
-            4,
-            1,
+            ValidationSplitConfig {
+                set_divisor: 4,
+                set_max_document_count: 20,
+            },
             config,
             optimizer,
         )
@@ -2110,8 +2102,10 @@ mod tests {
             vec!["anna".into(), "anne".into(), "emma".into(), "ella".into()],
             &mut rng,
             3,
-            4,
-            1,
+            ValidationSplitConfig {
+                set_divisor: 4,
+                set_max_document_count: 20,
+            },
             config,
             optimizer,
         )

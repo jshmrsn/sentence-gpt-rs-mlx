@@ -47,9 +47,33 @@ button, input {
 
 .actions {
     display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 8px;
+}
+
+.primary-actions,
+.snapshot-actions {
+    display: flex;
     flex-wrap: wrap;
+    align-items: center;
     gap: 8px;
     justify-content: flex-end;
+}
+
+.action-label {
+    color: #53645c;
+    font-size: 13px;
+    font-weight: 700;
+}
+
+.directory-label {
+    color: #53645c;
+    font-size: 12px;
+    max-width: 360px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
 .button {
@@ -281,8 +305,13 @@ button, input {
     }
 
     .actions {
-        justify-content: flex-start;
+        align-items: flex-start;
         margin-top: 12px;
+    }
+
+    .primary-actions,
+    .snapshot-actions {
+        justify-content: flex-start;
     }
 
     .status-grid, .config-grid, .samples, .document-list {
