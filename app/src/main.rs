@@ -12,9 +12,9 @@ use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use rfd::FileDialog;
 use sentence_gpt_rs_mlx_config::{
-    create_training_session, format_compact, format_count, format_learning_rate, format_loss,
-    format_percent, format_percent_style, format_perplexity, get_optimizer_config,
-    load_input_documents, next_validation_step_after, running_mean_loss, running_mean_loss_values,
+    create_training_session, format_count, format_learning_rate, format_loss, format_percent,
+    format_percent_style, format_perplexity, get_optimizer_config, load_input_documents,
+    next_validation_step_after, running_mean_loss, running_mean_loss_values,
     train_session_until_budget as train_shared_session_until_budget, Backend, TrainedSnapshot,
     TrainingSession,
 };
@@ -22,13 +22,9 @@ use sentence_gpt_rs_mlx_lib::checkpoint::{
     load_checkpoint_from_path, save_checkpoint_to_path, TrainingRunConfig,
 };
 use sentence_gpt_rs_mlx_lib::microgpt::{
-    generate_samples as generate_cpu_samples, Matrix, MicrogptTrainingProgress, TrainedMicrogpt,
-    TransformerConfig, Vector,
+    generate_samples as generate_cpu_samples, MicrogptTrainingProgress, TransformerConfig,
 };
-use sentence_gpt_rs_mlx_lib::mlx_microgpt::{
-    generate_samples as generate_mlx_samples, matrix_heatmaps as build_mlx_matrix_heatmaps,
-    MlxMatrixHeatmap,
-};
+use sentence_gpt_rs_mlx_lib::mlx_microgpt::generate_samples as generate_mlx_samples;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -81,17 +77,6 @@ impl DocumentBrowserDataset {
 }
 
 #[derive(Clone)]
-struct ModelHeatmap {
-    label: String,
-    rows: usize,
-    columns: usize,
-    values: Vec<f32>,
-    min: f32,
-    max: f32,
-    mean_abs: f32,
-}
-
-#[derive(Clone)]
 struct AppState {
     backend: Backend,
     // Applied to the current session and checkpoints. UI edits go into the
@@ -100,11 +85,6 @@ struct AppState {
     mlx_training_run_config: TrainingRunConfig,
     cpu_training_run_config: TrainingRunConfig,
     session: Option<TrainingSession>,
-    // Full parameter heatmaps require copying model values to the UI and drawing
-    // many small cells. That is excellent for inspection but expensive during
-    // training, so it is opt-in.
-    model_heatmaps: Vec<ModelHeatmap>,
-    visualize_network_values: bool,
     is_training_active: bool,
     is_training_busy: bool,
     manual_training_chunk_requested: bool,
@@ -131,9 +111,6 @@ struct AppState {
 
 struct TrainingChunkResult {
     session: TrainingSession,
-    // Empty unless `visualize_network_values` was enabled when the worker began.
-    model_heatmaps: Vec<ModelHeatmap>,
-    visualized_network_values: bool,
     next_validation_step: usize,
     elapsed_millis: u128,
 }
@@ -199,7 +176,7 @@ fn App() -> Element {
                 current.take_training_work()
             };
 
-            if let Some((session, next_validation_step, visualize_network_values)) = training_work {
+            if let Some((session, next_validation_step)) = training_work {
                 let training_run_config = {
                     let current = state.read();
                     current.training_run_config
@@ -207,12 +184,7 @@ fn App() -> Element {
                 // `spawn_blocking` keeps the Dioxus/Tokio UI runtime from being
                 // monopolized by MLX or CPU matrix math.
                 match tokio::task::spawn_blocking(move || {
-                    train_session_until_budget(
-                        session,
-                        next_validation_step,
-                        visualize_network_values,
-                        training_run_config,
-                    )
+                    train_session_until_budget(session, next_validation_step, training_run_config)
                 })
                 .await
                 {
@@ -580,23 +552,6 @@ fn App() -> Element {
                     }
                 }
 
-                // section { class: "panel",
-                //     div { class: "model-header",
-                //         h2 { class: "section-title", "Model values" }
-                //         button {
-                //             class: "button secondary",
-                //             disabled: snapshot.session.is_none(),
-                //             onclick: move |_| state.write().toggle_network_value_visualization(),
-                //             if snapshot.visualize_network_values { "Hide values" } else { "Show values" }
-                //         }
-                //     }
-                //     {model_visualization(
-                //         snapshot.session.as_ref(),
-                //         snapshot.visualize_network_values,
-                //         &snapshot.model_heatmaps,
-                //         snapshot.completed_step_count(),
-                //     )}
-                // }
             }
         }
     }
@@ -662,8 +617,6 @@ impl AppState {
                                 mlx_training_run_config,
                                 cpu_training_run_config,
                                 session: Some(session),
-                                model_heatmaps: Vec::new(),
-                                visualize_network_values: false,
                                 is_training_active: false,
                                 is_training_busy: false,
                                 manual_training_chunk_requested: false,
@@ -726,8 +679,6 @@ impl AppState {
             mlx_training_run_config,
             cpu_training_run_config,
             session: None,
-            model_heatmaps: Vec::new(),
-            visualize_network_values: false,
             is_training_active: false,
             is_training_busy: false,
             manual_training_chunk_requested: false,
@@ -859,7 +810,6 @@ impl AppState {
             self.mlx_training_run_config,
             self.cpu_training_run_config,
         );
-        next.visualize_network_values = self.visualize_network_values;
         next.prefix = self.prefix.clone();
         next.temperature = self.temperature;
         next.snapshot_export_directory = self.snapshot_export_directory.clone();
@@ -1042,11 +992,6 @@ impl AppState {
                 self.initialization_error = None;
                 self.checkpoint_message =
                     Some(format!("Imported checkpoint from {}", path.display()));
-                self.model_heatmaps = if self.visualize_network_values {
-                    build_model_heatmaps(&session)
-                } else {
-                    Vec::new()
-                };
                 self.session = Some(session);
                 self.refresh_cached_browser_search_matches();
             }
@@ -1064,21 +1009,6 @@ impl AppState {
             "Automatic validation snapshots will export to {}",
             directory.display()
         ));
-    }
-
-    fn toggle_network_value_visualization(&mut self) {
-        // Turning visualization on builds one snapshot immediately. Future
-        // training chunks will refresh it only while the toggle stays on.
-        self.visualize_network_values = !self.visualize_network_values;
-        if self.visualize_network_values {
-            self.model_heatmaps = self
-                .session
-                .as_ref()
-                .map(build_model_heatmaps)
-                .unwrap_or_default();
-        } else {
-            self.model_heatmaps.clear();
-        }
     }
 
     fn toggle_training(&mut self) {
@@ -1100,7 +1030,7 @@ impl AppState {
         self.manual_training_chunk_requested = true;
     }
 
-    fn take_training_work(&mut self) -> Option<(TrainingSession, usize, bool)> {
+    fn take_training_work(&mut self) -> Option<(TrainingSession, usize)> {
         // Clone the session for the worker. The UI keeps ownership of state and
         // replaces it only when the worker returns a complete updated session.
         if self.is_training_busy {
@@ -1118,17 +1048,10 @@ impl AppState {
 
         self.is_training_busy = true;
         self.manual_training_chunk_requested = false;
-        Some((
-            session.clone(),
-            self.next_validation_step,
-            self.visualize_network_values,
-        ))
+        Some((session.clone(), self.next_validation_step))
     }
 
     fn apply_training_chunk(&mut self, chunk_result: TrainingChunkResult) {
-        // If the user toggled visualization while a worker was running, honor the
-        // latest UI state. That avoids drawing stale heatmaps after values were
-        // hidden, and can build a fresh snapshot if values were just enabled.
         let is_complete = chunk_result.session.is_complete();
         let completed_validation_step =
             chunk_result.next_validation_step != self.next_validation_step;
@@ -1136,15 +1059,6 @@ impl AppState {
         self.next_validation_step = chunk_result.next_validation_step;
         self.is_training_active = !is_complete && self.is_training_active;
         self.is_training_busy = false;
-        if self.visualize_network_values {
-            self.model_heatmaps = if chunk_result.visualized_network_values {
-                chunk_result.model_heatmaps
-            } else {
-                build_model_heatmaps(&chunk_result.session)
-            };
-        } else {
-            self.model_heatmaps.clear();
-        }
         if completed_validation_step {
             self.export_validation_snapshot(&chunk_result.session);
         }
@@ -1270,7 +1184,6 @@ impl AppState {
 fn train_session_until_budget(
     session: TrainingSession,
     next_validation_step: usize,
-    visualize_network_values: bool,
     training_run_config: TrainingRunConfig,
 ) -> Result<TrainingChunkResult, String> {
     // One background chunk trains until the frame budget expires. The app then
@@ -1279,15 +1192,8 @@ fn train_session_until_budget(
     let training_result =
         train_shared_session_until_budget(session, next_validation_step, training_run_config)?;
 
-    let model_heatmaps = if visualize_network_values {
-        build_model_heatmaps(&training_result.session)
-    } else {
-        Vec::new()
-    };
     Ok(TrainingChunkResult {
         session: training_result.session,
-        model_heatmaps,
-        visualized_network_values: visualize_network_values,
         next_validation_step: training_result.next_validation_step,
         elapsed_millis: training_result.elapsed_millis,
     })
@@ -1528,243 +1434,6 @@ fn polyline_points(
         })
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-fn model_visualization(
-    session: Option<&TrainingSession>,
-    visualize_network_values: bool,
-    heatmaps: &[ModelHeatmap],
-    completed_step_count: usize,
-) -> Element {
-    // Even when heatmaps are hidden, keep the compact architecture summary
-    // visible so learners can relate loss curves to model size.
-    let Some(session) = session else {
-        return rsx! { div { class: "model-summary", "Initializing model" } };
-    };
-
-    let config = session.config();
-    let tokenizer = session.tokenizer();
-    let backend = session.backend().label();
-
-    rsx! {
-        div {
-            div { class: "model-summary",
-                "{backend} | Step {completed_step_count} | layers {config.layer_count} | embedding {config.embedding_size} | heads {config.attention_head_count} x {config.attention_head_size} | context {config.context_window_size} | vocab {tokenizer.vocabulary_size()}"
-            }
-            if visualize_network_values {
-                h3 { class: "section-title", "Parameter arrays" }
-                div { class: "heatmap-groups",
-                    for heatmap in heatmaps.iter() {
-                        {matrix_heatmap(heatmap, None)}
-                    }
-                }
-            } else {
-                div { class: "model-summary", "Parameter heatmaps are hidden to reduce drawing and training overhead." }
-            }
-        }
-    }
-}
-
-fn build_model_heatmaps(session: &TrainingSession) -> Vec<ModelHeatmap> {
-    match session {
-        TrainingSession::Mlx(session) => build_mlx_matrix_heatmaps(&session.trained_microgpt.model)
-            .into_iter()
-            .map(ModelHeatmap::from)
-            .collect(),
-        TrainingSession::Cpu(session) => build_cpu_model_heatmaps(&session.trained_microgpt),
-    }
-}
-
-fn build_cpu_model_heatmaps(trained_microgpt: &TrainedMicrogpt) -> Vec<ModelHeatmap> {
-    let model = &trained_microgpt.model;
-    let mut heatmaps = vec![
-        matrix_heatmap_data("Token embedding", &model.token_embedding),
-        matrix_heatmap_data("Position embedding", &model.position_embedding),
-        matrix_heatmap_data("Language head", &model.language_model_head),
-        vector_heatmap_data("Language head bias", &model.language_model_head_biases),
-        vector_heatmap_data("Final norm gain", &model.final_norm_gain),
-    ];
-    for (layer_index, layer) in model.layers.iter().enumerate() {
-        let prefix = format!("Layer {}", layer_index + 1);
-        heatmaps.push(vector_heatmap_data(
-            &format!("{prefix} attention norm gain"),
-            &layer.attention_norm_gain,
-        ));
-        heatmaps.push(matrix_heatmap_data(
-            &format!("{prefix} Q"),
-            &layer.attention.query_weights,
-        ));
-        heatmaps.push(vector_heatmap_data(
-            &format!("{prefix} Q bias"),
-            &layer.attention.query_biases,
-        ));
-        heatmaps.push(matrix_heatmap_data(
-            &format!("{prefix} K"),
-            &layer.attention.key_weights,
-        ));
-        heatmaps.push(vector_heatmap_data(
-            &format!("{prefix} K bias"),
-            &layer.attention.key_biases,
-        ));
-        heatmaps.push(matrix_heatmap_data(
-            &format!("{prefix} V"),
-            &layer.attention.value_weights,
-        ));
-        heatmaps.push(vector_heatmap_data(
-            &format!("{prefix} V bias"),
-            &layer.attention.value_biases,
-        ));
-        heatmaps.push(matrix_heatmap_data(
-            &format!("{prefix} Attn out"),
-            &layer.attention.output_projection_weights,
-        ));
-        heatmaps.push(vector_heatmap_data(
-            &format!("{prefix} Attn out bias"),
-            &layer.attention.output_projection_biases,
-        ));
-        heatmaps.push(vector_heatmap_data(
-            &format!("{prefix} feed-forward norm gain"),
-            &layer.feed_forward_norm_gain,
-        ));
-        heatmaps.push(matrix_heatmap_data(
-            &format!("{prefix} FF expand"),
-            &layer.feed_forward.expansion_weights,
-        ));
-        heatmaps.push(vector_heatmap_data(
-            &format!("{prefix} FF expand bias"),
-            &layer.feed_forward.expansion_biases,
-        ));
-        heatmaps.push(matrix_heatmap_data(
-            &format!("{prefix} FF gate"),
-            &layer.feed_forward.gate_weights,
-        ));
-        heatmaps.push(vector_heatmap_data(
-            &format!("{prefix} FF gate bias"),
-            &layer.feed_forward.gate_biases,
-        ));
-        heatmaps.push(matrix_heatmap_data(
-            &format!("{prefix} FF project"),
-            &layer.feed_forward.projection_weights,
-        ));
-        heatmaps.push(vector_heatmap_data(
-            &format!("{prefix} FF project bias"),
-            &layer.feed_forward.projection_biases,
-        ));
-    }
-    heatmaps
-}
-
-fn matrix_heatmap_data(label: &str, matrix: &Matrix) -> ModelHeatmap {
-    let rows = matrix.len();
-    let columns = matrix.first().map(Vec::len).unwrap_or(0);
-    let values = matrix
-        .iter()
-        .flat_map(|row| row.iter().map(|value| value.data() as f32))
-        .collect::<Vec<_>>();
-    let min = values.iter().copied().fold(f32::INFINITY, f32::min);
-    let max = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let mean_abs = values.iter().map(|value| value.abs()).sum::<f32>() / values.len().max(1) as f32;
-    ModelHeatmap {
-        label: label.into(),
-        rows,
-        columns,
-        values,
-        min,
-        max,
-        mean_abs,
-    }
-}
-
-fn vector_heatmap_data(label: &str, vector: &Vector) -> ModelHeatmap {
-    let values = vector
-        .iter()
-        .map(|value| value.data() as f32)
-        .collect::<Vec<_>>();
-    let min = values.iter().copied().fold(f32::INFINITY, f32::min);
-    let max = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let mean_abs = values.iter().map(|value| value.abs()).sum::<f32>() / values.len().max(1) as f32;
-    ModelHeatmap {
-        label: label.into(),
-        rows: 1,
-        columns: vector.len(),
-        values,
-        min,
-        max,
-        mean_abs,
-    }
-}
-
-impl From<MlxMatrixHeatmap> for ModelHeatmap {
-    fn from(heatmap: MlxMatrixHeatmap) -> Self {
-        Self {
-            label: heatmap.label,
-            rows: heatmap.rows,
-            columns: heatmap.columns,
-            values: heatmap.values,
-            min: heatmap.min,
-            max: heatmap.max,
-            mean_abs: heatmap.mean_abs,
-        }
-    }
-}
-
-fn matrix_heatmap(matrix: &ModelHeatmap, scale: Option<f64>) -> Element {
-    let label = &matrix.label;
-    let rows = matrix.rows;
-    let columns = matrix.columns;
-    if rows == 0 || columns == 0 {
-        return rsx! { div { class: "heatmap-card", "{label}: empty" } };
-    }
-
-    let scale = scale.unwrap_or_else(|| matrix_max_abs(matrix).max(0.001));
-    let stats = matrix_stats(matrix);
-    let grid_style = format!("grid-template-columns: repeat({columns}, minmax(1px, 1fr));");
-
-    rsx! {
-        div { class: "heatmap-card",
-            div { class: "heatmap-label",
-                span { "{label} {rows}x{columns}" }
-                span { "{stats}" }
-            }
-            div { class: "heatmap", style: "{grid_style}",
-                for value in matrix.values.iter() {
-                    div { class: "cell", style: "{weight_style(*value, scale)}" }
-                }
-            }
-        }
-    }
-}
-
-fn matrix_max_abs(matrix: &ModelHeatmap) -> f64 {
-    matrix
-        .values
-        .iter()
-        .map(|value| value.abs() as f64)
-        .fold(0.0, f64::max)
-}
-
-fn matrix_stats(matrix: &ModelHeatmap) -> String {
-    if matrix.values.is_empty() {
-        return "empty".into();
-    }
-    format!(
-        "min {} max {} mean |w| {}",
-        format_compact(matrix.min as f64),
-        format_compact(matrix.max as f64),
-        format_compact(matrix.mean_abs as f64)
-    )
-}
-
-fn weight_style(value: f32, scale: f64) -> String {
-    let value = value as f64;
-    let strength = (value.abs() / scale).min(1.0);
-    let alpha = 0.12 + strength * 0.88;
-    let color = if value >= 0.0 {
-        format!("rgba(25, 118, 210, {alpha:.3})")
-    } else {
-        format!("rgba(198, 40, 40, {alpha:.3})")
-    };
-    format!("background: {color};")
 }
 
 fn format_rate(value: f64) -> String {

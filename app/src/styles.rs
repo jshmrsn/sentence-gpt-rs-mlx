@@ -257,39 +257,6 @@ button, input {
     margin-bottom: 12px;
 }
 
-.heatmap-groups {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 12px;
-}
-
-.heatmap-card {
-    min-width: 0;
-}
-
-.heatmap-label {
-    display: flex;
-    justify-content: space-between;
-    gap: 8px;
-    color: #314238;
-    font-size: 12px;
-    margin-bottom: 4px;
-}
-
-.heatmap {
-    display: grid;
-    height: 120px;
-    border: 1px solid #d3ded7;
-    border-radius: 6px;
-    overflow: hidden;
-    background: #f7faf8;
-}
-
-.cell {
-    min-width: 1px;
-    min-height: 1px;
-}
-
 .layer {
     margin-top: 16px;
 }
@@ -304,7 +271,7 @@ button, input {
         margin-top: 12px;
     }
 
-    .status-grid, .config-grid, .heatmap-groups, .samples, .document-list {
+    .status-grid, .config-grid, .samples, .document-list {
         grid-template-columns: 1fr;
     }
 

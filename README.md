@@ -36,7 +36,6 @@ Current architecture features include:
 - GUI allows for most similar training example for a selected generated sample
 
 Currently, the GUI frontend is more feature-rich and tested than the TUI frontend.
-There are some model visualization features in the GUI, but they are not well thought through yet.
 The project started as a Kotlin port of Andrej Karpathy's microgpt, but then I ported a second time to Rust so I could leverage MLX via mlx-rs.
 https://github.com/oxiglade/mlx-rs
 

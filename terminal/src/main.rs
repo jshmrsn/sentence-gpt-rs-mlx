@@ -1,9 +1,9 @@
 // Ratatui terminal app for the same training loop as the Dioxus UI.
 //
 // This is intentionally useful over SSH or in a plain terminal: it shows loss,
-// samples, backend choice, and optional parameter summaries without needing a
-// desktop renderer. The same production rule applies here: training runs on a
-// worker thread so input handling and rendering remain responsive.
+// samples, and backend choice without needing a desktop renderer. The same
+// production rule applies here: training runs on a worker thread so input
+// handling and rendering remain responsive.
 
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
@@ -17,26 +17,21 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Gauge, List, ListItem, Paragraph, Sparkline, Wrap},
+    widgets::{Block, Borders, Gauge, List, ListItem, Paragraph, Sparkline},
     Frame, Terminal,
 };
 use sentence_gpt_rs_mlx_config::{
-    create_training_session, format_compact, format_count, format_learning_rate, format_loss,
-    format_perplexity, get_optimizer_config, load_input_documents, next_validation_step_after,
-    running_mean_loss, train_session_until_budget as train_shared_session_until_budget, Backend,
-    TrainingSession,
+    create_training_session, format_count, format_learning_rate, format_loss, format_perplexity,
+    get_optimizer_config, load_input_documents, next_validation_step_after, running_mean_loss,
+    train_session_until_budget as train_shared_session_until_budget, Backend, TrainingSession,
 };
 use sentence_gpt_rs_mlx_lib::checkpoint::{
     load_checkpoint_from_path, save_checkpoint_to_path, TrainingRunConfig,
 };
 use sentence_gpt_rs_mlx_lib::microgpt::{
-    generate_samples as generate_cpu_samples, Matrix, MicrogptTrainingProgress, TrainedMicrogpt,
-    TransformerConfig, Vector,
+    generate_samples as generate_cpu_samples, MicrogptTrainingProgress, TransformerConfig,
 };
-use sentence_gpt_rs_mlx_lib::mlx_microgpt::{
-    generate_samples as generate_mlx_samples, matrix_summaries as build_mlx_matrix_summaries,
-    MlxMatrixSummary,
-};
+use sentence_gpt_rs_mlx_lib::mlx_microgpt::generate_samples as generate_mlx_samples;
 use std::{
     io::{self, Stdout},
     path::PathBuf,
@@ -45,20 +40,8 @@ use std::{
     time::Duration,
 };
 
-#[derive(Clone)]
-struct MatrixSummary {
-    label: String,
-    rows: usize,
-    columns: usize,
-    min: f32,
-    max: f32,
-    mean_abs: f32,
-}
-
 struct TrainingChunkResult {
     session: TrainingSession,
-    matrix_summaries: Vec<MatrixSummary>,
-    visualized_network_values: bool,
     next_validation_step: usize,
     elapsed_millis: u128,
 }
@@ -66,11 +49,6 @@ struct TrainingChunkResult {
 struct App {
     session: TrainingSession,
     training_run_config: TrainingRunConfig,
-    // Matrix summaries are hidden by default because collecting them requires
-    // reading parameter tensors back for display. Press `v` when you want to
-    // inspect value ranges.
-    matrix_summaries: Vec<MatrixSummary>,
-    visualize_network_values: bool,
     is_training_active: bool,
     is_training_busy: bool,
     generation_requested: bool,
@@ -157,8 +135,6 @@ impl App {
         Ok(Self {
             session,
             training_run_config,
-            matrix_summaries: Vec::new(),
-            visualize_network_values: false,
             is_training_active: false,
             is_training_busy: false,
             generation_requested: false,
@@ -191,10 +167,6 @@ impl App {
             }
             KeyCode::Char('b') => {
                 self.toggle_backend();
-                false
-            }
-            KeyCode::Char('v') => {
-                self.toggle_network_value_visualization();
                 false
             }
             KeyCode::F(5) => {
@@ -289,27 +261,9 @@ impl App {
                 self.is_training_active = false;
                 self.generation_requested = false;
                 self.training_receiver = None;
-                self.matrix_summaries = if self.visualize_network_values {
-                    build_matrix_summaries(&self.session)
-                } else {
-                    Vec::new()
-                };
                 self.status_message = format!("Imported {}", path.display());
             }
             Err(error) => self.status_message = format!("Import failed: {error}"),
-        }
-    }
-
-    fn toggle_network_value_visualization(&mut self) {
-        // Build summaries immediately when toggled on; future training chunks
-        // will refresh them only while visualization remains enabled.
-        self.visualize_network_values = !self.visualize_network_values;
-        if self.visualize_network_values {
-            self.matrix_summaries = build_matrix_summaries(&self.session);
-            self.status_message = "Model values visible".into();
-        } else {
-            self.matrix_summaries.clear();
-            self.status_message = "Model values hidden".into();
         }
     }
 
@@ -353,7 +307,6 @@ impl App {
         // training math is running.
         let session = self.session.clone();
         let next_validation_step = self.next_validation_step;
-        let visualize_network_values = self.visualize_network_values;
         let training_run_config = self.training_run_config;
         let (sender, receiver) = mpsc::channel();
         self.is_training_busy = true;
@@ -361,12 +314,8 @@ impl App {
         self.status_message = "Training".into();
 
         thread::spawn(move || {
-            let result = train_session_until_budget(
-                session,
-                next_validation_step,
-                visualize_network_values,
-                training_run_config,
-            );
+            let result =
+                train_session_until_budget(session, next_validation_step, training_run_config);
             let _ = sender.send(result);
         });
     }
@@ -381,15 +330,6 @@ impl App {
                 self.accumulated_training_millis += result.elapsed_millis;
                 self.next_validation_step = result.next_validation_step;
                 self.session = result.session;
-                if self.visualize_network_values {
-                    self.matrix_summaries = if result.visualized_network_values {
-                        result.matrix_summaries
-                    } else {
-                        build_matrix_summaries(&self.session)
-                    };
-                } else {
-                    self.matrix_summaries.clear();
-                }
                 self.is_training_busy = false;
 
                 if self.generation_requested {
@@ -497,13 +437,7 @@ fn render(frame: &mut Frame<'_>, app: &App) {
     render_header(frame, app, root[0]);
     render_progress(frame, app, root[1]);
     render_loss(frame, app, root[2]);
-
-    let middle = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(root[3]);
-    render_model(frame, app, middle[0]);
-    render_samples(frame, app, middle[1]);
+    render_samples(frame, app, root[3]);
     render_help(frame, root[4]);
 }
 
@@ -519,11 +453,10 @@ fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
             Span::raw(format!("  {}", app.status_message)),
         ]),
         Line::from(format!(
-            "backend {} | params {} | lr {} | values {} | layers {} | embedding {} | heads {} x {} | context {} | batch {} | val every {} | vocab {} | prefix {:?} | temp {:.1}",
+            "backend {} | params {} | lr {} | layers {} | embedding {} | heads {} x {} | context {} | batch {} | val every {} | vocab {} | prefix {:?} | temp {:.1}",
             backend,
             format_count(app.session.parameter_count()),
             format_learning_rate(app.session.current_learning_rate()),
-            if app.visualize_network_values { "on" } else { "off" },
             config.layer_count,
             config.embedding_size,
             config.attention_head_count,
@@ -595,42 +528,6 @@ fn render_loss(frame: &mut Frame<'_>, app: &App, area: Rect) {
     );
 }
 
-fn render_model(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    // Keeping this panel mounted but empty-by-default makes the cost model
-    // obvious to the user: values are available, but not free.
-    if !app.visualize_network_values {
-        frame.render_widget(
-            Paragraph::new("Hidden. Press v to show model value summaries.")
-                .block(Block::default().title("Model values").borders(Borders::ALL))
-                .wrap(Wrap { trim: false }),
-            area,
-        );
-        return;
-    }
-
-    let lines = app
-        .matrix_summaries
-        .iter()
-        .map(|summary| {
-            format!(
-                "{:<18} {:>3}x{:<3} min {} max {} mean |w| {}",
-                summary.label,
-                summary.rows,
-                summary.columns,
-                format_compact(summary.min as f64),
-                format_compact(summary.max as f64),
-                format_compact(summary.mean_abs as f64)
-            )
-        })
-        .collect::<Vec<_>>();
-    frame.render_widget(
-        Paragraph::new(lines.join("\n"))
-            .block(Block::default().title("Model values").borders(Borders::ALL))
-            .wrap(Wrap { trim: false }),
-        area,
-    );
-}
-
 fn render_samples(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let items = if app.samples.is_empty() {
         vec![ListItem::new("Press g or Enter to generate.")]
@@ -648,7 +545,7 @@ fn render_samples(frame: &mut Frame<'_>, app: &App, area: Rect) {
 }
 
 fn render_help(frame: &mut Frame<'_>, area: Rect) {
-    let help = "s start/pause | c step chunk | g/Enter generate | b backend | v values | F5 export | F6 import | type prefix | Backspace edit | +/- temp | r reset | q/Esc quit";
+    let help = "s start/pause | c step chunk | g/Enter generate | b backend | F5 export | F6 import | type prefix | Backspace edit | +/- temp | r reset | q/Esc quit";
     frame.render_widget(
         Paragraph::new(help).block(Block::default().title("Keys").borders(Borders::ALL)),
         area,
@@ -658,7 +555,6 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
 fn train_session_until_budget(
     session: TrainingSession,
     next_validation_step: usize,
-    visualize_network_values: bool,
     training_run_config: TrainingRunConfig,
 ) -> Result<TrainingChunkResult, String> {
     // A chunk is deliberately bounded by wall-clock time. Continuous training is
@@ -667,160 +563,11 @@ fn train_session_until_budget(
     let training_result =
         train_shared_session_until_budget(session, next_validation_step, training_run_config)?;
 
-    let matrix_summaries = if visualize_network_values {
-        build_matrix_summaries(&training_result.session)
-    } else {
-        Vec::new()
-    };
     Ok(TrainingChunkResult {
         session: training_result.session,
-        matrix_summaries,
-        visualized_network_values: visualize_network_values,
         next_validation_step: training_result.next_validation_step,
         elapsed_millis: training_result.elapsed_millis,
     })
-}
-
-fn build_matrix_summaries(session: &TrainingSession) -> Vec<MatrixSummary> {
-    match session {
-        TrainingSession::Mlx(session) => {
-            build_mlx_matrix_summaries(&session.trained_microgpt.model)
-                .into_iter()
-                .map(MatrixSummary::from)
-                .collect()
-        }
-        TrainingSession::Cpu(session) => build_cpu_matrix_summaries(&session.trained_microgpt),
-    }
-}
-
-fn build_cpu_matrix_summaries(trained_microgpt: &TrainedMicrogpt) -> Vec<MatrixSummary> {
-    let model = &trained_microgpt.model;
-    let mut summaries = vec![
-        matrix_summary("Token embedding", &model.token_embedding),
-        matrix_summary("Position embedding", &model.position_embedding),
-        matrix_summary("Language head", &model.language_model_head),
-        vector_summary("Language head bias", &model.language_model_head_biases),
-        vector_summary("Final norm gain", &model.final_norm_gain),
-    ];
-    for (layer_index, layer) in model.layers.iter().enumerate() {
-        let prefix = format!("Layer {}", layer_index + 1);
-        summaries.push(vector_summary(
-            &format!("{prefix} attention norm gain"),
-            &layer.attention_norm_gain,
-        ));
-        summaries.push(matrix_summary(
-            &format!("{prefix} Q"),
-            &layer.attention.query_weights,
-        ));
-        summaries.push(vector_summary(
-            &format!("{prefix} Q bias"),
-            &layer.attention.query_biases,
-        ));
-        summaries.push(matrix_summary(
-            &format!("{prefix} K"),
-            &layer.attention.key_weights,
-        ));
-        summaries.push(vector_summary(
-            &format!("{prefix} K bias"),
-            &layer.attention.key_biases,
-        ));
-        summaries.push(matrix_summary(
-            &format!("{prefix} V"),
-            &layer.attention.value_weights,
-        ));
-        summaries.push(vector_summary(
-            &format!("{prefix} V bias"),
-            &layer.attention.value_biases,
-        ));
-        summaries.push(matrix_summary(
-            &format!("{prefix} Attn out"),
-            &layer.attention.output_projection_weights,
-        ));
-        summaries.push(vector_summary(
-            &format!("{prefix} Attn out bias"),
-            &layer.attention.output_projection_biases,
-        ));
-        summaries.push(vector_summary(
-            &format!("{prefix} feed-forward norm gain"),
-            &layer.feed_forward_norm_gain,
-        ));
-        summaries.push(matrix_summary(
-            &format!("{prefix} FF expand"),
-            &layer.feed_forward.expansion_weights,
-        ));
-        summaries.push(vector_summary(
-            &format!("{prefix} FF expand bias"),
-            &layer.feed_forward.expansion_biases,
-        ));
-        summaries.push(matrix_summary(
-            &format!("{prefix} FF gate"),
-            &layer.feed_forward.gate_weights,
-        ));
-        summaries.push(vector_summary(
-            &format!("{prefix} FF gate bias"),
-            &layer.feed_forward.gate_biases,
-        ));
-        summaries.push(matrix_summary(
-            &format!("{prefix} FF project"),
-            &layer.feed_forward.projection_weights,
-        ));
-        summaries.push(vector_summary(
-            &format!("{prefix} FF project bias"),
-            &layer.feed_forward.projection_biases,
-        ));
-    }
-    summaries
-}
-
-fn matrix_summary(label: &str, matrix: &Matrix) -> MatrixSummary {
-    let rows = matrix.len();
-    let columns = matrix.first().map(Vec::len).unwrap_or(0);
-    let values = matrix
-        .iter()
-        .flat_map(|row| row.iter().map(|value| value.data() as f32))
-        .collect::<Vec<_>>();
-    let min = values.iter().copied().fold(f32::INFINITY, f32::min);
-    let max = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let mean_abs = values.iter().map(|value| value.abs()).sum::<f32>() / values.len().max(1) as f32;
-    MatrixSummary {
-        label: label.into(),
-        rows,
-        columns,
-        min,
-        max,
-        mean_abs,
-    }
-}
-
-fn vector_summary(label: &str, vector: &Vector) -> MatrixSummary {
-    let values = vector
-        .iter()
-        .map(|value| value.data() as f32)
-        .collect::<Vec<_>>();
-    let min = values.iter().copied().fold(f32::INFINITY, f32::min);
-    let max = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let mean_abs = values.iter().map(|value| value.abs()).sum::<f32>() / values.len().max(1) as f32;
-    MatrixSummary {
-        label: label.into(),
-        rows: 1,
-        columns: vector.len(),
-        min,
-        max,
-        mean_abs,
-    }
-}
-
-impl From<MlxMatrixSummary> for MatrixSummary {
-    fn from(summary: MlxMatrixSummary) -> Self {
-        Self {
-            label: summary.label,
-            rows: summary.rows,
-            columns: summary.columns,
-            min: summary.min,
-            max: summary.max,
-            mean_abs: summary.mean_abs,
-        }
-    }
 }
 
 fn checkpoint_file_path() -> PathBuf {
