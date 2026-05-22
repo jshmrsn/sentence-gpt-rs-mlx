@@ -35,6 +35,11 @@ Current architecture features include:
 - sample allows specifying a prefix
 - GUI allows for most similar training example for a selected generated sample
 
+## Documentation
+
+- [CPU backend and overall architecture](docs/cpu-backend-and-architecture.md)
+- [MLX backend overview](docs/mlx-backend.md)
+
 ## Prerequisites
 
 The MLX backend needs native Apple build tooling:
