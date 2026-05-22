@@ -22,8 +22,8 @@
 
 use crate::checkpoint::{CheckpointBackend, CheckpointTensor, MicrogptCheckpoint};
 use crate::microgpt::{
-    apply_sampling_constraints, normalize_training_document, random_gaussian,
-    scheduled_learning_rate, shuffled_by, training_batch_token_windows,
+    apply_sampling_constraints, document_prediction_count, normalize_training_document,
+    random_gaussian, scheduled_learning_rate, shuffled_by, training_batch_token_windows,
     upgrade_legacy_checkpoint_tensors_for_norm_gains, AdamOptimizerConfig, CharacterTokenizer,
     MicrogptTrainingProgress, TrainingTokenWindow, TransformerConfig,
 };
@@ -574,8 +574,40 @@ pub fn create_mlx_microgpt_training_session(
     let validation_documents = shuffled_documents[..validation_document_count].to_vec();
     let documents = shuffled_documents[validation_document_count..].to_vec();
 
-    let mut unique_characters: Vec<char> = shuffled_documents
+    create_mlx_microgpt_training_session_from_splits(
+        documents,
+        validation_documents,
+        random_number_generator,
+        training_step_count,
+        validation_evaluation_document_count,
+        transformer_config,
+        optimizer_config,
+    )
+}
+
+pub fn create_mlx_microgpt_training_session_from_splits(
+    input_documents: Vec<String>,
+    input_validation_documents: Vec<String>,
+    random_number_generator: &mut impl Rng,
+    training_step_count: usize,
+    validation_evaluation_document_count: usize,
+    transformer_config: TransformerConfig,
+    optimizer_config: AdamOptimizerConfig,
+) -> MlxMicrogptTrainingSession {
+    let documents: Vec<_> = input_documents
+        .into_iter()
+        .map(|document| normalize_training_document(&document))
+        .filter(|document| !document.is_empty())
+        .collect();
+    let validation_documents: Vec<_> = input_validation_documents
+        .into_iter()
+        .map(|document| normalize_training_document(&document))
+        .filter(|document| !document.is_empty())
+        .collect();
+
+    let mut unique_characters: Vec<char> = documents
         .iter()
+        .chain(validation_documents.iter())
         .flat_map(|document| document.chars())
         .collect();
     unique_characters.sort_unstable();
@@ -787,19 +819,28 @@ pub fn calculate_validation_loss(
         .validation_evaluation_document_count
         .min(session.validation_documents.len());
     let validation_batch_index = completed_step_count / validation_step_interval;
-    let mut losses = Vec::with_capacity(validation_document_count);
+    let mut weighted_loss_sum = 0.0;
+    let mut token_count = 0usize;
     for validation_offset in 0..validation_document_count {
         let validation_index = (validation_batch_index * validation_document_count
             + validation_offset)
             % session.validation_documents.len();
-        losses.push(calculate_document_loss(
+        let document = &session.validation_documents[validation_index];
+        let document_token_count = document_prediction_count(
+            &session.trained_microgpt.tokenizer,
+            document,
+            session.trained_microgpt.config.context_window_size,
+        );
+        let document_loss = calculate_document_loss(
             &session.trained_microgpt.model,
             &session.trained_microgpt.config,
             &session.trained_microgpt.tokenizer,
-            &session.validation_documents[validation_index],
-        )?);
+            document,
+        )?;
+        weighted_loss_sum += document_loss * document_token_count as f64;
+        token_count += document_token_count;
     }
-    Ok(Some(losses.iter().sum::<f64>() / losses.len() as f64))
+    Ok((token_count > 0).then(|| weighted_loss_sum / token_count as f64))
 }
 
 pub fn calculate_document_loss(

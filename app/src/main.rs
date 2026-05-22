@@ -13,8 +13,8 @@ use rand_chacha::ChaCha8Rng;
 use rfd::FileDialog;
 use sentence_gpt_rs_mlx_config::{
     create_training_session, format_compact, format_count, format_learning_rate, format_loss,
-    format_percent, format_percent_style, get_optimizer_config, load_input_documents,
-    next_validation_step_after, running_mean_loss, running_mean_loss_values,
+    format_percent, format_percent_style, format_perplexity, get_optimizer_config,
+    load_input_documents, next_validation_step_after, running_mean_loss, running_mean_loss_values,
     train_session_until_budget as train_shared_session_until_budget, Backend, TrainedSnapshot,
     TrainingSession,
 };
@@ -94,7 +94,11 @@ struct ModelHeatmap {
 #[derive(Clone)]
 struct AppState {
     backend: Backend,
+    // Applied to the current session and checkpoints. UI edits go into the
+    // per-backend staged configs below and are applied when training starts.
     training_run_config: TrainingRunConfig,
+    mlx_training_run_config: TrainingRunConfig,
+    cpu_training_run_config: TrainingRunConfig,
     session: Option<TrainingSession>,
     // Full parameter heatmaps require copying model values to the UI and drawing
     // many small cells. That is excellent for inspection but expensive during
@@ -268,6 +272,7 @@ fn App() -> Element {
         .as_ref()
         .map(|session| session.tokenizer().vocabulary_size())
         .unwrap_or(0);
+    let selected_training_run_config = snapshot.selected_training_run_config();
     let is_complete = snapshot
         .session
         .as_ref()
@@ -300,7 +305,10 @@ fn App() -> Element {
                     div { class: "actions",
                         button {
                             class: "button",
-                            disabled: snapshot.session.is_none() || is_complete,
+                            disabled: !snapshot.is_training_active
+                                && (snapshot.is_training_busy
+                                    || snapshot.is_generating_samples
+                                    || is_complete),
                             onclick: move |_| state.write().toggle_training(),
                             if snapshot.is_training_active { "Pause" } else { "Start" }
                         }
@@ -363,10 +371,8 @@ fn App() -> Element {
                         }
                         button {
                             class: "button secondary",
-                            onclick: move |_| {
-                                let backend = state.read().backend;
-                                state.set(AppState::initialize_with_backend(backend));
-                            },
+                            disabled: snapshot.is_training_busy || snapshot.is_generating_samples,
+                            onclick: move |_| state.write().reset_training(),
                             "Reset"
                         }
                     }
@@ -396,7 +402,7 @@ fn App() -> Element {
                         "Document trains {completed_document_train_count} / {total_document_train_count} | running avg {format_rate(document_trains_per_minute)}/min | elapsed {format_elapsed_training_time(snapshot.accumulated_training_millis)}"
                     }
                     div { class: "model-summary",
-                        "Train examples {training_example_count} | validation examples {validation_example_count} | validation batch {validation_batch_count} | train batch {snapshot.training_run_config.training_document_batch_size}"
+                        "Train examples {training_example_count} | validation examples {validation_example_count} | validation batch {validation_batch_count} | train batch {selected_training_run_config.training_document_batch_size}"
                     }
                     div { class: "model-summary",
                         "Snapshot export: {snapshot_export_directory_label}"
@@ -414,22 +420,28 @@ fn App() -> Element {
                         h2 { class: "section-title", "Training configuration" }
                         div { class: "model-summary",
                             if can_configure_training_run {
-                                "Editable before training starts"
+                                "Staged until training starts"
                             } else {
                                 "Locked after training starts"
                             }
                         }
+                        button {
+                            class: "button secondary",
+                            disabled: !can_configure_training_run,
+                            onclick: move |_| state.write().restore_default_training_config(),
+                            "Restore defaults"
+                        }
                     }
                     div { class: "config-grid",
-                        {config_number_input("Validation interval steps", snapshot.training_run_config.validation_step_interval, can_configure_training_run, TrainingRunConfigField::ValidationStepInterval, state)}
-                        {config_number_input("Docs per batch", snapshot.training_run_config.training_document_batch_size, can_configure_training_run, TrainingRunConfigField::TrainingDocumentBatchSize, state)}
-                        {config_number_input("Max total docs", snapshot.training_run_config.max_document_count, can_configure_training_run, TrainingRunConfigField::MaxDocumentCount, state)}
-                        {config_number_input("Validation docs divisor", snapshot.training_run_config.validation_set_divisor, can_configure_training_run, TrainingRunConfigField::ValidationSetDivisor, state)}
-                        {config_number_input("Docs per validation eval", snapshot.training_run_config.validation_evaluation_document_count, can_configure_training_run, TrainingRunConfigField::ValidationEvaluationDocumentCount, state)}
-                        {config_number_input("Context size", snapshot.training_run_config.context_window_size, can_configure_training_run, TrainingRunConfigField::ContextWindowSize, state)}
-                        {config_number_input("Layers", snapshot.training_run_config.layer_count, can_configure_training_run, TrainingRunConfigField::LayerCount, state)}
-                        {config_number_input("Attention heads", snapshot.training_run_config.attention_heads, can_configure_training_run, TrainingRunConfigField::AttentionHeads, state)}
-                        {config_number_input("Embedding size", snapshot.training_run_config.embedding_size, can_configure_training_run, TrainingRunConfigField::EmbeddingSize, state)}
+                        {config_number_input("Validation interval steps", selected_training_run_config.validation_step_interval, can_configure_training_run, TrainingRunConfigField::ValidationStepInterval, state)}
+                        {config_number_input("Docs per batch", selected_training_run_config.training_document_batch_size, can_configure_training_run, TrainingRunConfigField::TrainingDocumentBatchSize, state)}
+                        {config_number_input("Max total docs", selected_training_run_config.max_document_count, can_configure_training_run, TrainingRunConfigField::MaxDocumentCount, state)}
+                        {config_number_input("Validation docs divisor", selected_training_run_config.validation_set_divisor, can_configure_training_run, TrainingRunConfigField::ValidationSetDivisor, state)}
+                        {config_number_input("Docs per validation eval", selected_training_run_config.validation_evaluation_document_count, can_configure_training_run, TrainingRunConfigField::ValidationEvaluationDocumentCount, state)}
+                        {config_number_input("Context size", selected_training_run_config.context_window_size, can_configure_training_run, TrainingRunConfigField::ContextWindowSize, state)}
+                        {config_number_input("Layers", selected_training_run_config.layer_count, can_configure_training_run, TrainingRunConfigField::LayerCount, state)}
+                        {config_number_input("Attention heads", selected_training_run_config.attention_heads, can_configure_training_run, TrainingRunConfigField::AttentionHeads, state)}
+                        {config_number_input("Embedding size", selected_training_run_config.embedding_size, can_configure_training_run, TrainingRunConfigField::EmbeddingSize, state)}
                     }
                 }
 
@@ -592,14 +604,36 @@ fn App() -> Element {
 
 impl AppState {
     fn initialize() -> Self {
-        Self::initialize_with_backend(Backend::Mlx)
+        Self::initialize_with_config_state(
+            Backend::Mlx,
+            Backend::Mlx.default_training_run_config(),
+            Backend::Cpu.default_training_run_config(),
+        )
     }
 
-    fn initialize_with_backend(backend: Backend) -> Self {
-        Self::initialize_with_config(backend, backend.default_training_run_config())
+    fn initialize_with_config_state(
+        backend: Backend,
+        mlx_training_run_config: TrainingRunConfig,
+        cpu_training_run_config: TrainingRunConfig,
+    ) -> Self {
+        let training_run_config = match backend {
+            Backend::Mlx => mlx_training_run_config,
+            Backend::Cpu => cpu_training_run_config,
+        };
+        Self::initialize_with_config(
+            backend,
+            training_run_config,
+            mlx_training_run_config,
+            cpu_training_run_config,
+        )
     }
 
-    fn initialize_with_config(backend: Backend, training_run_config: TrainingRunConfig) -> Self {
+    fn initialize_with_config(
+        backend: Backend,
+        training_run_config: TrainingRunConfig,
+        mlx_training_run_config: TrainingRunConfig,
+        cpu_training_run_config: TrainingRunConfig,
+    ) -> Self {
         let mut rng = ChaCha8Rng::seed_from_u64(1);
         let transformer_config = TransformerConfig::new(
             training_run_config.layer_count,
@@ -625,6 +659,8 @@ impl AppState {
                             Ok(session) => Self {
                                 backend,
                                 training_run_config,
+                                mlx_training_run_config,
+                                cpu_training_run_config,
                                 session: Some(session),
                                 model_heatmaps: Vec::new(),
                                 visualize_network_values: false,
@@ -649,26 +685,46 @@ impl AppState {
                                 sample_rng: ChaCha8Rng::seed_from_u64(1),
                                 training_document_page_rng: ChaCha8Rng::seed_from_u64(2),
                             },
-                            Err(error) => {
-                                Self::failed_initialization(backend, training_run_config, error)
-                            }
+                            Err(error) => Self::failed_initialization(
+                                backend,
+                                training_run_config,
+                                mlx_training_run_config,
+                                cpu_training_run_config,
+                                error,
+                            ),
                         }
                     }
-                    Err(error) => Self::failed_initialization(backend, training_run_config, error),
+                    Err(error) => Self::failed_initialization(
+                        backend,
+                        training_run_config,
+                        mlx_training_run_config,
+                        cpu_training_run_config,
+                        error,
+                    ),
                 }
             }
-            Err(error) => Self::failed_initialization(backend, training_run_config, error),
+            Err(error) => Self::failed_initialization(
+                backend,
+                training_run_config,
+                mlx_training_run_config,
+                cpu_training_run_config,
+                error,
+            ),
         }
     }
 
     fn failed_initialization(
         backend: Backend,
         training_run_config: TrainingRunConfig,
+        mlx_training_run_config: TrainingRunConfig,
+        cpu_training_run_config: TrainingRunConfig,
         error: String,
     ) -> Self {
         Self {
             backend,
             training_run_config,
+            mlx_training_run_config,
+            cpu_training_run_config,
             session: None,
             model_heatmaps: Vec::new(),
             visualize_network_values: false,
@@ -701,9 +757,24 @@ impl AppState {
         self.refresh_cached_browser_search_matches();
     }
 
+    fn selected_training_run_config(&self) -> TrainingRunConfig {
+        match self.backend {
+            Backend::Mlx => self.mlx_training_run_config,
+            Backend::Cpu => self.cpu_training_run_config,
+        }
+    }
+
+    fn selected_training_run_config_mut(&mut self) -> &mut TrainingRunConfig {
+        match self.backend {
+            Backend::Mlx => &mut self.mlx_training_run_config,
+            Backend::Cpu => &mut self.cpu_training_run_config,
+        }
+    }
+
     fn can_configure_training_run(&self) -> bool {
         !self.is_training_busy
             && !self.is_generating_samples
+            && !self.is_training_active
             && self
                 .session
                 .as_ref()
@@ -721,41 +792,73 @@ impl AppState {
             return;
         }
 
+        let training_run_config = self.selected_training_run_config_mut();
         match field {
             TrainingRunConfigField::ValidationStepInterval => {
-                self.training_run_config.validation_step_interval = value;
+                training_run_config.validation_step_interval = value;
             }
             TrainingRunConfigField::TrainingDocumentBatchSize => {
-                self.training_run_config.training_document_batch_size = value;
+                training_run_config.training_document_batch_size = value;
             }
             TrainingRunConfigField::MaxDocumentCount => {
-                self.training_run_config.max_document_count = value;
+                training_run_config.max_document_count = value;
             }
             TrainingRunConfigField::ValidationSetDivisor => {
-                self.training_run_config.validation_set_divisor = value;
+                training_run_config.validation_set_divisor = value;
             }
             TrainingRunConfigField::ValidationEvaluationDocumentCount => {
-                self.training_run_config
-                    .validation_evaluation_document_count = value;
+                training_run_config.validation_evaluation_document_count = value;
             }
             TrainingRunConfigField::ContextWindowSize => {
-                self.training_run_config.context_window_size = value;
+                training_run_config.context_window_size = value;
             }
             TrainingRunConfigField::LayerCount => {
-                self.training_run_config.layer_count = value;
+                training_run_config.layer_count = value;
             }
             TrainingRunConfigField::AttentionHeads => {
-                self.training_run_config.attention_heads = value;
+                training_run_config.attention_heads = value;
             }
             TrainingRunConfigField::EmbeddingSize => {
-                self.training_run_config.embedding_size = value;
+                training_run_config.embedding_size = value;
             }
         }
-        self.recreate_unstarted_session();
+        self.initialization_error = None;
     }
 
-    fn recreate_unstarted_session(&mut self) {
-        let mut next = Self::initialize_with_config(self.backend, self.training_run_config);
+    fn restore_default_training_config(&mut self) {
+        if !self.can_configure_training_run() {
+            return;
+        }
+        *self.selected_training_run_config_mut() = self.backend.default_training_run_config();
+        self.initialization_error = None;
+    }
+
+    fn reset_training(&mut self) {
+        if self.is_training_busy || self.is_generating_samples {
+            return;
+        }
+        self.recreate_session_with_config(self.training_run_config);
+    }
+
+    fn apply_selected_training_config(&mut self) -> bool {
+        if !self.can_configure_training_run() {
+            return self.session.is_some();
+        }
+        let selected_training_run_config = self.selected_training_run_config();
+        if self.session.is_some() && self.training_run_config == selected_training_run_config {
+            return true;
+        }
+        self.recreate_session_with_config(selected_training_run_config);
+        self.session.is_some()
+    }
+
+    fn recreate_session_with_config(&mut self, training_run_config: TrainingRunConfig) {
+        let mut next = Self::initialize_with_config(
+            self.backend,
+            training_run_config,
+            self.mlx_training_run_config,
+            self.cpu_training_run_config,
+        );
         next.visualize_network_values = self.visualize_network_values;
         next.prefix = self.prefix.clone();
         next.temperature = self.temperature;
@@ -878,7 +981,8 @@ impl AppState {
         if self.is_training_busy || self.is_generating_samples {
             return;
         }
-        *self = Self::initialize_with_backend(self.backend.toggled());
+        self.backend = self.backend.toggled();
+        self.recreate_session_with_config(self.selected_training_run_config());
     }
 
     fn export_checkpoint_to_directory(&mut self, directory: PathBuf) {
@@ -920,6 +1024,10 @@ impl AppState {
             Ok((session, training_run_config)) => {
                 self.backend = session.backend();
                 self.training_run_config = training_run_config;
+                match self.backend {
+                    Backend::Mlx => self.mlx_training_run_config = training_run_config,
+                    Backend::Cpu => self.cpu_training_run_config = training_run_config,
+                }
                 self.next_validation_step = next_validation_step_after(
                     session.completed_step_count(),
                     self.training_run_config.validation_step_interval,
@@ -980,6 +1088,9 @@ impl AppState {
             .is_some_and(TrainingSession::is_complete)
         {
             self.is_training_active = false;
+            return;
+        }
+        if !self.is_training_active && !self.apply_selected_training_config() {
             return;
         }
         self.is_training_active = !self.is_training_active;
@@ -1287,6 +1398,7 @@ fn ordered_character_score(document: &str, query: &str) -> usize {
 
 fn loss_metric_text(label: &str, loss: f64, vocabulary_size: usize) -> Element {
     let estimated_accuracy = estimated_accuracy_from_loss(loss, vocabulary_size);
+    let perplexity = format_perplexity(loss);
     let random_accuracy = if vocabulary_size > 0 {
         1.0 / vocabulary_size as f64
     } else {
@@ -1295,7 +1407,7 @@ fn loss_metric_text(label: &str, loss: f64, vocabulary_size: usize) -> Element {
 
     rsx! {
         div { class: "model-summary",
-            "{label} estimated accuracy {format_percent(estimated_accuracy)} | random {format_percent(random_accuracy)} | vocab {vocabulary_size}"
+            "{label} perplexity {perplexity} | estimated accuracy {format_percent(estimated_accuracy)} | random {format_percent(random_accuracy)} | vocab {vocabulary_size}"
         }
     }
 }

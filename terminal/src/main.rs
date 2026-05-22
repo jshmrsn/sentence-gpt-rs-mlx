@@ -22,8 +22,9 @@ use ratatui::{
 };
 use sentence_gpt_rs_mlx_config::{
     create_training_session, format_compact, format_count, format_learning_rate, format_loss,
-    get_optimizer_config, load_input_documents, next_validation_step_after, running_mean_loss,
-    train_session_until_budget as train_shared_session_until_budget, Backend, TrainingSession,
+    format_perplexity, get_optimizer_config, load_input_documents, next_validation_step_after,
+    running_mean_loss, train_session_until_budget as train_shared_session_until_budget, Backend,
+    TrainingSession,
 };
 use sentence_gpt_rs_mlx_lib::checkpoint::{
     load_checkpoint_from_path, save_checkpoint_to_path, TrainingRunConfig,
@@ -545,12 +546,12 @@ fn render_progress(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let latest_loss = app
         .session
         .latest_loss()
-        .map(format_loss)
+        .map(|loss| format!("{} ppl {}", format_loss(loss), format_perplexity(loss)))
         .unwrap_or_else(|| "pending".into());
     let latest_validation_loss = app
         .session
         .latest_validation_loss()
-        .map(format_loss)
+        .map(|loss| format!("{} ppl {}", format_loss(loss), format_perplexity(loss)))
         .unwrap_or_else(|| "pending".into());
     let label = format!(
         "step {} / {} | train loss {} | validation {} | {:.1} doc-trains/min",

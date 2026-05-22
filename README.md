@@ -16,7 +16,7 @@ The project trains a tiny GPT-style character model on short story sentences. It
 
 Stories are originally sourced from [roneneldan/TinyStories](https://huggingface.co/datasets/roneneldan/TinyStories)
 
-Stories are split into sentence-like examples on `.`, `?`, and `!` while keeping the punctuation, and then builds train/validation splits during session creation.
+Stories are grouped by source story, split into sentence-like examples on `.`, `?`, and `!` while keeping the punctuation, and then separated into train/validation sets at story granularity during session creation.
 
 The default backend is MLX on Apple Silicon. The dry Rust CPU backend is kept for comparison, learning, and debugging.
 

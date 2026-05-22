@@ -1797,6 +1797,18 @@ pub fn calculate_document_loss(
     train_on_document(model, config, tokenizer, document).data()
 }
 
+pub fn document_prediction_count(
+    tokenizer: &CharacterTokenizer,
+    document: &str,
+    context_window_size: usize,
+) -> usize {
+    tokenizer
+        .encode_document(document)
+        .len()
+        .saturating_sub(1)
+        .min(context_window_size)
+}
+
 pub fn calculate_validation_loss(
     session: &MicrogptTrainingSession,
     completed_step_count: usize,
@@ -1812,21 +1824,28 @@ pub fn calculate_validation_loss(
         .validation_evaluation_document_count
         .min(session.validation_documents.len());
     let validation_batch_index = completed_step_count / validation_step_interval;
-    let loss = (0..validation_document_count)
-        .map(|validation_offset| {
-            let validation_index = (validation_batch_index * validation_document_count
-                + validation_offset)
-                % session.validation_documents.len();
-            calculate_document_loss(
-                &session.trained_microgpt.model,
-                &session.trained_microgpt.config,
-                &session.trained_microgpt.tokenizer,
-                &session.validation_documents[validation_index],
-            )
-        })
-        .sum::<f64>()
-        / validation_document_count as f64;
-    Some(loss)
+    let mut weighted_loss_sum = 0.0;
+    let mut token_count = 0usize;
+    for validation_offset in 0..validation_document_count {
+        let validation_index = (validation_batch_index * validation_document_count
+            + validation_offset)
+            % session.validation_documents.len();
+        let document = &session.validation_documents[validation_index];
+        let document_token_count = document_prediction_count(
+            &session.trained_microgpt.tokenizer,
+            document,
+            session.trained_microgpt.config.context_window_size,
+        );
+        let document_loss = calculate_document_loss(
+            &session.trained_microgpt.model,
+            &session.trained_microgpt.config,
+            &session.trained_microgpt.tokenizer,
+            document,
+        );
+        weighted_loss_sum += document_loss * document_token_count as f64;
+        token_count += document_token_count;
+    }
+    (token_count > 0).then(|| weighted_loss_sum / token_count as f64)
 }
 
 pub fn calculate_training_loss_baseline(session: &MicrogptTrainingSession) -> Option<f64> {
@@ -2139,8 +2158,40 @@ pub fn create_microgpt_training_session(
     let validation_documents = shuffled_documents[..validation_document_count].to_vec();
     let documents = shuffled_documents[validation_document_count..].to_vec();
 
-    let mut unique_characters: Vec<char> = shuffled_documents
+    create_microgpt_training_session_from_splits(
+        documents,
+        validation_documents,
+        random_number_generator,
+        training_step_count,
+        validation_evaluation_document_count,
+        transformer_config,
+        optimizer_config,
+    )
+}
+
+pub fn create_microgpt_training_session_from_splits(
+    input_documents: Vec<String>,
+    input_validation_documents: Vec<String>,
+    random_number_generator: &mut impl Rng,
+    training_step_count: usize,
+    validation_evaluation_document_count: usize,
+    transformer_config: TransformerConfig,
+    optimizer_config: AdamOptimizerConfig,
+) -> MicrogptTrainingSession {
+    let documents: Vec<_> = input_documents
+        .into_iter()
+        .map(|document| normalize_training_document(&document))
+        .filter(|document| !document.is_empty())
+        .collect();
+    let validation_documents: Vec<_> = input_validation_documents
+        .into_iter()
+        .map(|document| normalize_training_document(&document))
+        .filter(|document| !document.is_empty())
+        .collect();
+
+    let mut unique_characters: Vec<char> = documents
         .iter()
+        .chain(validation_documents.iter())
         .flat_map(|document| document.chars())
         .collect();
     unique_characters.sort_unstable();
@@ -2224,6 +2275,61 @@ mod tests {
         let result = train_microgpt_step(session, 2).expect("training should run");
 
         assert!(bias_abs_sum(&result.session.trained_microgpt.model) > 0.0);
+    }
+
+    #[test]
+    fn validation_loss_is_weighted_by_prediction_count() {
+        let mut rng = ChaCha8Rng::seed_from_u64(9);
+        let config = TransformerConfig::new(1, 8, 32, 2).unwrap();
+        let optimizer = AdamOptimizerConfig {
+            learning_rate: 0.006,
+            first_moment_decay: 0.9,
+            second_moment_decay: 0.999,
+            epsilon: 1e-8,
+            weight_decay: 0.0,
+            warmup_step_count: 0,
+            minimum_learning_rate_ratio: 0.0,
+        };
+        let session = create_microgpt_training_session_from_splits(
+            vec!["train text.".into()],
+            vec!["a.".into(), "a much longer validation sentence.".into()],
+            &mut rng,
+            1,
+            2,
+            config,
+            optimizer,
+        );
+        let short_document = &session.validation_documents[0];
+        let long_document = &session.validation_documents[1];
+        let short_token_count = document_prediction_count(
+            &session.trained_microgpt.tokenizer,
+            short_document,
+            session.trained_microgpt.config.context_window_size,
+        );
+        let long_token_count = document_prediction_count(
+            &session.trained_microgpt.tokenizer,
+            long_document,
+            session.trained_microgpt.config.context_window_size,
+        );
+        let short_loss = calculate_document_loss(
+            &session.trained_microgpt.model,
+            &session.trained_microgpt.config,
+            &session.trained_microgpt.tokenizer,
+            short_document,
+        );
+        let long_loss = calculate_document_loss(
+            &session.trained_microgpt.model,
+            &session.trained_microgpt.config,
+            &session.trained_microgpt.tokenizer,
+            long_document,
+        );
+        let expected = (short_loss * short_token_count as f64
+            + long_loss * long_token_count as f64)
+            / (short_token_count + long_token_count) as f64;
+
+        let actual = calculate_validation_loss(&session, 1, 1).unwrap();
+
+        assert!((actual - expected).abs() < 1e-12);
     }
 
     #[test]

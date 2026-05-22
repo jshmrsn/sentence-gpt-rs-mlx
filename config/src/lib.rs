@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     path::PathBuf,
     time::{Duration, Instant},
 };
@@ -10,16 +11,16 @@ use sentence_gpt_rs_mlx_lib::{
         attach_validation_loss as attach_cpu_validation_loss,
         calculate_training_loss_baseline as calculate_cpu_training_loss_baseline,
         calculate_validation_loss as calculate_cpu_validation_loss,
-        create_microgpt_training_session,
+        create_microgpt_training_session_from_splits,
         export_training_session_checkpoint as export_cpu_training_session_checkpoint,
         import_training_session_checkpoint as import_cpu_training_session_checkpoint,
-        scheduled_learning_rate, train_microgpt_step, CharacterTokenizer, MicrogptTrainingProgress,
-        MicrogptTrainingSession, TrainedMicrogpt, TransformerConfig,
+        scheduled_learning_rate, shuffled_by, train_microgpt_step, CharacterTokenizer,
+        MicrogptTrainingProgress, MicrogptTrainingSession, TrainedMicrogpt, TransformerConfig,
     },
     mlx_microgpt::{
         attach_validation_loss as attach_mlx_validation_loss,
         calculate_validation_loss as calculate_mlx_validation_loss,
-        create_mlx_microgpt_training_session,
+        create_mlx_microgpt_training_session_from_splits,
         export_training_session_checkpoint as export_mlx_training_session_checkpoint,
         import_training_session_checkpoint as import_mlx_training_session_checkpoint,
         train_mlx_microgpt_step, MlxMicrogptTrainingSession, MlxTrainedMicrogpt,
@@ -288,19 +289,25 @@ pub enum TrainedSnapshot {
 }
 
 pub fn create_training_session(
-    input_documents: Vec<String>,
+    input_stories: Vec<TrainingStoryDocuments>,
     rng: &mut ChaCha8Rng,
     backend: Backend,
     transformer_config: TransformerConfig,
     optimizer_config: AdamOptimizerConfig,
     training_run_config: TrainingRunConfig,
 ) -> Result<TrainingSession, String> {
+    let shuffled_stories = shuffled_by(&input_stories, rng);
+    let validation_story_count =
+        shuffled_stories.len() / training_run_config.validation_set_divisor;
+    let validation_documents = flatten_story_sentences(&shuffled_stories[..validation_story_count]);
+    let documents = flatten_story_sentences(&shuffled_stories[validation_story_count..]);
+
     match backend {
-        Backend::Mlx => create_mlx_microgpt_training_session(
-            input_documents,
+        Backend::Mlx => create_mlx_microgpt_training_session_from_splits(
+            documents,
+            validation_documents,
             rng,
             MAX_TRAINING_STEP_COUNT,
-            training_run_config.validation_set_divisor,
             training_run_config.validation_evaluation_document_count,
             transformer_config,
             optimizer_config,
@@ -309,11 +316,11 @@ pub fn create_training_session(
         .map(TrainingSession::Mlx)
         .map_err(|error| error.to_string()),
         Backend::Cpu => {
-            let mut session = create_microgpt_training_session(
-                input_documents,
+            let mut session = create_microgpt_training_session_from_splits(
+                documents,
+                validation_documents,
                 rng,
                 MAX_TRAINING_STEP_COUNT,
-                training_run_config.validation_set_divisor,
                 training_run_config.validation_evaluation_document_count,
                 transformer_config,
                 optimizer_config,
@@ -483,6 +490,17 @@ pub fn format_loss(loss: f64) -> String {
     format!("{loss:.4}")
 }
 
+pub fn format_perplexity(loss: f64) -> String {
+    let perplexity = loss.exp();
+    if perplexity >= 1_000.0 {
+        format!("{perplexity:.0}")
+    } else if perplexity >= 100.0 {
+        format!("{perplexity:.1}")
+    } else {
+        format!("{perplexity:.2}")
+    }
+}
+
 pub fn format_learning_rate(learning_rate: f64) -> String {
     format!("{learning_rate:.6}")
 }
@@ -515,7 +533,14 @@ struct Story {
     source: String,
 }
 
-pub fn load_input_documents(training_run_config: TrainingRunConfig) -> Result<Vec<String>, String> {
+#[derive(Clone, Debug)]
+pub struct TrainingStoryDocuments {
+    sentences: Vec<String>,
+}
+
+pub fn load_input_documents(
+    training_run_config: TrainingRunConfig,
+) -> Result<Vec<TrainingStoryDocuments>, String> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
     let stories_path = root.join("data/input-stories-00.json");
     let stories_json = std::fs::read_to_string(&stories_path).map_err(|error| {
@@ -526,48 +551,66 @@ pub fn load_input_documents(training_run_config: TrainingRunConfig) -> Result<Ve
     })?;
     let stories: Vec<Story> = serde_json::from_str(&stories_json)
         .map_err(|error| format!("could not parse {}: {error}", stories_path.display()))?;
-    let documents = stories_to_sentences(stories, training_run_config);
-    if documents.is_empty() {
+    let story_documents = stories_to_sentence_groups(stories, training_run_config);
+    if story_documents.is_empty() {
         Err(format!(
             "no training documents survived filtering in required {}",
             stories_path.display()
         ))
     } else {
-        Ok(documents)
+        Ok(story_documents)
     }
 }
 
-fn stories_to_sentences(
+fn flatten_story_sentences(stories: &[TrainingStoryDocuments]) -> Vec<String> {
+    stories
+        .iter()
+        .flat_map(|story| story.sentences.iter().cloned())
+        .collect()
+}
+
+fn stories_to_sentence_groups(
     stories: Vec<Story>,
     training_run_config: TrainingRunConfig,
-) -> Vec<String> {
+) -> Vec<TrainingStoryDocuments> {
     const SENTENCE_DISQUALIFYING_CHARACTERS: &[char] = &[
         '$', '&', '"', '“', '”', '(', ')', '*', '\'', '_', '-', '–', '…', '%', '~', '`', '[', ']',
         '{', '}', '\\', ';', '|', '—', 'é', '/', '’', '‘', ':', '0', '1', '2', '3', '4', '5', '6',
         '7', '8', '9',
     ];
 
-    let filtered_stories = stories
-        .into_iter()
-        .filter(|story| story.source == "GPT-4")
-        .collect::<Vec<_>>();
-
-    filtered_stories
-        .into_iter()
-        .flat_map(|story| split_sentences_keep_punctuation(&story.story))
-        .filter(|sentence| {
-            !SENTENCE_DISQUALIFYING_CHARACTERS
-                .iter()
-                .any(|excluded| sentence.contains(*excluded))
-        })
-        .map(|sentence| sentence.replace(['\n'], " ").trim().to_string())
-        .filter(|sentence| {
-            sentence.len() > 10
-                && sentence.contains(' ')
-                && sentence.chars().count() < training_run_config.context_window_size
-        })
-        .take(training_run_config.max_document_count)
-        .collect::<Vec<_>>()
+    let mut total_document_count = 0usize;
+    let mut seen_sentences = HashSet::new();
+    let mut story_documents = Vec::new();
+    for story in stories.into_iter().filter(|story| story.source == "GPT-4") {
+        if total_document_count >= training_run_config.max_document_count {
+            break;
+        }
+        let remaining_document_count =
+            training_run_config.max_document_count - total_document_count;
+        let sentences = split_sentences_keep_punctuation(&story.story)
+            .into_iter()
+            .filter(|sentence| {
+                !SENTENCE_DISQUALIFYING_CHARACTERS
+                    .iter()
+                    .any(|excluded| sentence.contains(*excluded))
+            })
+            .map(|sentence| sentence.replace(['\n'], " ").trim().to_string())
+            .filter(|sentence| {
+                sentence.len() > 10
+                    && sentence.contains(' ')
+                    && sentence.chars().count() < training_run_config.context_window_size
+            })
+            .filter(|sentence| seen_sentences.insert(sentence.clone()))
+            .take(remaining_document_count)
+            .collect::<Vec<_>>();
+        if sentences.is_empty() {
+            continue;
+        }
+        total_document_count += sentences.len();
+        story_documents.push(TrainingStoryDocuments { sentences });
+    }
+    story_documents
 }
 
 fn split_sentences_keep_punctuation(story: &str) -> Vec<String> {
@@ -588,13 +631,128 @@ fn split_sentences_keep_punctuation(story: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::split_sentences_keep_punctuation;
+    use super::{
+        create_training_session, get_optimizer_config, split_sentences_keep_punctuation,
+        stories_to_sentence_groups, Backend, Story, TrainingRunConfig, TransformerConfig,
+    };
+    use rand_chacha::rand_core::SeedableRng;
+    use rand_chacha::ChaCha8Rng;
 
     #[test]
     fn sentence_splitter_keeps_boundary_punctuation() {
         assert_eq!(
             split_sentences_keep_punctuation("Are you there? Yes! I am."),
             vec!["Are you there?", " Yes!", " I am."]
+        );
+    }
+
+    #[test]
+    fn stories_stay_grouped_before_train_validation_split() {
+        let training_run_config = TrainingRunConfig {
+            validation_step_interval: 25,
+            training_document_batch_size: 2,
+            max_document_count: 10,
+            validation_set_divisor: 2,
+            validation_evaluation_document_count: 2,
+            context_window_size: 64,
+            layer_count: 1,
+            attention_heads: 2,
+            embedding_size: 8,
+        };
+        let stories = stories_to_sentence_groups(
+            vec![
+                Story {
+                    story: "Alpha went home. Alpha ate cake.".into(),
+                    source: "GPT-4".into(),
+                },
+                Story {
+                    story: "Ignored went home. Ignored ate cake.".into(),
+                    source: "GPT-3.5".into(),
+                },
+                Story {
+                    story: "Beta saw stars. Beta went home.".into(),
+                    source: "GPT-4".into(),
+                },
+            ],
+            training_run_config,
+        );
+        let mut rng = ChaCha8Rng::seed_from_u64(1);
+        let session = create_training_session(
+            stories,
+            &mut rng,
+            Backend::Cpu,
+            TransformerConfig::new(1, 8, 64, 2).unwrap(),
+            get_optimizer_config(),
+            training_run_config,
+        )
+        .unwrap();
+
+        assert_eq!(session.training_document_count(), 2);
+        assert_eq!(session.validation_document_count(), 2);
+        assert!(
+            session
+                .training_documents()
+                .iter()
+                .all(|document| document.starts_with("Alpha"))
+                || session
+                    .training_documents()
+                    .iter()
+                    .all(|document| document.starts_with("Beta"))
+        );
+        assert!(
+            session
+                .validation_documents()
+                .iter()
+                .all(|document| document.starts_with("Alpha"))
+                || session
+                    .validation_documents()
+                    .iter()
+                    .all(|document| document.starts_with("Beta"))
+        );
+        assert_ne!(
+            session.training_documents()[0].chars().next(),
+            session.validation_documents()[0].chars().next()
+        );
+    }
+
+    #[test]
+    fn duplicate_sentences_are_filtered_globally() {
+        let training_run_config = TrainingRunConfig {
+            validation_step_interval: 25,
+            training_document_batch_size: 2,
+            max_document_count: 10,
+            validation_set_divisor: 2,
+            validation_evaluation_document_count: 2,
+            context_window_size: 64,
+            layer_count: 1,
+            attention_heads: 2,
+            embedding_size: 8,
+        };
+        let stories = stories_to_sentence_groups(
+            vec![
+                Story {
+                    story: "Shared sentence here. Unique alpha sentence.".into(),
+                    source: "GPT-4".into(),
+                },
+                Story {
+                    story: "Shared sentence here. Unique beta sentence.".into(),
+                    source: "GPT-4".into(),
+                },
+            ],
+            training_run_config,
+        );
+        let sentences = stories
+            .iter()
+            .flat_map(|story| story.sentences.iter())
+            .collect::<Vec<_>>();
+
+        assert_eq!(sentences.len(), 3);
+        assert_eq!(
+            sentences
+                .iter()
+                .filter(|sentence| sentence.as_str() == "Shared sentence here.")
+                .count(),
+            1
         );
     }
 }
