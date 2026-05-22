@@ -40,7 +40,63 @@ pub type KeyValueCache = Vec<Vec<Vec<Value>>>;
 const MAX_GRADIENT_NORM: f64 = 1.0;
 const SAMPLING_TOP_K: usize = 8;
 const MIN_GENERATED_CHARACTER_COUNT: usize = 8;
-const RESIDUAL_DROPOUT_PROBABILITY: f64 = 0.05;
+pub const RESIDUAL_DROPOUT_PROBABILITY: f64 = 0.05;
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TransformerFeatureConfig {
+    pub use_learned_biases: bool,
+    pub use_rope_position_encoding: bool,
+    pub use_learned_absolute_position_encoding: bool,
+    pub use_residual_dropout: bool,
+    pub use_learned_rmsnorm_gain: bool,
+    pub use_final_rmsnorm: bool,
+    pub use_swiglu_feed_forward: bool,
+    pub use_tied_output_embeddings: bool,
+}
+
+impl TransformerFeatureConfig {
+    pub const fn optimized_defaults() -> Self {
+        Self {
+            use_learned_biases: true,
+            use_rope_position_encoding: true,
+            use_learned_absolute_position_encoding: false,
+            use_residual_dropout: true,
+            use_learned_rmsnorm_gain: true,
+            use_final_rmsnorm: true,
+            use_swiglu_feed_forward: true,
+            use_tied_output_embeddings: true,
+        }
+    }
+}
+
+impl Default for TransformerFeatureConfig {
+    fn default() -> Self {
+        Self::optimized_defaults()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OptimizerFeatureConfig {
+    pub use_gradient_clipping: bool,
+    pub use_weight_decay: bool,
+    pub use_warmup_cosine_learning_rate: bool,
+}
+
+impl OptimizerFeatureConfig {
+    pub const fn optimized_defaults() -> Self {
+        Self {
+            use_gradient_clipping: true,
+            use_weight_decay: true,
+            use_warmup_cosine_learning_rate: true,
+        }
+    }
+}
+
+impl Default for OptimizerFeatureConfig {
+    fn default() -> Self {
+        Self::optimized_defaults()
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct AttentionParameters {
@@ -475,6 +531,7 @@ pub struct TransformerConfig {
     // vowel pattern".
     pub attention_head_count: usize,
     pub attention_head_size: usize,
+    pub features: TransformerFeatureConfig,
 }
 
 impl TransformerConfig {
@@ -483,6 +540,22 @@ impl TransformerConfig {
         embedding_size: usize,
         context_window_size: usize,
         attention_head_count: usize,
+    ) -> Result<Self, String> {
+        Self::new_with_features(
+            layer_count,
+            embedding_size,
+            context_window_size,
+            attention_head_count,
+            TransformerFeatureConfig::optimized_defaults(),
+        )
+    }
+
+    pub fn new_with_features(
+        layer_count: usize,
+        embedding_size: usize,
+        context_window_size: usize,
+        attention_head_count: usize,
+        features: TransformerFeatureConfig,
     ) -> Result<Self, String> {
         if layer_count == 0 {
             return Err("layer_count must be positive".into());
@@ -505,6 +578,7 @@ impl TransformerConfig {
             context_window_size,
             attention_head_count,
             attention_head_size: embedding_size / attention_head_count,
+            features,
         })
     }
 }
@@ -582,6 +656,7 @@ pub struct AdamOptimizerConfig {
     pub warmup_step_count: usize,
     // Cosine decay never drops below this fraction of the base learning rate.
     pub minimum_learning_rate_ratio: f64,
+    pub features: OptimizerFeatureConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -1041,6 +1116,28 @@ pub fn linear(input_vector: &[Value], weights: &[Vec<Value>], biases: &[Value]) 
         .collect()
 }
 
+fn linear_with_optional_bias(
+    input_vector: &[Value],
+    weights: &[Vec<Value>],
+    biases: &[Value],
+    config: &TransformerConfig,
+) -> Vec<Value> {
+    if config.features.use_learned_biases {
+        linear(input_vector, weights, biases)
+    } else {
+        weights
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .zip(input_vector.iter())
+                    .fold(Value::new(0.0), |output_value, (weight, input)| {
+                        output_value.add(&weight.mul(input))
+                    })
+            })
+            .collect()
+    }
+}
+
 pub fn tied_language_model_logits(
     hidden_state: &[Value],
     token_embedding: &[Vec<Value>],
@@ -1056,6 +1153,24 @@ pub fn tied_language_model_logits(
     // that character as output. That reduces redundant parameters and often
     // improves generalization when data is limited.
     linear(hidden_state, token_embedding, biases)
+}
+
+fn language_model_logits(
+    hidden_state: &[Value],
+    model: &TransformerModelParameters,
+    config: &TransformerConfig,
+) -> Vec<Value> {
+    let weights = if config.features.use_tied_output_embeddings {
+        &model.token_embedding
+    } else {
+        &model.language_model_head
+    };
+    linear_with_optional_bias(
+        hidden_state,
+        weights,
+        &model.language_model_head_biases,
+        config,
+    )
 }
 
 pub fn softmax(logits: &[Value]) -> Vec<Value> {
@@ -1115,6 +1230,18 @@ pub fn rmsnorm(input_vector: &[Value], gain: &[Value]) -> Vec<Value> {
         .collect()
 }
 
+fn rmsnorm_with_optional_gain(
+    input_vector: &[Value],
+    gain: &[Value],
+    config: &TransformerConfig,
+) -> Vec<Value> {
+    if config.features.use_learned_rmsnorm_gain {
+        rmsnorm(input_vector, gain)
+    } else {
+        rmsnorm(input_vector, &one_vector(input_vector.len()))
+    }
+}
+
 pub fn weighted_choice(weights: &[f64], random_number_generator: &mut impl Rng) -> usize {
     // Sampling chooses an index with probability proportional to its weight.
     // Example: weights [0.1, 0.7, 0.2] will choose index 1 most often, but not
@@ -1158,6 +1285,13 @@ fn run_transformer_model_with_dropout(
     // current position, updates the KV cache, then returns logits for the next
     // token. Training calls this repeatedly over a sentence.
     let mut hidden_state = model.token_embedding[token_id].clone();
+    if config.features.use_learned_absolute_position_encoding {
+        hidden_state = hidden_state
+            .iter()
+            .zip(model.position_embedding[position_id].iter())
+            .map(|(token_value, position_value)| token_value.add(position_value))
+            .collect();
+    }
     let mut current_keys = keys;
     let mut current_values = values;
 
@@ -1179,13 +1313,11 @@ fn run_transformer_model_with_dropout(
         current_values = layer_run.values;
     }
 
-    hidden_state = rmsnorm(&hidden_state, &model.final_norm_gain);
+    if config.features.use_final_rmsnorm {
+        hidden_state = rmsnorm_with_optional_gain(&hidden_state, &model.final_norm_gain, config);
+    }
     TransformerRun {
-        logits: tied_language_model_logits(
-            &hidden_state,
-            &model.token_embedding,
-            &model.language_model_head_biases,
-        ),
+        logits: language_model_logits(&hidden_state, model, config),
         keys: current_keys,
         values: current_values,
     }
@@ -1207,30 +1339,30 @@ fn run_transformer_layer(
     // Residual additions let each block make an incremental edit instead of
     // relearning the whole representation from scratch.
     let residual_state = hidden_state.to_vec();
-    let normalized_state = rmsnorm(hidden_state, &layer.attention_norm_gain);
+    let normalized_state =
+        rmsnorm_with_optional_gain(hidden_state, &layer.attention_norm_gain, config);
 
-    let query = apply_rotary_position_embedding(
-        &linear(
-            &normalized_state,
-            &layer.attention.query_weights,
-            &layer.attention.query_biases,
-        ),
-        layer_context.position_id,
+    let mut query = linear_with_optional_bias(
+        &normalized_state,
+        &layer.attention.query_weights,
+        &layer.attention.query_biases,
         config,
     );
-    let key = apply_rotary_position_embedding(
-        &linear(
-            &normalized_state,
-            &layer.attention.key_weights,
-            &layer.attention.key_biases,
-        ),
-        layer_context.position_id,
+    let mut key = linear_with_optional_bias(
+        &normalized_state,
+        &layer.attention.key_weights,
+        &layer.attention.key_biases,
         config,
     );
-    let value = linear(
+    if config.features.use_rope_position_encoding {
+        query = apply_rotary_position_embedding(&query, layer_context.position_id, config);
+        key = apply_rotary_position_embedding(&key, layer_context.position_id, config);
+    }
+    let value = linear_with_optional_bias(
         &normalized_state,
         &layer.attention.value_weights,
         &layer.attention.value_biases,
+        config,
     );
 
     // Store this step's key/value so future positions can attend to it.
@@ -1243,10 +1375,11 @@ fn run_transformer_layer(
         &values[layer_context.layer_index],
         config,
     );
-    let mut block_output = linear(
+    let mut block_output = linear_with_optional_bias(
         &attention_output,
         &layer.attention.output_projection_weights,
         &layer.attention.output_projection_biases,
+        config,
     );
     apply_cpu_residual_dropout(
         &mut block_output,
@@ -1262,29 +1395,37 @@ fn run_transformer_layer(
         .collect();
 
     let residual_state = updated_hidden_state.clone();
-    let normalized_state = rmsnorm(&updated_hidden_state, &layer.feed_forward_norm_gain);
-    let expanded_output = linear(
+    let normalized_state =
+        rmsnorm_with_optional_gain(&updated_hidden_state, &layer.feed_forward_norm_gain, config);
+    let expanded_output = linear_with_optional_bias(
         &normalized_state,
         &layer.feed_forward.expansion_weights,
         &layer.feed_forward.expansion_biases,
+        config,
     );
-    let gated_output = linear(
+    let gated_output = linear_with_optional_bias(
         &normalized_state,
         &layer.feed_forward.gate_weights,
         &layer.feed_forward.gate_biases,
+        config,
     );
     // SwiGLU: silu(candidate) * gate. The multiplication lets the model suppress
     // or emphasize features depending on context, which is more expressive than
     // a plain ReLU MLP at similar compute.
-    let block_output = expanded_output
-        .iter()
-        .zip(gated_output.iter())
-        .map(|(expanded_value, gate_value)| silu(expanded_value).mul(gate_value))
-        .collect::<Vec<_>>();
-    let mut block_output = linear(
+    let block_output = if config.features.use_swiglu_feed_forward {
+        expanded_output
+            .iter()
+            .zip(gated_output.iter())
+            .map(|(expanded_value, gate_value)| silu(expanded_value).mul(gate_value))
+            .collect::<Vec<_>>()
+    } else {
+        expanded_output.iter().map(Value::relu).collect::<Vec<_>>()
+    };
+    let mut block_output = linear_with_optional_bias(
         &block_output,
         &layer.feed_forward.projection_weights,
         &layer.feed_forward.projection_biases,
+        config,
     );
     apply_cpu_residual_dropout(
         &mut block_output,
@@ -1589,15 +1730,14 @@ fn train_on_document_with_gradients(
 ) -> DocumentTrainingResult {
     // One document produces one scalar loss. Calling backward on that loss tells
     // us how every parameter should change to reduce surprise on this document.
-    let loss = train_on_token_window_with_dropout(
-        model,
-        config,
-        token_window,
-        Some(CpuDropoutContext {
+    let dropout_context = config
+        .features
+        .use_residual_dropout
+        .then_some(CpuDropoutContext {
             step,
             batch_offset: token_window.batch_offset,
-        }),
-    );
+        });
+    let loss = train_on_token_window_with_dropout(model, config, token_window, dropout_context);
     DocumentTrainingResult {
         loss: loss.data(),
         parameter_gradients: loss.backward_for(parameter_index_by_value, parameter_count),
@@ -1896,7 +2036,11 @@ pub fn apply_adam_update(
     // 5. Add decoupled weight decay.
     // 6. Subtract the update from each parameter.
     let parameters = model.values();
-    let clipped_gradients = clipped_gradients(gradients, MAX_GRADIENT_NORM);
+    let clipped_gradients = if optimizer_config.features.use_gradient_clipping {
+        clipped_gradients(gradients, MAX_GRADIENT_NORM)
+    } else {
+        gradients.to_vec()
+    };
     let step_learning_rate = scheduled_learning_rate(optimizer_config, step, training_step_count);
 
     let parameter_updates: Vec<_> = parameters
@@ -1920,7 +2064,11 @@ pub fn apply_adam_update(
                 / (1.0 - optimizer_config.second_moment_decay.powf(step as f64 + 1.0));
             let adam_update = bias_corrected_first_moment
                 / (bias_corrected_second_moment.sqrt() + optimizer_config.epsilon);
-            let decay_update = optimizer_config.weight_decay * parameter.data();
+            let decay_update = if optimizer_config.features.use_weight_decay {
+                optimizer_config.weight_decay * parameter.data()
+            } else {
+                0.0
+            };
             let parameter_update = step_learning_rate * (adam_update + decay_update);
 
             ParameterUpdate {
@@ -1956,6 +2104,11 @@ pub fn scheduled_learning_rate(
     step: usize,
     training_step_count: usize,
 ) -> f64 {
+    if !optimizer_config.features.use_warmup_cosine_learning_rate {
+        return optimizer_config.learning_rate
+            * (1.0 - step as f64 / training_step_count.max(1) as f64).max(0.0);
+    }
+
     // Warmup ramps linearly from small steps to the base learning rate. After
     // warmup, cosine decay smoothly lowers the rate. This gives fast early
     // learning and gentler late fine-tuning.
@@ -2260,6 +2413,7 @@ mod tests {
             weight_decay: 0.0,
             warmup_step_count: 0,
             minimum_learning_rate_ratio: 0.0,
+            features: OptimizerFeatureConfig::optimized_defaults(),
         };
         let session = create_microgpt_training_session(
             vec!["anna".into(), "anne".into(), "emma".into(), "ella".into()],
@@ -2278,6 +2432,26 @@ mod tests {
     }
 
     #[test]
+    fn optimizer_schedule_can_fall_back_to_linear_decay() {
+        let optimizer = AdamOptimizerConfig {
+            learning_rate: 0.01,
+            first_moment_decay: 0.9,
+            second_moment_decay: 0.999,
+            epsilon: 1e-8,
+            weight_decay: 0.0,
+            warmup_step_count: 100,
+            minimum_learning_rate_ratio: 0.1,
+            features: OptimizerFeatureConfig {
+                use_gradient_clipping: true,
+                use_weight_decay: false,
+                use_warmup_cosine_learning_rate: false,
+            },
+        };
+
+        assert!((scheduled_learning_rate(&optimizer, 25, 100) - 0.0075).abs() < 1e-12);
+    }
+
+    #[test]
     fn validation_loss_is_weighted_by_prediction_count() {
         let mut rng = ChaCha8Rng::seed_from_u64(9);
         let config = TransformerConfig::new(1, 8, 32, 2).unwrap();
@@ -2289,6 +2463,7 @@ mod tests {
             weight_decay: 0.0,
             warmup_step_count: 0,
             minimum_learning_rate_ratio: 0.0,
+            features: OptimizerFeatureConfig::optimized_defaults(),
         };
         let session = create_microgpt_training_session_from_splits(
             vec!["train text.".into()],
@@ -2344,6 +2519,7 @@ mod tests {
             weight_decay: 0.0,
             warmup_step_count: 0,
             minimum_learning_rate_ratio: 0.0,
+            features: OptimizerFeatureConfig::optimized_defaults(),
         };
         let session = create_microgpt_training_session(
             vec!["anna".into(), "anne".into(), "emma".into(), "ella".into()],

@@ -491,6 +491,8 @@ struct MlxParamView<'a> {
     // treat the flat `inputs: &[Array]` from `value_and_grad` as a named model
     // without cloning every tensor.
     token_embedding: &'a Array,
+    position_embedding: &'a Array,
+    language_model_head: &'a Array,
     language_model_head_biases: &'a Array,
     final_norm_gain: &'a Array,
     rotary_position_matrices: &'a [Array],
@@ -676,21 +678,23 @@ pub fn train_mlx_microgpt_step(
     // borrowed view without needing to capture the whole model inside the MLX
     // autodiff closure.
     let layer_count = session.trained_microgpt.model.layers.len();
-    let dropout_masks = batch_dropout_masks(
-        step,
-        batch_document_count,
-        session.trained_microgpt.config.context_window_size,
-        session.trained_microgpt.config.embedding_size,
-        layer_count,
-        RESIDUAL_DROPOUT_PROBABILITY,
-    );
+    let dropout_masks = config.features.use_residual_dropout.then(|| {
+        batch_dropout_masks(
+            step,
+            batch_document_count,
+            session.trained_microgpt.config.context_window_size,
+            session.trained_microgpt.config.embedding_size,
+            layer_count,
+            RESIDUAL_DROPOUT_PROBABILITY,
+        )
+    });
 
     let loss_fn = move |inputs: &[Array]| -> MlxResult<Vec<Array>> {
         // MLX closures receive a flat parameter list. Convert it back into a
         // named view, compute scalar batch loss, and return it as a one-element
         // vector because the transform API is vector-valued.
         let params = params_from_arrays(inputs, layer_count, &rotary_position_matrices);
-        let loss = batch_loss(&params, &config, &batch_windows, Some(&dropout_masks))?;
+        let loss = batch_loss(&params, &config, &batch_windows, dropout_masks.as_ref())?;
         Ok(vec![loss])
     };
 
@@ -963,13 +967,15 @@ fn params_from_arrays<'a>(
     };
 
     let token_embedding = next();
-    let _position_embedding = next();
-    let _language_model_head = next();
+    let position_embedding = next();
+    let language_model_head = next();
     let language_model_head_biases = next();
     let final_norm_gain = next();
 
     MlxParamView {
         token_embedding,
+        position_embedding,
+        language_model_head,
         language_model_head_biases,
         final_norm_gain,
         rotary_position_matrices,
@@ -1074,6 +1080,16 @@ fn run_transformer_batch(
     // [batch, sequence, embedding_size]. This single gather replaces the
     // token-by-token embedding lookup loop used by the reference backend.
     let mut hidden_state = params.token_embedding.take_axis(input_tokens, 0)?;
+    if config.features.use_learned_absolute_position_encoding {
+        let position_ids = Array::from_slice(
+            &(0..config.context_window_size as i32).collect::<Vec<_>>(),
+            &[config.context_window_size as i32],
+        );
+        hidden_state += &params
+            .position_embedding
+            .take_axis(&position_ids, 0)?
+            .expand_dims(0)?;
+    }
 
     for (layer_index, layer) in params.layers.iter().enumerate() {
         hidden_state = run_transformer_layer_batch(
@@ -1089,12 +1105,10 @@ fn run_transformer_batch(
     // Final norm makes the scale of the hidden states predictable before the
     // output dot products. With tied embeddings, this is especially helpful:
     // logits are literal dot products against token embedding rows.
-    hidden_state = rmsnorm_last_axis(&hidden_state, params.final_norm_gain)?;
-    tied_language_model_logits_batch(
-        &hidden_state,
-        params.token_embedding,
-        params.language_model_head_biases,
-    )
+    if config.features.use_final_rmsnorm {
+        hidden_state = rmsnorm_last_axis(&hidden_state, params.final_norm_gain, config)?;
+    }
+    language_model_logits_batch(&hidden_state, params, config)
 }
 
 fn run_transformer_layer_batch(
@@ -1110,30 +1124,29 @@ fn run_transformer_layer_batch(
     // sub-block output back to the residual stream. Pre-norm is generally easier
     // to train because gradients can flow through the residual path even when a
     // sub-block is poorly initialized.
-    let normalized_state = rmsnorm_last_axis(hidden_state, layer.attention_norm_gain)?;
+    let normalized_state = rmsnorm_last_axis(hidden_state, layer.attention_norm_gain, config)?;
 
-    let query = apply_rotary_position_embedding_batch(
-        &linear_last_axis(
-            &normalized_state,
-            layer.attention.query_weights,
-            layer.attention.query_biases,
-        )?,
-        rotary_position_matrices,
+    let mut query = linear_last_axis(
+        &normalized_state,
+        layer.attention.query_weights,
+        layer.attention.query_biases,
         config,
     )?;
-    let key = apply_rotary_position_embedding_batch(
-        &linear_last_axis(
-            &normalized_state,
-            layer.attention.key_weights,
-            layer.attention.key_biases,
-        )?,
-        rotary_position_matrices,
+    let mut key = linear_last_axis(
+        &normalized_state,
+        layer.attention.key_weights,
+        layer.attention.key_biases,
         config,
     )?;
+    if config.features.use_rope_position_encoding {
+        query = apply_rotary_position_embedding_batch(&query, rotary_position_matrices, config)?;
+        key = apply_rotary_position_embedding_batch(&key, rotary_position_matrices, config)?;
+    }
     let value = linear_last_axis(
         &normalized_state,
         layer.attention.value_weights,
         layer.attention.value_biases,
+        config,
     )?;
 
     let attention_output = run_multi_head_attention_batch(&query, &key, &value, config)?;
@@ -1141,6 +1154,7 @@ fn run_transformer_layer_batch(
         &attention_output,
         layer.attention.output_projection_weights,
         layer.attention.output_projection_biases,
+        config,
     )?;
     if let Some(dropout_masks) = dropout_masks {
         // Drop only the residual update, not the residual state itself. The
@@ -1151,22 +1165,30 @@ fn run_transformer_layer_batch(
     let updated_hidden_state = block_output + residual_state;
 
     let residual_state = updated_hidden_state.clone();
-    let normalized_state = rmsnorm_last_axis(&updated_hidden_state, layer.feed_forward_norm_gain)?;
+    let normalized_state =
+        rmsnorm_last_axis(&updated_hidden_state, layer.feed_forward_norm_gain, config)?;
     let expanded_output = linear_last_axis(
         &normalized_state,
         layer.feed_forward.expansion_weights,
         layer.feed_forward.expansion_biases,
+        config,
     )?;
     let gated_output = linear_last_axis(
         &normalized_state,
         layer.feed_forward.gate_weights,
         layer.feed_forward.gate_biases,
+        config,
     )?;
-    let block_output = silu(&expanded_output)? * gated_output;
+    let block_output = if config.features.use_swiglu_feed_forward {
+        silu(&expanded_output)? * gated_output
+    } else {
+        relu(&expanded_output)?
+    };
     let mut block_output = linear_last_axis(
         &block_output,
         layer.feed_forward.projection_weights,
         layer.feed_forward.projection_biases,
+        config,
     )?;
     if let Some(dropout_masks) = dropout_masks {
         // Same idea for the feed-forward update. During inference this mask is
@@ -1276,31 +1298,56 @@ fn apply_rotary_position_embedding_batch(
         .reshape(&[batch_size, sequence_len, config.embedding_size as i32])
 }
 
-fn linear_last_axis(input: &Array, weights: &Array, biases: &Array) -> MlxResult<Array> {
+fn linear_last_axis(
+    input: &Array,
+    weights: &Array,
+    biases: &Array,
+    config: &TransformerConfig,
+) -> MlxResult<Array> {
     // Apply the same dense layer independently at every [batch, sequence]
     // location. `input` is [..., input_size], weights are [output_size,
     // input_size], so transposing weights lets MLX produce [..., output_size].
-    Ok(input.matmul(&weights.transpose()?)? + biases)
+    let output = input.matmul(&weights.transpose()?)?;
+    if config.features.use_learned_biases {
+        Ok(output + biases)
+    } else {
+        Ok(output)
+    }
 }
 
-fn tied_language_model_logits_batch(
+fn language_model_logits_batch(
     hidden_state: &Array,
-    token_embedding: &Array,
-    biases: &Array,
+    params: &MlxParamView<'_>,
+    config: &TransformerConfig,
 ) -> MlxResult<Array> {
     // Tied output head: every final hidden vector is dotted against every token
     // embedding row. Result shape is [batch, sequence, vocabulary_size].
-    Ok(hidden_state.matmul(&token_embedding.transpose()?)? + biases)
+    let weights = if config.features.use_tied_output_embeddings {
+        params.token_embedding
+    } else {
+        params.language_model_head
+    };
+    let output = hidden_state.matmul(&weights.transpose()?)?;
+    if config.features.use_learned_biases {
+        Ok(output + params.language_model_head_biases)
+    } else {
+        Ok(output)
+    }
 }
 
-fn rmsnorm_last_axis(input: &Array, gain: &Array) -> MlxResult<Array> {
+fn rmsnorm_last_axis(input: &Array, gain: &Array, config: &TransformerConfig) -> MlxResult<Array> {
     // Normalize only the feature/channel axis, not batch or time. For a hidden
     // vector [x1, x2, ...], RMSNorm divides by sqrt(mean(x_i^2) + epsilon), then
     // multiplies by the learned gain vector. The gain is the trainable "how loud
     // should this channel be after normalization?" parameter.
     let mean_square = ops::mean_axis(&ops::square(input)?, -1, true)?;
     let scale = (mean_square + Array::from_f32(1e-5)).sqrt()?;
-    Ok((input / scale) * gain)
+    let output = input / scale;
+    if config.features.use_learned_rmsnorm_gain {
+        Ok(output * gain)
+    } else {
+        Ok(output)
+    }
 }
 
 fn batch_dropout_masks(
@@ -1434,6 +1481,9 @@ fn run_transformer_model(
     //   position_embedding table: [context_window_size, embedding_size]
     //   hidden_state:             [embedding_size]
     let mut hidden_state = params.token_embedding.index(token_id as i32);
+    if config.features.use_learned_absolute_position_encoding {
+        hidden_state += params.position_embedding.index(position_id as i32);
+    }
     let mut current_keys = keys;
     let mut current_values = values;
 
@@ -1454,14 +1504,12 @@ fn run_transformer_model(
         current_keys = layer_run.keys;
         current_values = layer_run.values;
     }
-    hidden_state = rmsnorm(&hidden_state, params.final_norm_gain)?;
+    if config.features.use_final_rmsnorm {
+        hidden_state = rmsnorm(&hidden_state, params.final_norm_gain, config)?;
+    }
 
     Ok(TransformerRun {
-        logits: tied_language_model_logits(
-            &hidden_state,
-            params.token_embedding,
-            params.language_model_head_biases,
-        )?,
+        logits: language_model_logits(&hidden_state, params, config)?,
         keys: current_keys,
         values: current_values,
     })
@@ -1479,30 +1527,31 @@ fn run_transformer_layer(
     // Same pre-norm residual block as the CPU implementation, now expressed as
     // tensor operations. The residual stream is an Array of shape [embedding].
     let residual_state = hidden_state.clone();
-    let normalized_state = rmsnorm(hidden_state, layer.attention_norm_gain)?;
+    let normalized_state = rmsnorm(hidden_state, layer.attention_norm_gain, config)?;
 
     // `linear` returns [embedding_size]. The precomputed RoPE matrix keeps the
     // same shape while rotating pairs of values inside each attention head.
-    let query = apply_rotary_position_embedding(
-        &linear(
-            &normalized_state,
-            layer.attention.query_weights,
-            layer.attention.query_biases,
-        )?,
-        rotary_position_matrix,
+    let mut query = linear(
+        &normalized_state,
+        layer.attention.query_weights,
+        layer.attention.query_biases,
+        config,
     )?;
-    let key = apply_rotary_position_embedding(
-        &linear(
-            &normalized_state,
-            layer.attention.key_weights,
-            layer.attention.key_biases,
-        )?,
-        rotary_position_matrix,
+    let mut key = linear(
+        &normalized_state,
+        layer.attention.key_weights,
+        layer.attention.key_biases,
+        config,
     )?;
+    if config.features.use_rope_position_encoding {
+        query = apply_rotary_position_embedding(&query, rotary_position_matrix)?;
+        key = apply_rotary_position_embedding(&key, rotary_position_matrix)?;
+    }
     let value = linear(
         &normalized_state,
         layer.attention.value_weights,
         layer.attention.value_biases,
+        config,
     )?;
 
     // Cache entries are per layer. At time step t, `keys[layer_index]` contains
@@ -1516,11 +1565,12 @@ fn run_transformer_layer(
         &attention_output,
         layer.attention.output_projection_weights,
         layer.attention.output_projection_biases,
+        config,
     )?;
     let mut updated_hidden_state = block_output + residual_state;
 
     let residual_state = updated_hidden_state.clone();
-    let normalized_state = rmsnorm(&updated_hidden_state, layer.feed_forward_norm_gain)?;
+    let normalized_state = rmsnorm(&updated_hidden_state, layer.feed_forward_norm_gain, config)?;
     // Feed-forward tensor shapes:
     //   normalized_state: [embedding_size]
     //   expanded_output:  [3 * embedding_size]
@@ -1530,17 +1580,24 @@ fn run_transformer_layer(
         &normalized_state,
         layer.feed_forward.expansion_weights,
         layer.feed_forward.expansion_biases,
+        config,
     )?;
     let gated_output = linear(
         &normalized_state,
         layer.feed_forward.gate_weights,
         layer.feed_forward.gate_biases,
+        config,
     )?;
-    let block_output = silu(&expanded_output)? * gated_output;
+    let block_output = if config.features.use_swiglu_feed_forward {
+        silu(&expanded_output)? * gated_output
+    } else {
+        relu(&expanded_output)?
+    };
     let block_output = linear(
         &block_output,
         layer.feed_forward.projection_weights,
         layer.feed_forward.projection_biases,
+        config,
     )?;
     updated_hidden_state = block_output + residual_state;
 
@@ -1594,19 +1651,39 @@ fn run_multi_head_attention(
     ops::sum_axis(&weighted_values, 1, None)?.reshape(&[config.embedding_size as i32])
 }
 
-fn linear(input_vector: &Array, weights: &Array, biases: &Array) -> MlxResult<Array> {
+fn linear(
+    input_vector: &Array,
+    weights: &Array,
+    biases: &Array,
+    config: &TransformerConfig,
+) -> MlxResult<Array> {
     // MLX matmul is the high-performance version of the CPU backend's row-wise
     // dot-product loop. Adding the bias vector turns pure matrix multiplication
     // into the affine projection used by ordinary dense neural-network layers.
-    Ok(weights.matmul(input_vector)? + biases)
+    let output = weights.matmul(input_vector)?;
+    if config.features.use_learned_biases {
+        Ok(output + biases)
+    } else {
+        Ok(output)
+    }
 }
 
-fn tied_language_model_logits(
+fn language_model_logits(
     hidden_state: &Array,
-    token_embedding: &Array,
-    biases: &Array,
+    params: &MlxParamView<'_>,
+    config: &TransformerConfig,
 ) -> MlxResult<Array> {
-    Ok(token_embedding.matmul(hidden_state)? + biases)
+    let weights = if config.features.use_tied_output_embeddings {
+        params.token_embedding
+    } else {
+        params.language_model_head
+    };
+    let output = weights.matmul(hidden_state)?;
+    if config.features.use_learned_biases {
+        Ok(output + params.language_model_head_biases)
+    } else {
+        Ok(output)
+    }
 }
 
 fn apply_rotary_position_embedding(
@@ -1667,16 +1744,25 @@ fn rotary_position_matrix(position_id: usize, config: &TransformerConfig) -> Arr
     )
 }
 
-fn rmsnorm(input_vector: &Array, gain: &Array) -> MlxResult<Array> {
+fn rmsnorm(input_vector: &Array, gain: &Array, config: &TransformerConfig) -> MlxResult<Array> {
     // Tensor RMSNorm. `None` means reduce over every element in this 1-D vector.
     let mean_square = ops::mean(&ops::square(input_vector)?, None)?;
     let scale = (mean_square + Array::from_f32(1e-5)).sqrt()?;
-    Ok((input_vector / scale) * gain)
+    let output = input_vector / scale;
+    if config.features.use_learned_rmsnorm_gain {
+        Ok(output * gain)
+    } else {
+        Ok(output)
+    }
 }
 
 fn silu(input: &Array) -> MlxResult<Array> {
     // Tensor SiLU: x / (1 + exp(-x)).
     Ok(input / (Array::from_f32(1.0) + ops::exp(&(input * Array::from_f32(-1.0)))?))
+}
+
+fn relu(input: &Array) -> MlxResult<Array> {
+    ops::maximum(input, &Array::from_f32(0.0))
 }
 
 fn apply_adam_update(
@@ -1699,7 +1785,11 @@ fn apply_adam_update(
     let second_bias_correction = Array::from_f32(1.0 - beta2.powf(step as f32 + 1.0));
     // `gradient_scale` is a scalar Array, not a Rust f32. Keeping it as an Array
     // lets MLX apply it to every gradient tensor inside the same lazy graph.
-    let gradient_scale = gradient_clip_scale(gradients, MAX_GRADIENT_NORM)?;
+    let gradient_scale = if optimizer_config.features.use_gradient_clipping {
+        gradient_clip_scale(gradients, MAX_GRADIENT_NORM)?
+    } else {
+        Array::from_f32(1.0)
+    };
 
     let mut updated_parameters = Vec::with_capacity(parameters.len());
     let mut first_moment_estimates = Vec::with_capacity(parameters.len());
@@ -1723,7 +1813,11 @@ fn apply_adam_update(
         let bias_corrected_second_moment = &new_second_moment / &second_bias_correction;
         let adam_update =
             bias_corrected_first_moment / (bias_corrected_second_moment.sqrt()? + &epsilon);
-        let decay_update = parameter * Array::from_f32(optimizer_config.weight_decay as f32);
+        let decay_update = if optimizer_config.features.use_weight_decay {
+            parameter * Array::from_f32(optimizer_config.weight_decay as f32)
+        } else {
+            Array::from_f32(0.0)
+        };
         let update = &learning_rate * (adam_update + decay_update);
 
         // `parameter - update` creates the next parameter tensor. It does not
@@ -1887,6 +1981,7 @@ fn weighted_choice(weights: &[f64], random_number_generator: &mut impl Rng) -> u
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::microgpt::OptimizerFeatureConfig;
     use rand::SeedableRng;
     use rand_chacha::ChaCha8Rng;
     use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -1911,6 +2006,7 @@ mod tests {
             weight_decay: 0.0,
             warmup_step_count: 0,
             minimum_learning_rate_ratio: 0.0,
+            features: OptimizerFeatureConfig::optimized_defaults(),
         };
         let session = create_mlx_microgpt_training_session(
             vec!["anna".into(), "anne".into(), "emma".into(), "ella".into()],
@@ -1953,6 +2049,7 @@ mod tests {
             weight_decay: 0.0,
             warmup_step_count: 0,
             minimum_learning_rate_ratio: 0.0,
+            features: OptimizerFeatureConfig::optimized_defaults(),
         };
         let session = create_mlx_microgpt_training_session(
             vec![
@@ -1990,6 +2087,7 @@ mod tests {
             weight_decay: 0.0,
             warmup_step_count: 0,
             minimum_learning_rate_ratio: 0.0,
+            features: OptimizerFeatureConfig::optimized_defaults(),
         };
         let session = create_mlx_microgpt_training_session(
             vec!["anna".into(), "anne".into(), "emma".into(), "ella".into()],

@@ -148,6 +148,20 @@ button, input {
     color: #53645c;
 }
 
+.checkbox-field {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 38px;
+    color: #17202a;
+    font-size: 13px;
+}
+
+.checkbox-field input {
+    width: 16px;
+    height: 16px;
+}
+
 .text-input {
     width: 100%;
     box-sizing: border-box;

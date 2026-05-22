@@ -13,8 +13,8 @@ use rand_chacha::ChaCha8Rng;
 use rfd::FileDialog;
 use sentence_gpt_rs_mlx_config::{
     create_training_session, format_count, format_learning_rate, format_loss, format_percent,
-    format_percent_style, format_perplexity, get_optimizer_config, load_input_documents,
-    next_validation_step_after, running_mean_loss, running_mean_loss_values,
+    format_percent_style, format_perplexity, load_input_documents, next_validation_step_after,
+    optimizer_config_for_training_run, running_mean_loss, running_mean_loss_values,
     train_session_until_budget as train_shared_session_until_budget, Backend, TrainedSnapshot,
     TrainingSession,
 };
@@ -49,6 +49,21 @@ enum TrainingRunConfigField {
     LayerCount,
     AttentionHeads,
     EmbeddingSize,
+}
+
+#[derive(Clone, Copy)]
+enum TrainingRunConfigToggleField {
+    LearnedBiases,
+    RopePositionEncoding,
+    LearnedAbsolutePositionEncoding,
+    ResidualDropout,
+    LearnedRmsNormGain,
+    FinalRmsNorm,
+    SwigluFeedForward,
+    TiedOutputEmbeddings,
+    GradientClipping,
+    WeightDecay,
+    WarmupCosineLearningRate,
 }
 
 impl DocumentBrowserDataset {
@@ -414,6 +429,17 @@ fn App() -> Element {
                         {config_number_input("Layers", selected_training_run_config.layer_count, can_configure_training_run, TrainingRunConfigField::LayerCount, state)}
                         {config_number_input("Attention heads", selected_training_run_config.attention_heads, can_configure_training_run, TrainingRunConfigField::AttentionHeads, state)}
                         {config_number_input("Embedding size", selected_training_run_config.embedding_size, can_configure_training_run, TrainingRunConfigField::EmbeddingSize, state)}
+                        {config_checkbox_input("Learned biases", selected_training_run_config.transformer_features.use_learned_biases, can_configure_training_run, TrainingRunConfigToggleField::LearnedBiases, state)}
+                        {config_checkbox_input("RoPE positions", selected_training_run_config.transformer_features.use_rope_position_encoding, can_configure_training_run, TrainingRunConfigToggleField::RopePositionEncoding, state)}
+                        {config_checkbox_input("Absolute positions", selected_training_run_config.transformer_features.use_learned_absolute_position_encoding, can_configure_training_run, TrainingRunConfigToggleField::LearnedAbsolutePositionEncoding, state)}
+                        {config_checkbox_input("Residual dropout", selected_training_run_config.transformer_features.use_residual_dropout, can_configure_training_run, TrainingRunConfigToggleField::ResidualDropout, state)}
+                        {config_checkbox_input("Learned RMSNorm gain", selected_training_run_config.transformer_features.use_learned_rmsnorm_gain, can_configure_training_run, TrainingRunConfigToggleField::LearnedRmsNormGain, state)}
+                        {config_checkbox_input("Final RMSNorm", selected_training_run_config.transformer_features.use_final_rmsnorm, can_configure_training_run, TrainingRunConfigToggleField::FinalRmsNorm, state)}
+                        {config_checkbox_input("SwiGLU MLP", selected_training_run_config.transformer_features.use_swiglu_feed_forward, can_configure_training_run, TrainingRunConfigToggleField::SwigluFeedForward, state)}
+                        {config_checkbox_input("Tied output embeddings", selected_training_run_config.transformer_features.use_tied_output_embeddings, can_configure_training_run, TrainingRunConfigToggleField::TiedOutputEmbeddings, state)}
+                        {config_checkbox_input("Gradient clipping", selected_training_run_config.optimizer_features.use_gradient_clipping, can_configure_training_run, TrainingRunConfigToggleField::GradientClipping, state)}
+                        {config_checkbox_input("Weight decay", selected_training_run_config.optimizer_features.use_weight_decay, can_configure_training_run, TrainingRunConfigToggleField::WeightDecay, state)}
+                        {config_checkbox_input("Warmup/cosine LR", selected_training_run_config.optimizer_features.use_warmup_cosine_learning_rate, can_configure_training_run, TrainingRunConfigToggleField::WarmupCosineLearningRate, state)}
                     }
                 }
 
@@ -590,13 +616,14 @@ impl AppState {
         cpu_training_run_config: TrainingRunConfig,
     ) -> Self {
         let mut rng = ChaCha8Rng::seed_from_u64(1);
-        let transformer_config = TransformerConfig::new(
+        let transformer_config = TransformerConfig::new_with_features(
             training_run_config.layer_count,
             training_run_config.embedding_size,
             training_run_config.context_window_size,
             training_run_config.attention_heads,
+            training_run_config.transformer_features,
         );
-        let optimizer_config = get_optimizer_config();
+        let optimizer_config = optimizer_config_for_training_run(training_run_config);
 
         match transformer_config {
             Ok(transformer_config) => {
@@ -771,6 +798,64 @@ impl AppState {
             }
             TrainingRunConfigField::EmbeddingSize => {
                 training_run_config.embedding_size = value;
+            }
+        }
+        self.initialization_error = None;
+    }
+
+    fn set_training_run_config_toggle(&mut self, field: TrainingRunConfigToggleField, value: bool) {
+        if !self.can_configure_training_run() {
+            return;
+        }
+
+        let training_run_config = self.selected_training_run_config_mut();
+        match field {
+            TrainingRunConfigToggleField::LearnedBiases => {
+                training_run_config.transformer_features.use_learned_biases = value;
+            }
+            TrainingRunConfigToggleField::RopePositionEncoding => {
+                training_run_config
+                    .transformer_features
+                    .use_rope_position_encoding = value;
+            }
+            TrainingRunConfigToggleField::LearnedAbsolutePositionEncoding => {
+                training_run_config
+                    .transformer_features
+                    .use_learned_absolute_position_encoding = value;
+            }
+            TrainingRunConfigToggleField::ResidualDropout => {
+                training_run_config
+                    .transformer_features
+                    .use_residual_dropout = value;
+            }
+            TrainingRunConfigToggleField::LearnedRmsNormGain => {
+                training_run_config
+                    .transformer_features
+                    .use_learned_rmsnorm_gain = value;
+            }
+            TrainingRunConfigToggleField::FinalRmsNorm => {
+                training_run_config.transformer_features.use_final_rmsnorm = value;
+            }
+            TrainingRunConfigToggleField::SwigluFeedForward => {
+                training_run_config
+                    .transformer_features
+                    .use_swiglu_feed_forward = value;
+            }
+            TrainingRunConfigToggleField::TiedOutputEmbeddings => {
+                training_run_config
+                    .transformer_features
+                    .use_tied_output_embeddings = value;
+            }
+            TrainingRunConfigToggleField::GradientClipping => {
+                training_run_config.optimizer_features.use_gradient_clipping = value;
+            }
+            TrainingRunConfigToggleField::WeightDecay => {
+                training_run_config.optimizer_features.use_weight_decay = value;
+            }
+            TrainingRunConfigToggleField::WarmupCosineLearningRate => {
+                training_run_config
+                    .optimizer_features
+                    .use_warmup_cosine_learning_rate = value;
             }
         }
         self.initialization_error = None;
@@ -1268,6 +1353,28 @@ fn config_number_input(
                     state.write().set_training_run_config_value(field, event.value());
                 }
             }
+        }
+    }
+}
+
+fn config_checkbox_input(
+    label: &'static str,
+    value: bool,
+    is_editable: bool,
+    field: TrainingRunConfigToggleField,
+    mut state: Signal<AppState>,
+) -> Element {
+    rsx! {
+        label { class: "checkbox-field",
+            input {
+                r#type: "checkbox",
+                checked: value,
+                disabled: !is_editable,
+                onchange: move |event| {
+                    state.write().set_training_run_config_toggle(field, event.checked());
+                }
+            }
+            span { "{label}" }
         }
     }
 }

@@ -1,5 +1,6 @@
 use crate::microgpt::{
-    AdamOptimizerConfig, CharacterTokenizer, MicrogptTrainingProgress, TransformerConfig,
+    AdamOptimizerConfig, CharacterTokenizer, MicrogptTrainingProgress, OptimizerFeatureConfig,
+    TransformerConfig, TransformerFeatureConfig,
 };
 use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
@@ -43,6 +44,8 @@ pub struct TrainingRunConfig {
     pub layer_count: usize,
     pub attention_heads: usize,
     pub embedding_size: usize,
+    pub transformer_features: TransformerFeatureConfig,
+    pub optimizer_features: OptimizerFeatureConfig,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

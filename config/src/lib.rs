@@ -15,7 +15,8 @@ use sentence_gpt_rs_mlx_lib::{
         export_training_session_checkpoint as export_cpu_training_session_checkpoint,
         import_training_session_checkpoint as import_cpu_training_session_checkpoint,
         scheduled_learning_rate, shuffled_by, train_microgpt_step, CharacterTokenizer,
-        MicrogptTrainingProgress, MicrogptTrainingSession, TrainedMicrogpt, TransformerConfig,
+        MicrogptTrainingProgress, MicrogptTrainingSession, OptimizerFeatureConfig, TrainedMicrogpt,
+        TransformerConfig, TransformerFeatureConfig,
     },
     mlx_microgpt::{
         attach_validation_loss as attach_mlx_validation_loss,
@@ -43,6 +44,8 @@ pub const MLX_DEFAULT_TRAINING_RUN_CONFIG: TrainingRunConfig = TrainingRunConfig
     layer_count: 6,
     attention_heads: 8,
     embedding_size: 128,
+    transformer_features: TransformerFeatureConfig::optimized_defaults(),
+    optimizer_features: OptimizerFeatureConfig::optimized_defaults(),
 };
 pub const CPU_DEFAULT_TRAINING_RUN_CONFIG: TrainingRunConfig = TrainingRunConfig {
     validation_step_interval: 25,
@@ -54,6 +57,8 @@ pub const CPU_DEFAULT_TRAINING_RUN_CONFIG: TrainingRunConfig = TrainingRunConfig
     layer_count: 2,
     attention_heads: 4,
     embedding_size: 16,
+    transformer_features: TransformerFeatureConfig::optimized_defaults(),
+    optimizer_features: OptimizerFeatureConfig::optimized_defaults(),
 };
 
 pub fn get_optimizer_config() -> AdamOptimizerConfig {
@@ -65,6 +70,16 @@ pub fn get_optimizer_config() -> AdamOptimizerConfig {
         weight_decay: 0.01,
         warmup_step_count: 200,
         minimum_learning_rate_ratio: 0.1,
+        features: OptimizerFeatureConfig::optimized_defaults(),
+    }
+}
+
+pub fn optimizer_config_for_training_run(
+    training_run_config: TrainingRunConfig,
+) -> AdamOptimizerConfig {
+    AdamOptimizerConfig {
+        features: training_run_config.optimizer_features,
+        ..get_optimizer_config()
     }
 }
 
@@ -633,7 +648,8 @@ fn split_sentences_keep_punctuation(story: &str) -> Vec<String> {
 mod tests {
     use super::{
         create_training_session, get_optimizer_config, split_sentences_keep_punctuation,
-        stories_to_sentence_groups, Backend, Story, TrainingRunConfig, TransformerConfig,
+        stories_to_sentence_groups, Backend, OptimizerFeatureConfig, Story, TrainingRunConfig,
+        TransformerConfig, TransformerFeatureConfig,
     };
     use rand_chacha::rand_core::SeedableRng;
     use rand_chacha::ChaCha8Rng;
@@ -658,6 +674,8 @@ mod tests {
             layer_count: 1,
             attention_heads: 2,
             embedding_size: 8,
+            transformer_features: TransformerFeatureConfig::optimized_defaults(),
+            optimizer_features: OptimizerFeatureConfig::optimized_defaults(),
         };
         let stories = stories_to_sentence_groups(
             vec![
@@ -727,6 +745,8 @@ mod tests {
             layer_count: 1,
             attention_heads: 2,
             embedding_size: 8,
+            transformer_features: TransformerFeatureConfig::optimized_defaults(),
+            optimizer_features: OptimizerFeatureConfig::optimized_defaults(),
         };
         let stories = stories_to_sentence_groups(
             vec![

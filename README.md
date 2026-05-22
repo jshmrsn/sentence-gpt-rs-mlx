@@ -35,6 +35,22 @@ Current architecture features include:
 - sample allows specifying a prefix
 - GUI allows for most similar training example for a selected generated sample
 
+## Compared with original microgpt
+
+Most training additions beyond the original dependency-free Python microgpt can now be toggled before a run starts in the desktop app's training configuration:
+
+- Learned linear/output biases, versus microgpt's no-bias projections.
+- RoPE position encoding, optionally with learned absolute position embeddings for a more microgpt-like setup.
+- Residual dropout during training.
+- Learned RMSNorm gains and final RMSNorm.
+- SwiGLU feed-forward blocks, with a ReLU MLP fallback.
+- Tied token embeddings / LM head, with an independent LM head fallback.
+- Global gradient clipping.
+- AdamW weight decay.
+- Warmup/cosine learning-rate scheduling, with the original-style linear decay fallback.
+
+Other project-level additions remain structural rather than simple toggles: the MLX backend batches full sequences for Apple Silicon acceleration, the app tracks validation loss, checkpoints can be imported/exported, and training data is split into train/validation sentence examples from TinyStories-derived input.
+
 ## Documentation
 
 - [CPU backend and overall architecture](docs/cpu-backend-and-architecture.md)
