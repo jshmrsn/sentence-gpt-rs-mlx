@@ -31,6 +31,12 @@ button, input {
     z-index: 1;
 }
 
+.bottom-tooltip-space {
+    height: min(42vh, 360px);
+    min-height: 220px;
+    pointer-events: none;
+}
+
 .topbar {
     display: flex;
     align-items: flex-start;

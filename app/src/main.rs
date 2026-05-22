@@ -719,6 +719,8 @@ fn App() -> Element {
                     }
                 }
 
+                div { class: "bottom-tooltip-space" }
+
             }
         }
     }
@@ -1697,7 +1699,7 @@ fn system_overview_panel(
                 "cross entropy".into(),
                 "masked padding".into(),
             ],
-            info_key: None,
+            info_key: Some("optimizer-loss"),
         },
         SystemOverviewStep {
             title: "Gradients".into(),
@@ -1713,7 +1715,7 @@ fn system_overview_panel(
                     snapshot.training_run_config.training_document_batch_size
                 ),
             ],
-            info_key: None,
+            info_key: Some("optimizer-gradients"),
         },
         SystemOverviewStep {
             title: "AdamW".into(),
@@ -1733,7 +1735,7 @@ fn system_overview_panel(
                     session.training_step_count()
                 ),
             ],
-            info_key: None,
+            info_key: Some("optimizer-adamw"),
         },
     ];
 
@@ -2151,6 +2153,21 @@ fn overview_chunk_description(info_key: &str) -> &'static [&'static str] {
             "Input vectors are the dense per-position representations that enter the transformer stack. Their shape is context length by embedding width, though this summary reports vocabulary size by embedding width for the token table itself.",
             "The token table is always active because token ids need learned vectors before the network can process them. Position information is added or applied alongside those token vectors.",
             "Tied output embeddings reuse the token table at the output side, reducing parameter count and encouraging input and output token geometry to stay aligned.",
+        ],
+        "optimizer-loss" => &[
+            "Loss is the scalar training objective computed from the model's next-token predictions. For each position, the model produces logits over the vocabulary, and cross entropy penalizes it when the true next token receives low probability.",
+            "Padding or unavailable positions are masked so they do not contribute fake prediction targets. That keeps the reported loss tied to real token predictions rather than batch-shaping artifacts.",
+            "Training loss is measured on the sampled training batch, while validation loss is measured on held-out documents without updating weights. Comparing the two helps separate memorization from generally useful learning.",
+        ],
+        "optimizer-gradients" => &[
+            "Gradients describe how each trainable parameter should change to reduce the loss for the current batch. Reverse-mode autodiff computes these sensitivities efficiently by walking backward through the operations used in the forward pass.",
+            "The parameter count here is the number of learned scalar values receiving updates: embeddings, attention projections, MLP projections, normalization gains, biases, and optimizer-tracked state where applicable.",
+            "Gradient clipping, when enabled, limits excessively large update signals. This is a stability tool: it prevents one unusually difficult or unlucky batch from producing a step that throws the model far away from the region it was learning in.",
+        ],
+        "optimizer-adamw" => &[
+            "AdamW is the optimizer that turns gradients into parameter updates. It keeps running estimates of gradient direction and gradient scale, then uses those estimates to adapt the step size for each parameter.",
+            "The learning-rate value shown here is the current global scale applied to updates after any warmup or cosine schedule. Warmup starts cautiously, and cosine decay gradually reduces update size later in training.",
+            "Weight decay, when enabled, gently pulls parameters toward smaller values as a separate part of the AdamW update. That can reduce overfitting and keep weights from growing simply because the optimizer can exploit larger magnitudes.",
         ],
         _ => &["This chunk summarizes one concrete part of the training or inference pipeline without expanding it into every token, neuron, or parameter."],
     }
