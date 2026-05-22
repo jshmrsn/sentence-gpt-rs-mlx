@@ -1166,6 +1166,8 @@ fn run_transformer_layer_batch(
     )?;
     let block_output = if config.features.use_swiglu_feed_forward {
         silu(&expanded_output)? * gated_output
+    } else if config.features.use_gelu_feed_forward {
+        gelu(&expanded_output)?
     } else {
         relu(&expanded_output)?
     };
@@ -1575,6 +1577,8 @@ fn run_transformer_layer(
     )?;
     let block_output = if config.features.use_swiglu_feed_forward {
         silu(&expanded_output)? * gated_output
+    } else if config.features.use_gelu_feed_forward {
+        gelu(&expanded_output)?
     } else {
         relu(&expanded_output)?
     };
@@ -1744,6 +1748,18 @@ fn rmsnorm(input_vector: &Array, gain: &Array, config: &TransformerConfig) -> Ml
 fn silu(input: &Array) -> MlxResult<Array> {
     // Tensor SiLU: x / (1 + exp(-x)).
     Ok(input / (Array::from_f32(1.0) + ops::exp(&(input * Array::from_f32(-1.0)))?))
+}
+
+fn gelu(input: &Array) -> MlxResult<Array> {
+    let cubic_adjustment = ops::power(input, Array::from_f32(3.0))? * Array::from_f32(0.044_715);
+    let inner =
+        (input + cubic_adjustment) * Array::from_f32((2.0_f32 / std::f32::consts::PI).sqrt());
+    Ok(input * Array::from_f32(0.5) * (Array::from_f32(1.0) + tanh(&inner)?))
+}
+
+fn tanh(input: &Array) -> MlxResult<Array> {
+    let doubled_exp = ops::exp(&(input * Array::from_f32(2.0)))?;
+    Ok((&doubled_exp - Array::from_f32(1.0)) / (doubled_exp + Array::from_f32(1.0)))
 }
 
 fn relu(input: &Array) -> MlxResult<Array> {

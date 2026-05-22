@@ -53,6 +53,7 @@ pub struct TransformerFeatureConfig {
     pub use_learned_rmsnorm_gain: bool,
     pub use_final_rmsnorm: bool,
     pub use_swiglu_feed_forward: bool,
+    pub use_gelu_feed_forward: bool,
     pub use_tied_output_embeddings: bool,
 }
 
@@ -66,6 +67,7 @@ impl TransformerFeatureConfig {
             use_learned_rmsnorm_gain: true,
             use_final_rmsnorm: true,
             use_swiglu_feed_forward: true,
+            use_gelu_feed_forward: true,
             use_tied_output_embeddings: true,
         }
     }
@@ -1330,6 +1332,8 @@ fn run_transformer_layer(
             .zip(gated_output.iter())
             .map(|(expanded_value, gate_value)| silu(expanded_value).mul(gate_value))
             .collect::<Vec<_>>()
+    } else if config.features.use_gelu_feed_forward {
+        expanded_output.iter().map(gelu).collect::<Vec<_>>()
     } else {
         expanded_output.iter().map(Value::relu).collect::<Vec<_>>()
     };
@@ -1477,6 +1481,19 @@ pub fn silu(value: &Value) -> Value {
     // jump at zero like ReLU.
     let sigmoid = value.neg().exp().add_f64(1.0).powf(-1.0);
     value.mul(&sigmoid)
+}
+
+pub fn gelu(value: &Value) -> Value {
+    // GELU tanh approximation:
+    // 0.5x * (1 + tanh(sqrt(2/pi) * (x + 0.044715x^3))).
+    let cubic_adjustment = value.powf(3.0).mul_f64(0.044_715);
+    let inner = value.add(&cubic_adjustment).mul_f64((2.0 / PI).sqrt());
+    value.mul_f64(0.5).mul(&tanh(&inner).add_f64(1.0))
+}
+
+fn tanh(value: &Value) -> Value {
+    let doubled_exp = value.mul_f64(2.0).exp();
+    doubled_exp.add_f64(-1.0).div(&doubled_exp.add_f64(1.0))
 }
 
 fn apply_cpu_residual_dropout(

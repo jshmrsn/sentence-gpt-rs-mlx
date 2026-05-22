@@ -60,6 +60,7 @@ enum TrainingRunConfigToggleField {
     LearnedRmsNormGain,
     FinalRmsNorm,
     SwigluFeedForward,
+    GeluFeedForward,
     TiedOutputEmbeddings,
     GradientClipping,
     WeightDecay,
@@ -436,6 +437,7 @@ fn App() -> Element {
                         {config_checkbox_input("Learned RMSNorm gain", selected_training_run_config.transformer_features.use_learned_rmsnorm_gain, can_configure_training_run, TrainingRunConfigToggleField::LearnedRmsNormGain, state)}
                         {config_checkbox_input("Final RMSNorm", selected_training_run_config.transformer_features.use_final_rmsnorm, can_configure_training_run, TrainingRunConfigToggleField::FinalRmsNorm, state)}
                         {config_checkbox_input("SwiGLU MLP", selected_training_run_config.transformer_features.use_swiglu_feed_forward, can_configure_training_run, TrainingRunConfigToggleField::SwigluFeedForward, state)}
+                        {config_checkbox_input("GELU MLP activation", selected_training_run_config.transformer_features.use_gelu_feed_forward, can_configure_training_run, TrainingRunConfigToggleField::GeluFeedForward, state)}
                         {config_checkbox_input("Tied output embeddings", selected_training_run_config.transformer_features.use_tied_output_embeddings, can_configure_training_run, TrainingRunConfigToggleField::TiedOutputEmbeddings, state)}
                         {config_checkbox_input("Gradient clipping", selected_training_run_config.optimizer_features.use_gradient_clipping, can_configure_training_run, TrainingRunConfigToggleField::GradientClipping, state)}
                         {config_checkbox_input("Weight decay", selected_training_run_config.optimizer_features.use_weight_decay, can_configure_training_run, TrainingRunConfigToggleField::WeightDecay, state)}
@@ -841,6 +843,11 @@ impl AppState {
                     .transformer_features
                     .use_swiglu_feed_forward = value;
             }
+            TrainingRunConfigToggleField::GeluFeedForward => {
+                training_run_config
+                    .transformer_features
+                    .use_gelu_feed_forward = value;
+            }
             TrainingRunConfigToggleField::TiedOutputEmbeddings => {
                 training_run_config
                     .transformer_features
@@ -1107,10 +1114,6 @@ impl AppState {
             return;
         }
         self.is_training_active = !self.is_training_active;
-    }
-
-    fn request_training_chunk(&mut self) {
-        self.manual_training_chunk_requested = true;
     }
 
     fn take_training_work(&mut self) -> Option<(TrainingSession, usize)> {
